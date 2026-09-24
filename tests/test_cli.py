@@ -18,5 +18,5 @@ def test_instances_shows_status_not_values(monkeypatch, tmp_path):
 
 def test_sub_apps_exist():
     result = CliRunner().invoke(app, ["--help"])
-    for name in ("klaviyo", "attentive", "stoq", "instances"):
+    for name in ("klaviyo", "instances"):
         assert name in result.output

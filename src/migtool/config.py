@@ -1,7 +1,7 @@
 """Instance registry and .env loading.
 
 Every command targets a named instance. Each instance maps to one `.env`
-variable holding its API key (Klaviyo, Attentive) or shop domain (STOQ).
+variable holding its API key.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class Secret:
 @dataclass(frozen=True)
 class Instance:
     name: str
-    service: str  # "klaviyo" | "attentive" | "stoq"
+    service: str  # "klaviyo"
     env_var: str
 
     @property
@@ -53,10 +53,6 @@ INSTANCES: dict[str, Instance] = {
         Instance("klaviyo_ca", "klaviyo", "KLAVIYO_CA_API_KEY"),
         Instance("klaviyo_us", "klaviyo", "KLAVIYO_US_API_KEY"),
         Instance("klaviyo_sandbox", "klaviyo", "KLAVIYO_SANDBOX_API_KEY"),
-        Instance("attentive_ca", "attentive", "ATTENTIVE_CA_API_KEY"),
-        Instance("attentive_us", "attentive", "ATTENTIVE_US_API_KEY"),
-        Instance("stoq_dev", "stoq", "STOQ_DEV_SHOP_DOMAIN"),
-        Instance("stoq_us", "stoq", "STOQ_US_SHOP_DOMAIN"),
     )
 }
 

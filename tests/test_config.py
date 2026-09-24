@@ -9,8 +9,8 @@ def test_unknown_instance_lists_valid_names():
 
 
 def test_wrong_service_is_rejected():
-    with pytest.raises(ConfigError, match="not a stoq instance"):
-        get_instance("klaviyo_us", "stoq")
+    with pytest.raises(ConfigError, match="not a shopify instance"):
+        get_instance("klaviyo_us", "shopify")
 
 
 def test_missing_variable_names_the_variable():
@@ -28,6 +28,4 @@ def test_credential_value_never_shows():
 
 def test_only_ca_instances_are_sources():
     assert get_instance("klaviyo_ca").is_source
-    assert get_instance("attentive_ca").is_source
     assert not get_instance("klaviyo_us").is_source
-    assert not get_instance("stoq_dev").is_source

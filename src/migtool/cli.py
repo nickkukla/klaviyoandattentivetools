@@ -7,7 +7,8 @@ import sys
 
 import typer
 
-from migtool.config import INSTANCES, ConfigError, load_env
+from migtool.config import INSTANCES, ConfigError, credential, get_instance, load_env
+from migtool.klaviyo.client import KlaviyoClient
 from migtool.http import ApiError
 from migtool.output import ResumeError
 from migtool.safety import WriteRefused
@@ -15,16 +16,12 @@ from migtool.safety import WriteRefused
 # Locals are hidden in tracebacks so a crash can't print a key.
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
 klaviyo_app = typer.Typer(no_args_is_help=True, help="Klaviyo exports and imports.")
-attentive_app = typer.Typer(no_args_is_help=True, help="Attentive segments.")
-stoq_app = typer.Typer(no_args_is_help=True, help="STOQ Back in Stock import.")
 app.add_typer(klaviyo_app, name="klaviyo")
-app.add_typer(attentive_app, name="attentive")
-app.add_typer(stoq_app, name="stoq")
 
 
 @app.callback()
 def _root() -> None:
-    """Klaviyo, Attentive and STOQ migration tools."""
+    """Klaviyo migration tools."""
     load_env()
 
 
@@ -34,6 +31,17 @@ def instances() -> None:
     for inst in INSTANCES.values():
         status = "set" if os.environ.get(inst.env_var, "").strip() else "NOT SET"
         typer.echo(f"{inst.name:<17} {inst.service:<10} {inst.env_var:<25} {status}")
+
+
+@klaviyo_app.command("whoami")
+def klaviyo_whoami(
+    instance: str = typer.Option(..., "--instance", help="Klaviyo instance to check."),
+) -> None:
+    """Show the account ID and name a key belongs to."""
+    inst = get_instance(instance, "klaviyo")
+    with KlaviyoClient(credential(inst)) as client:
+        acct = client.account()
+    typer.echo(f"{inst.name}: account {acct['id']} ({acct['name']})")
 
 
 def main() -> None:
