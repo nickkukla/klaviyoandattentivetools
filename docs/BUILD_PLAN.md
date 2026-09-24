@@ -39,9 +39,9 @@ Build the shared parts every command uses.
 - **Config:** instances `klaviyo_ca`, `klaviyo_us`, `klaviyo_sandbox`, `attentive_ca`, `attentive_us`, `stoq_dev`, `stoq_us`, each mapped to its `.env` variable. A missing variable is a clear error naming the variable. Keys never appear in logs or errors.
 - **HTTP client:** retries 429 and 5xx up to 6 times with increasing waits, honouring `Retry-After`. Per-endpoint rate limiter (Klaviyo publishes burst and steady limits per endpoint; STOQ uses 360 points per minute).
 - **Safety:** `--to` required on writes; prompt shows account, instance and record count; typed confirmation; `--yes`; `--allow-write-to-source` for `_ca` targets.
-- **Output:** CSV and JSONL writers, `manifest.json` with counts per run.
+- **Output:** CSV writer (JSONL fallback for exports too complex for CSV), UTC ISO 8601 timestamps, `manifest.json` with counts per run.
 - **Run log:** `<run>.errors.csv`, end-of-run summary (read, written, skipped, failed), non-zero exit on any failure.
-- **State:** checkpoint files for `--resume`; saved bulk job IDs.
+- **State:** checkpoint files for export `--resume`; saved bulk job IDs.
 
 **Gate:** unit tests pass for retries (fake 429 with `Retry-After`), rate limiter pacing, the confirmation prompt (including a refused `_ca` write), and resume from a checkpoint.
 
@@ -51,15 +51,20 @@ Confirm the facts the design depends on before building features. Record results
 
 | Check | Why it matters |
 |---|---|
-| `whoami` against every configured instance | Keys work and point at the expected accounts |
+| `whoami` against every configured instance; `klaviyo_sandbox` must be account `T2aEdf` | Keys work and point at the expected accounts |
 | Attentive: does List Segments include segments built in the UI, or only API-created ones? | Whether the segment export is complete, and how the duplicate guard behaves |
 | Klaviyo: which API revision returns segment rule definitions, and their shape | Segment labels (engagement / site activity / third-party) depend on it |
 | Klaviyo: map metric IDs to their source integration | Same |
 | Klaviyo: name of the Back in Stock metric in `klaviyo_ca`, and the event property keys holding variant and product IDs | Back in Stock export |
 | Klaviyo: catalog variants expose SKU and inventory quantity | SKU lookup and in-stock filtering |
 | Klaviyo: batch limits and request shape for bulk profile import, historical-import subscribe, and bulk suppression | Import design |
-| Klaviyo: which suppression reasons the profile data reports | Filtering hard bounce / spam / manual vs. unsubscribe |
-| STOQ: v1 intents on the dev store — response when a signup already exists, and whether it counts against the 360-point limit | Duplicate handling and pacing |
+| Klaviyo: which suppression reasons and dates the profile data reports, and whether they can be filtered by date | Suppressions export columns and `--since` |
+| Klaviyo: does a consent or suppression change update a profile's `updated` time, and can profiles, list memberships and Back in Stock events be filtered by time? | Catch-up run relies on `--since` catching every change |
+| Klaviyo: bulk import with a list relationship adds profiles to a list without changing consent, and creates profiles for emails that have none | `lists add` |
+| Klaviyo: which Back in Stock event or profile fields map to STOQ's `Name`, `Language`, `Accepts marketing` and `Quantity` | STOQ output columns |
+| Klaviyo: historical-import subscribe skips double opt-in and doesn't trigger list flows | No emails sent on import |
+| STOQ: v1 intents on the dev store — response when a signup already exists, whether it counts against the 360-point limit, and which request fields carry market or inventory location | Duplicate handling, pacing, passing location data from the CSV |
+| Attentive: adding members to an existing segment, including members already in it | `--append` re-uploads |
 
 Record real responses (secrets and personal data scrubbed) as test fixtures while doing this.
 
@@ -67,32 +72,37 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 
 ## Phase 2: Klaviyo exports (read-only)
 
-- `klaviyo profiles export` with the full CSV layout from the spec, `--resume`, `--with-predictive`, `--segment`.
-- `klaviyo lists export` → `lists.csv`, `list_members.csv`.
+- `klaviyo profiles export` with the full CSV layout from the spec, `--resume`, `--with-predictive`, `--segment`, `--since`.
+- `klaviyo lists export` → `lists.csv`, `list_members.csv`, with `--since`.
 - `klaviyo segments export` → `segments.csv` with the three label columns and event names, `segment_members.csv`.
-- `klaviyo suppressions export`, filtered to hard bounces, spam complaints and manual suppressions.
+- `klaviyo suppressions export`: every suppression with email, reason and date; `--since`.
 
 **Gate:**
 - Full profile export of `klaviyo_ca` completes (about 636k rows); totals in `manifest.json` match the dashboard (active, suppressed, never subscribed).
 - An export interrupted mid-run finishes correctly with `--resume`, with no duplicate or missing rows.
 - Segment labels spot-checked against five segments with known rules.
+- `--since` on each export returns only records changed after the timestamp.
 
 ## Phase 3: Klaviyo writes
 
-- `klaviyo profiles import`: bulk profile import, then historical-import subscribe (to `--list-id`) using the original consent timestamp, then unsubscribe/suppress where the CSV says so. Writes `ca_consent_method`, `ca_consent_source`, `ca_suppression_reason`, `ca_suppression_timestamp`. Supports `--limit`.
-- `klaviyo suppressions import`.
-- Both track Klaviyo's background jobs and put per-record errors in the errors file.
+- `klaviyo profiles import`: bulk profile import, then historical-import subscribe (to `--list-id`) using the original consent timestamp, then unsubscribe/suppress where the CSV says so. Writes `ca_consent_method`, `ca_consent_source`, `ca_suppression_reason`, `ca_suppression_timestamp`, `ca_external_id` (from the `external_id` column; the source profile `id` is never sent), `migrated_from=ca` and `migration_run_id` (generated per run, recorded in `manifest.json`). Imports `phone_number`. Supports `--limit`.
+- `klaviyo whoami`.
+- `klaviyo suppressions import`: suppresses every email in the file, whatever its consent in the destination; creates missing profiles as suppressed.
+- `klaviyo lists add`: adds every profile in the file to one list; creates missing profiles; writes consent only when the file has consent columns; safe to repeat.
+- All three track Klaviyo's background jobs and put per-record errors in the errors file.
 
-**Trial** in `klaviyo_sandbox` if granted, otherwise in `klaviyo_us` against the dedicated test list:
+**Trial** in `klaviyo_sandbox` (`T2aEdf`):
 - 10 profiles on addresses we control, mixing subscribed, unsubscribed, suppressed and never-subscribed.
-- 5 suppressions.
+- 5 suppressions, including one profile that is subscribed in the sandbox.
+- 5 profiles added to a list (email only, including one with no existing profile), then the same file added again; and 5 more from a file with consent columns.
+- A catch-up pass: change some trial profiles, export with `--since`, re-import.
 
-**Gate:** re-exporting the trial profiles shows the same consent status and timestamp, the `ca_*` properties are set, suppressed profiles are still suppressed, never-subscribed profiles are unchanged, no welcome or double opt-in emails were sent, and the 5 suppressions appear in the suppression list.
+**Gate:** re-exporting the trial profiles shows the same consent status and timestamp, the `ca_*`, `migrated_from` and `migration_run_id` properties are set, the destination `external_id` is untouched, suppressed profiles are still suppressed, never-subscribed profiles are unchanged, no welcome or double opt-in emails were sent, the 5 suppressions appear in the suppression list (the subscribed one is now suppressed), the email-only list add changed no consent, created the missing profile and its second run changed nothing, the list add with consent columns subscribed the consented rows with their original timestamps, and the catch-up pass picked up exactly the changed profiles.
 
 ## Phase 4: Back in Stock and STOQ
 
 - `klaviyo bis export`: read Back in Stock events with profile email, look up SKU via the catalog, keep latest per email + SKU, skip in-stock variants, apply `--since`, write STOQ template columns, write `bis.excluded.csv` with reasons.
-- `stoq import`: v1 intents, paced to the rate limit, duplicates counted separately, `--resume`.
+- `stoq import`: v1 intents, paced to the rate limit, duplicates counted separately.
 
 **Trial:** a 10-row CSV using the dev store's SKUs into `stoq_dev`.
 
@@ -104,27 +114,29 @@ Can be built any time after phase 0. Running it for real waits on the segment CS
 
 - `attentive whoami`.
 - `attentive segments export`.
-- `attentive segments upload`: validation, rejected-rows file, suffix naming, duplicate-name guard, dry-run, `--segment` pilot, batches of 10,000.
+- `attentive segments upload`: validation, rejected-rows file, suffix naming, duplicate-name guard, `--append`, dry-run, `--segment` pilot, batches of 10,000.
 - `attentive segments jobs`: status, results download, skipped counts and `<segment>.skipped.csv`.
 
 **Trial (production, there is no sandbox):** dry-run on every CSV, then a real pilot on one small segment in `attentive_us`.
 
-**Gate:** the pilot job completes and its results file shows no failures other than expected skips. Re-running the same upload is stopped by the duplicate-name guard.
+**Gate:** the pilot job completes and its results file shows no failures other than expected skips. Re-running the same upload is stopped by the duplicate-name guard, and succeeds with `--append`.
 
 ## Phase 6: README and sign-off
 
-- README: setup (`uv`, `.env`), every command and flag with an example, the recommended run order for the migration, STOQ CSV preparation and the admin-upload fallback, and warnings (import overwrites matching profiles; Attentive upload is one-time).
+- README: setup (`uv`, `.env`), every command and flag with an example, the recommended run order for the migration, STOQ CSV preparation and the admin-upload fallback, the catch-up run, deleting local data afterwards, and warnings (import overwrites matching profiles; suppressions override newer US subscribes; `Phone` is left blank in the STOQ file on purpose).
 - Walk through every acceptance criterion in the spec and record the result.
 
 **Gate:** all acceptance criteria in `REQUIREMENTS.md` checked off.
 
 ## Migration run order (after sign-off)
 
-1. Klaviyo: export profiles from `klaviyo_ca` and `klaviyo_us`; dedupe outside the tool; import unique CA profiles into `klaviyo_us`.
-2. Klaviyo: export CA suppressions; import into `klaviyo_us`.
-3. Klaviyo: export lists and segments from `klaviyo_ca` for the record; clone segments in the Klaviyo UI.
-4. Back in Stock: export from `klaviyo_ca`; review the CSV; `stoq import --to stoq_us`.
-5. Attentive: after the subscriber migration is finished and the CSM's CSVs arrive — export segments, dry-run every CSV, pilot one, upload the rest, check jobs.
+1. Klaviyo: create the LOF Canada Newsletter list in `klaviyo_us`. Export profiles from `klaviyo_ca` and `klaviyo_us`; dedupe outside the tool (including phone uniqueness and removing overlapping Shopify properties); import unique CA profiles into `klaviyo_us` with `--list-id` set to the LOF Canada Newsletter list.
+2. Klaviyo: export CA suppressions; choose which to apply by editing the file; import into `klaviyo_us`.
+3. Klaviyo: export lists and segments from `klaviyo_ca`; attach chosen sets of profiles to US lists with `lists add` or through the Klaviyo UI (often into existing US lists); clone segments in the Klaviyo UI.
+4. Back in Stock: export from `klaviyo_ca`; review the CSV and fill `Market`, `GDPR confirmed` and inventory-location data; `stoq import --to stoq_us`.
+5. Attentive: after the subscriber migration is finished and the CSM's CSVs arrive (reformatted by hand) — export segments, dry-run every CSV, pilot one, upload the rest, check jobs.
+6. Catch-up run, immediately before CA Klaviyo sign-ups are turned off: repeat steps 1–4 with `--since` set to the start of the main run; dedupe the delta files; re-import. Attentive re-uploads use `--append`.
+7. Delete `exports/` and `state/`.
 
 ## Risks
 
@@ -135,4 +147,5 @@ Can be built any time after phase 0. Running it for real waits on the segment CS
 | Klaviyo may not expose segment rules in a usable form | Found in phase 1; if so, labels become a manual column and the spec is updated |
 | Back in Stock events may lack variant IDs, or SKUs may be missing from the catalog | Such rows go to the excluded file with a reason; volume reported in phase 1 |
 | Klaviyo import overwrites matching profiles | Dedupe happens beforehand (outside the tool); README warning; trial first |
-| Rate limits make runs long | Pacing plus `--resume`; expected run times documented in the README |
+| Catch-up run misses a change `--since` can't see | Phase 1 confirms which changes move the `updated` time; set `--since` a little before the main run started, since every write is safe to repeat |
+| Rate limits make runs long | Pacing; `--resume` on exports; imports are safe to re-run; expected run times documented in the README |
