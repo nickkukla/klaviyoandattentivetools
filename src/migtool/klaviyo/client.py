@@ -46,11 +46,24 @@ class KlaviyoClient:
 
     def paginate(self, path: str, *, tier: str = "M", **kwargs) -> Iterator[dict]:
         """Yield each response page, following `links.next` cursors."""
-        page = self.get(path, tier=tier, **kwargs)
-        yield page
-        while nxt := (page.get("links") or {}).get("next"):
-            page = self.get(nxt, tier=tier)
+        for page, _ in self.pages(path, tier=tier, **kwargs):
             yield page
+
+    def pages(
+        self, path: str, *, tier: str = "M", start: str | None = None, **kwargs
+    ) -> Iterator[tuple[dict, str | None]]:
+        """Yield `(page, next_url)` pairs. `next_url` is None on the last page.
+
+        `start` is a `next_url` saved from an earlier run; paging continues from
+        there instead of from `path`, which is how exports resume.
+        """
+        page = self.get(start, tier=tier) if start else self.get(path, tier=tier, **kwargs)
+        while True:
+            nxt = (page.get("links") or {}).get("next")
+            yield page, nxt
+            if not nxt:
+                return
+            page = self.get(nxt, tier=tier)
 
     def account(self) -> dict:
         """The account the key belongs to: `id` and `name`."""

@@ -2,7 +2,8 @@
 
 CSV is the default. Nested values go into a cell as JSON text. JSONL is only
 for data too complex for a usable CSV. `ResumableExport` adds `--resume`
-support on top of the writers.
+support on top of the writers, and can stage rows as JSONL when the CSV
+columns aren't known until the end.
 """
 
 from __future__ import annotations
@@ -31,6 +32,17 @@ def utc_now() -> datetime:
 def iso(dt: datetime) -> str:
     """UTC ISO 8601 with a `Z`, e.g. `2026-09-24T15:30:00Z`."""
     return dt.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_iso(value: str) -> datetime:
+    """Parse an ISO 8601 timestamp; one without a zone is taken as UTC."""
+    dt = datetime.fromisoformat(value.strip())
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def iso_or_none(value: str | None) -> str | None:
+    """An API timestamp in this tool's format (`...Z`), or None when blank."""
+    return iso(parse_iso(value)) if value else None
 
 
 def file_stamp(dt: datetime) -> str:
@@ -163,6 +175,54 @@ def write_manifest(
     return path
 
 
+def _last_occurrences(rows: Iterable[Mapping[str, Any]], key: list[str]) -> set[int]:
+    """Indexes of the last row for each value of `key`."""
+    last: dict[tuple, int] = {}
+    for i, row in enumerate(rows):
+        last[tuple(row.get(k) for k in key)] = i
+    return set(last.values())
+
+
+def _read_rows(path: Path) -> Iterable[dict[str, Any]]:
+    with open(path, encoding="utf-8", newline="") as f:
+        if path.suffix == ".jsonl":
+            for line in f:
+                yield json.loads(line)
+        else:
+            yield from csv.DictReader(f)
+
+
+def finalize_csv(
+    src: Path, dest: Path, first_columns: Iterable[str], *, unique_by: list[str] | None = None
+) -> tuple[int, int]:
+    """Write the rows in `src` (JSONL or CSV) to CSV at `dest`, which may be `src`.
+
+    Columns are `first_columns`, then every other key seen, sorted. With
+    `unique_by`, only the last row for each key is kept: paging over data that
+    changes during an export can return a record twice, and the later copy is
+    the fresher one. Returns (rows written, duplicates dropped).
+    """
+    first = list(first_columns)
+    seen = set(first)
+    extra: set[str] = set()
+    for row in _read_rows(src):
+        extra.update(k for k in row if k not in seen)
+    keep = _last_occurrences(_read_rows(src), unique_by) if unique_by else None
+    tmp = dest.with_name(dest.name + ".tmp")
+    writer = CsvWriter(tmp, first + sorted(extra))
+    dropped = 0
+    for i, row in enumerate(_read_rows(src)):
+        if keep is not None and i not in keep:
+            dropped += 1
+            continue
+        writer.write(row)
+    writer.close()
+    os.replace(tmp, dest)
+    if src != dest:
+        src.unlink()
+    return writer.count, dropped
+
+
 class ResumeError(Exception):
     """`--resume` was asked for but there is nothing matching to resume."""
 
@@ -174,6 +234,13 @@ class ResumableExport:
     cursor for the *next* page. On `--resume`, the output file is cut back to
     the last checkpoint, so rows written after it are neither lost nor
     duplicated. `params` (filters such as `--since`) must match on resume.
+
+    With `staged=True`, rows go to a `.jsonl` file and `finish` turns it into
+    the CSV, with `fieldnames` first and any other keys after them, sorted.
+    Use it when rows carry columns that can't be listed up front.
+
+    With `unique_by`, `finish` keeps only the last row for each key (see
+    `finalize_csv`).
     """
 
     def __init__(
@@ -183,6 +250,8 @@ class ResumableExport:
         fieldnames: Iterable[str],
         *,
         resume: bool = False,
+        staged: bool = False,
+        unique_by: list[str] | None = None,
         params: Mapping[str, Any] | None = None,
         store: StateStore | None = None,
         base: Path = EXPORTS_DIR,
@@ -192,6 +261,7 @@ class ResumableExport:
         self.instance = instance
         self.object = obj
         self.params = dict(params or {})
+        self.unique_by = unique_by
         self.store = store or StateStore()
         saved = self.store.load_checkpoint(instance, obj)
 
@@ -208,9 +278,8 @@ class ResumableExport:
                 base / instance / obj,
             )
             self.fieldnames = saved["fieldnames"]
-            self.writer = CsvWriter(
-                self.run.path(".csv"), self.fieldnames, truncate_to=saved["offset"]
-            )
+            self.staged = saved.get("staged", False)
+            self.writer = self._open_writer(truncate_to=saved["offset"])
             self.cursor: Any = saved["cursor"]
             self.rows = saved["rows"]
             echo(f"Resuming {obj} export {self.run.run_id} at row {self.rows:,}.")
@@ -222,10 +291,16 @@ class ResumableExport:
                 )
             self.run = new_run(instance, obj, base=base, now=now)
             self.fieldnames = list(fieldnames)
-            self.writer = CsvWriter(self.run.path(".csv"), self.fieldnames)
+            self.staged = staged
+            self.writer = self._open_writer()
             self.cursor = None
             self.rows = 0
             self.checkpoint(None)
+
+    def _open_writer(self, truncate_to: int | None = None) -> CsvWriter | JsonlWriter:
+        if self.staged:
+            return JsonlWriter(self.run.path(".jsonl"), truncate_to=truncate_to)
+        return CsvWriter(self.run.path(".csv"), self.fieldnames, truncate_to=truncate_to)
 
     def write(self, row: Mapping[str, Any]) -> None:
         self.writer.write(row)
@@ -242,6 +317,7 @@ class ResumableExport:
                 "started": self.run.started,
                 "params": self.params,
                 "fieldnames": self.fieldnames,
+                "staged": self.staged,
                 "offset": self.writer.flush(),
                 "cursor": cursor,
                 "rows": self.rows,
@@ -251,10 +327,19 @@ class ResumableExport:
     def finish(self, counts: Mapping[str, int] | None = None) -> Path:
         """Close the file, record the run in the manifest and drop the checkpoint."""
         self.writer.close()
+        path = self.run.path(".csv")
+        dropped = 0
+        if self.staged or self.unique_by:
+            self.rows, dropped = finalize_csv(
+                self.writer.path, path, self.fieldnames, unique_by=self.unique_by
+            )
+        counts = {"rows": self.rows, **(counts or {})}
+        if dropped:
+            counts["duplicates_dropped"] = dropped
         manifest = write_manifest(
             self.run,
-            files={self.writer.path.name: self.rows},
-            counts={"rows": self.rows, **(counts or {})},
+            files={path.name: self.rows},
+            counts=counts,
             extra={"params": self.params} if self.params else None,
         )
         self.store.clear_checkpoint(self.instance, self.object)

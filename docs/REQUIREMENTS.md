@@ -63,7 +63,7 @@ Also out of scope: flows, templates, campaigns, and event and order history. Non
 
 ### Profiles
 - **Export:** `klaviyo profiles export --instance <instance> [--segment <id|name>] [--since <timestamp>] [--with-predictive] [--resume]` writes every profile, whatever its consent or suppression state, to CSV. It works against either account.
-  - Scale (`klaviyo_ca`, 2026-09-23): 635,817 profiles, of which 352,286 are active, 233,995 suppressed and about 49,536 never subscribed. That's about 6,400 pages of 100; the export saves its position after each page.
+  - Scale (`klaviyo_ca`, full export 2026-09-24): 291,337 profiles: 164,798 active (have an email and aren't suppressed, matching the dashboard), 106,110 suppressed, and 20,429 with no email address (707 with neither email nor phone). By consent: 90,180 subscribed, 98,463 unsubscribed, 102,694 never subscribed. That's about 2,900 pages of 100 (about 40 minutes); the export saves its position after each page. (`klaviyo_us`, 2026-09-23 dashboard: 635,817 profiles, 352,286 active, 233,995 suppressed, about 49,536 never subscribed.)
   - Predictive analytics fields are included only with `--with-predictive`, because they cut Klaviyo's rate limit from 750 to 150 requests per minute.
   - `--segment` exports only that segment's members, in the same layout. If a name matches more than one segment, the tool stops and lists the matching IDs.
   - "Last order date" is **not** required. It isn't a field on the profile, so it isn't exported or derived.
@@ -162,3 +162,4 @@ Legal is reviewing the transfer of CA consent into the US account, including CAS
 - 2026-09-24: Phase 1 finding. Segment labels: site activity is decided by event name whatever the integration, and includes Checkout Started; Klaviyo subscription events get no label.
 - 2026-09-24: Phase 1 finding. Attentive's List Segments API only sees API-created segments. Attentive dropped from the tool entirely (segment export, upload, jobs, whoami, instances and keys); segments are handled by hand.
 - 2026-09-24: Phase 1 finding. STOQ's v1 intents API needs US Shopify variant and product IDs, not SKUs. `stoq import`, the `stoq_dev`/`stoq_us` instances and their `.env` variables dropped; the BIS export file is uploaded by hand in STOQ admin.
+- 2026-09-24: Phase 2. The profile counts previously given for `klaviyo_ca` were `klaviyo_us` figures; CA figures replaced with the full export's counts.

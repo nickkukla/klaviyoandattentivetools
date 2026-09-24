@@ -107,3 +107,19 @@ def test_new_export_abandons_unfinished_one_with_a_warning(tmp_path):
     ResumableExport("klaviyo_ca", "profiles", FIELDS, store=StateStore(tmp_path / "state"),
                     base=tmp_path / "exports", echo=messages.append)
     assert "use --resume" in messages[0]
+
+
+def test_unique_by_keeps_the_last_copy(tmp_path):
+    exp = ResumableExport(
+        "klaviyo_ca", "profiles", ["id", "email"], staged=True, unique_by=["id"],
+        store=StateStore(tmp_path / "state"), base=tmp_path / "exports", echo=lambda _: None,
+    )
+    for row in ({"id": "1", "email": "old@example.com"}, {"id": "2", "email": "b@example.com"},
+                {"id": "1", "email": "new@example.com", "properties.x": "y"}):
+        exp.write(row)
+    exp.checkpoint(None)
+    manifest = json.loads(exp.finish().read_text())
+    rows = read_csv(exp.run.path(".csv"))
+    assert [(r["id"], r["email"]) for r in rows] == [("2", "b@example.com"), ("1", "new@example.com")]
+    assert list(rows[0]) == ["id", "email", "properties.x"]
+    assert manifest["runs"][-1]["counts"] == {"rows": 2, "duplicates_dropped": 1}
