@@ -5,13 +5,15 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import typer
 
 from migtool.config import INSTANCES, ConfigError, credential, get_instance, load_env
 from migtool.http import ApiError
-from migtool.klaviyo import groups, profiles, segments, suppressions
+from migtool.klaviyo import groups, imports, profiles, segments, suppressions
 from migtool.klaviyo.client import KlaviyoClient
+from migtool.klaviyo.writes import Job, Writer
 from migtool.output import (
     CsvWriter,
     ResumableExport,
@@ -22,7 +24,9 @@ from migtool.output import (
     parse_iso,
     write_manifest,
 )
-from migtool.safety import WriteRefused
+from migtool.runlog import RunLog
+from migtool.safety import WriteRefused, confirm_write
+from migtool.state import StateStore
 
 # Locals are hidden in tracebacks so a crash can't print a key.
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
@@ -42,6 +46,17 @@ SINCE = typer.Option(
     None, "--since", help="Only records changed after this UTC ISO 8601 time, e.g. 2026-09-24T15:30:00Z."
 )
 RESUME = typer.Option(False, "--resume", help="Continue the unfinished export with the same options.")
+TO = typer.Option(..., "--to", help="Klaviyo instance to write to.")
+FILE = typer.Option(..., "--file", exists=True, dir_okay=False, help="CSV to import.")
+LIMIT = typer.Option(None, "--limit", min=1, help="Only the first N rows, for trials and pilots.")
+YES = typer.Option(False, "--yes", help="Skip the typed confirmation.")
+AS_UNSUBSCRIBE = typer.Option(
+    False, "--as-unsubscribe",
+    help="Unsubscribe instead of suppressing. Blocks marketing email now, but a later subscribe lifts it.",
+)
+ALLOW_SOURCE = typer.Option(
+    False, "--allow-write-to-source", help="Allow writing to a _ca (source) instance."
+)
 
 
 @app.callback()
@@ -205,6 +220,146 @@ def segments_export(instance: str = INSTANCE) -> None:
                 **segments.labels(a.get("definition"), known)}
 
     _export_groups(instance, "segment", segments.COLUMNS, "name,created,updated,definition", None, row)
+
+
+def _write_run(
+    to: str, obj: str, main_step: str, file: Path, limit: int | None, yes: bool,
+    allow_write_to_source: bool, body, extra_manifest: dict | None = None,
+) -> None:
+    """Shared frame for the write commands: read and check the file, confirm the
+    target, run `body(importer, rows, columns, run)`, then write the skipped
+    file, manifest and summary. Exits non-zero if anything failed."""
+    inst = get_instance(to, "klaviyo")
+    try:
+        columns, raw = imports.read_rows(file, limit=limit)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    batch = imports.usable(raw)
+    run = new_run(inst.name, obj)
+    store = StateStore()
+    with KlaviyoClient(credential(inst)) as client:
+        account = client.account()
+        typer.echo(f"File:            {file} ({len(raw):,} rows, {len(batch.skipped):,} skipped)")
+        confirm_write(
+            inst, account=f"{account['name']} ({account['id']})", record_count=len(batch.rows),
+            yes=yes, allow_write_to_source=allow_write_to_source,
+        )
+        log = RunLog(run)
+        log.read(len(raw))
+        log.skipped(len(batch.skipped))
+
+        def save_job(job: Job) -> None:
+            store.add_job(inst.name, {"id": job.id, "kind": job.kind, "run_id": run.run_id, "size": job.size})
+
+        imp = imports.Importer(Writer(client), log, echo=typer.echo, save_job=save_job, main_step=main_step)
+        counts = body(imp, batch.rows, columns, run) or {}
+        for job in imp.unfinished:
+            log.error(f"job {job.id}", f"{job.kind} still {job.status or 'processing'}; check it later",
+                      stage="wait")
+    skipped_path = imports.write_skipped(run, batch.skipped)
+    files = {skipped_path.name: len(batch.skipped)} if skipped_path else {}
+    write_manifest(
+        run, files=files, counts={**log.counts, **counts, "steps": imp.steps},
+        status="complete" if not log.counts["failed"] else "completed with errors",
+        extra={"migration_run_id": run.run_id, "source_file": str(file), "account": account["id"],
+               **(extra_manifest or {})},
+    )
+    typer.echo(f"migration_run_id: {run.run_id}")
+    if skipped_path:
+        typer.echo(f"Skipped rows written to {skipped_path}")
+    code = log.finish()
+    if code:
+        raise typer.Exit(code)
+
+
+@profiles_app.command("import")
+def profiles_import(
+    to: str = TO,
+    file: Path = FILE,
+    list_id: str = typer.Option(..., "--list-id", help="List every imported profile joins and subscribes to."),
+    limit: int | None = LIMIT,
+    as_unsubscribe: bool = AS_UNSUBSCRIBE,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+) -> None:
+    """Import profiles from a `profiles export` CSV, keeping consent and suppression."""
+
+    def body(imp, rows, columns, run):
+        imports.profiles_import(imp, rows, list_id=list_id, run_id=run.run_id, as_unsubscribe=as_unsubscribe)
+
+    _write_run(to, "profiles-import", "import", file, limit, yes, allow_write_to_source, body,
+               {"list_id": list_id, "as_unsubscribe": as_unsubscribe})
+
+
+@suppressions_app.command("import")
+def suppressions_import(
+    to: str = TO,
+    file: Path = FILE,
+    limit: int | None = LIMIT,
+    as_unsubscribe: bool = AS_UNSUBSCRIBE,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+) -> None:
+    """Suppress every email in the file, creating suppressed profiles where none exist."""
+
+    def body(imp, rows, columns, run):
+        return {"created": imports.suppressions_import(imp, rows, run_id=run.run_id, as_unsubscribe=as_unsubscribe)}
+
+    _write_run(to, "suppressions-import", "suppress", file, limit, yes, allow_write_to_source, body,
+               {"as_unsubscribe": as_unsubscribe})
+
+
+@suppressions_app.command("check")
+def suppressions_check(
+    instance: str = INSTANCE,
+    file: Path = typer.Option(..., "--file", exists=True, dir_okay=False, help="CSV with an email column."),
+) -> None:
+    """Report whether each email in the file is suppressed now (read-only).
+
+    Klaviyo can take hours to apply suppression jobs, so run this some time
+    after `suppressions import`. Emails not yet suppressed go to a CSV."""
+    try:
+        _, raw = imports.read_rows(file)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    batch = imports.usable(raw)
+    with _client(instance) as client:
+        states = suppressions.check(client, (r["email"] for r in batch.rows))
+    counts: dict[str, int] = {}
+    for row in states.values():
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+    run = new_run(instance, "suppressions-check")
+    pending = [r for r in states.values() if r["state"] != "suppressed"]
+    files = {}
+    if pending:
+        path = run.path(".not_suppressed.csv")
+        writer = CsvWriter(path, suppressions.CHECK_COLUMNS)
+        for row in pending:
+            writer.write(row)
+        writer.close()
+        files[path.name] = writer.count
+    write_manifest(run, files=files, counts=counts, extra={"source_file": str(file)})
+    for state in ("suppressed", "unsubscribed", "not suppressed", "no profile"):
+        typer.echo(f"{state:<15} {counts.get(state, 0):,}")
+    if pending:
+        typer.echo(f"Not yet suppressed: {run.path('.not_suppressed.csv')}")
+
+
+@lists_app.command("add")
+def lists_add(
+    to: str = TO,
+    list_id: str = typer.Option(..., "--list", help="ID of the list to add profiles to."),
+    file: Path = FILE,
+    limit: int | None = LIMIT,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+) -> None:
+    """Add every profile in the file to one list; writes consent only if the file has consent columns."""
+
+    def body(imp, rows, columns, run):
+        return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
+
+    _write_run(to, "lists-add", "add", file, limit, yes, allow_write_to_source, body, {"list_id": list_id})
 
 
 def main() -> None:

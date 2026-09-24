@@ -65,6 +65,11 @@ class KlaviyoClient:
                 return
             page = self.get(nxt, tier=tier)
 
+    def post(self, path: str, body: dict, *, tier: str = "M") -> dict:
+        """Send a write. Returns the JSON body, or {} for a 202 with no body."""
+        response = self._http.post(path, json=body, limiter=self._limiter(tier))
+        return response.json() if response.content else {}
+
     def account(self) -> dict:
         """The account the key belongs to: `id` and `name`."""
         data = self.get("/accounts/", tier="XS")["data"][0]
