@@ -1,7 +1,7 @@
 [project]
 name = "migtool"
 version = "0.1.0"
-description = "Klaviyo, Attentive and STOQ migration tools"
+description = "Klaviyo migration tools"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

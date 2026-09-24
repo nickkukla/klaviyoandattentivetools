@@ -1,6 +1,6 @@
 # migtool
 
-Command-line tools for the Klaviyo, Attentive and STOQ migration. See `docs/REQUIREMENTS.md` for what they do and `docs/BUILD_PLAN.md` for build status.
+Command-line tools for the Klaviyo migration (including the Back in Stock export for STOQ). See `docs/REQUIREMENTS.md` for what they do and `docs/BUILD_PLAN.md` for build status.
 
 ## Setup
 

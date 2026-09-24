@@ -80,8 +80,8 @@ def test_limiter_allows_burst_then_paces(clock):
     assert clock.sleeps == [pytest.approx(1 / 3)]
 
 
-def test_limiter_stoq_points(clock):
-    # 360 points per minute, 2 points per write: 180 writes per minute.
+def test_limiter_counts_cost_points(clock):
+    # 360 points per minute, 2 points per request: 180 requests per minute.
     limiter = RateLimiter([Limit(360, 60)], clock=clock, sleep=clock.sleep)
     for _ in range(180 + 180):
         limiter.acquire(cost=2)

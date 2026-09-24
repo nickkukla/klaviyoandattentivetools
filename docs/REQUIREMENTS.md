@@ -1,23 +1,20 @@
-# Klaviyo, Attentive and STOQ migration tools — requirements
+# Klaviyo migration tools — requirements
 
 ## Context
 
-I'm running a migration, and part of that is merging objects and records from the Canada Klaviyo and Attentive accounts into the corresponding US accounts, plus moving Back in Stock signups into STOQ.
+I'm running a migration, and part of that is merging objects and records from the Canada Klaviyo account into the US account, plus exporting Back in Stock signups for upload to STOQ. Attentive is handled by hand, and the STOQ upload is done in STOQ's admin (see below).
 
 Instance names used throughout:
 
 | Instance | Role |
 |---|---|
-| `klaviyo_ca`, `attentive_ca` | Source (Canada) |
-| `klaviyo_us`, `attentive_us` | Destination (US, the merged store) |
+| `klaviyo_ca` | Source (Canada) |
+| `klaviyo_us` | Destination (US, the merged store) |
 | `klaviyo_sandbox` | Klaviyo test account (account ID `T2aEdf`), for trials |
-| `stoq_dev` | STOQ on our Shopify dev store, for testing |
-| `stoq_us` | STOQ on the merged/destination US Shopify store |
 
 The tool is a command-line app that I run directly or ask Claude Code to run from a session. Every command targets a named instance.
 
 API references:
-- Attentive: https://docs.attentive.com/reference/test-authentication-v2
 - Klaviyo: https://developers.klaviyo.com/en/reference/api_overview
 - STOQ: https://docs.stoqapp.com/ and https://help.stoqapp.com/back-in-stock/migrate-klaviyo-back-in-stock-signups/
 
@@ -25,54 +22,36 @@ API references:
 
 ### Runtime and configuration
 - Python 3.12, `uv`, `typer` CLI. Runs locally by hand (WSL). No scheduler, no server.
-- Secrets live in a git-ignored `.env`, one per instance: `KLAVIYO_CA_API_KEY`, `KLAVIYO_US_API_KEY`, `KLAVIYO_SANDBOX_API_KEY`, `ATTENTIVE_CA_API_KEY`, `ATTENTIVE_US_API_KEY`, `STOQ_DEV_SHOP_DOMAIN`, `STOQ_US_SHOP_DOMAIN`. Keys are never logged.
+- Secrets live in a git-ignored `.env`, one per instance: `KLAVIYO_CA_API_KEY`, `KLAVIYO_US_API_KEY`, `KLAVIYO_SANDBOX_API_KEY`. Keys are never logged.
 - Output goes to `./exports/<instance>/<object>/<timestamp>.csv` with a `manifest.json` of record counts per run. Every export is CSV wherever the data fits in columns (nested values as JSON text in a cell). Only an export whose data is too complex for a usable CSV falls back to `.jsonl`, and the README says which ones do.
 - All timestamps, in files and on the command line, are UTC ISO 8601 (`2026-09-24T15:30:00Z`).
-- A README documents every command and flag, with an example of each, and the STOQ CSV preparation steps.
+- A README documents every command and flag, with an example of each, and the STOQ CSV preparation and admin upload steps.
 - Exports hold personal data. I delete `exports/` and `state/` immediately after the migration; the README's run order ends with that step.
 
 ### Write safety
 - Every write command names its target with `--to <instance>`. Before writing it prints the account name, the target instance and the record count, and asks the user to type the instance name to confirm.
 - `--yes` skips the prompt for scripted runs, including runs started by Claude.
 - Writes into a `_ca` instance also require `--allow-write-to-source`.
-- Dry-run mode exists only for the Attentive segment membership upload. Everything else is either an export (for archiving, or to check or edit data) or an import of a previously exported file.
+- There is no dry-run mode. Every command is either an export (for archiving, or to check or edit data) or an import of a previously exported file, and Klaviyo writes are tried in `klaviyo_sandbox` first.
 
 ### Errors and retries
 - Rate-limit (429) and server (5xx) errors are retried with increasing waits, honouring the service's `Retry-After`, up to 6 attempts.
 - Per-record errors go to `<run>.errors.csv` and the run continues.
-- Asynchronous bulk jobs (Klaviyo imports, Attentive segment members) are tracked, and their per-record errors go to the same errors file.
+- Asynchronous bulk jobs (Klaviyo imports) are tracked, and their per-record errors go to the same errors file.
 - Every run ends with a summary of counts (read, written, skipped, failed) and exits non-zero if anything failed.
-- Long exports save their position and support `--resume`. Imports and uploads don't resume: a failed import is re-run from the start, which is safe because every write can be repeated.
+- Long exports save their position and support `--resume`. Imports don't resume: a failed import is re-run from the start, which is safe because every write can be repeated.
 
 ### Catch-up (delta) run
 Immediately before sign-ups are turned off on the CA Klaviyo site, I run a catch-up pass that repeats the migration for anything that changed since the main run:
-- Every Klaviyo export used in the migration takes `--since <ISO timestamp>` and returns only records changed since then: profiles by last update, list memberships by join date, suppressions by suppression date, and Back in Stock signups by event date.
-- Every write can be repeated safely. Re-importing a profile updates it; adding a profile to a list or suppression it's already in changes nothing; STOQ counts existing signups as duplicates. A catch-up run therefore uses the same commands on the smaller files.
+- Every Klaviyo export used in the migration takes `--since <ISO timestamp>` and returns only records changed since then: profiles by last update, list memberships by join date, suppressions by suppression date, and Back in Stock signups by event date. Unsubscribes don't change a profile's last-update time, so they're caught only by the suppressions export, which every catch-up run must include.
+- Every write can be repeated safely. Re-importing a profile updates it; adding a profile to a list or suppression it's already in changes nothing. The Back in Stock catch-up file only holds signups after `--since`, so earlier ones aren't uploaded again. A catch-up run therefore uses the same commands on the smaller files.
 - The catch-up files go through the same external dedupe as the main run.
 
 ## Attentive
 
-Attentive's public API (REST and GraphQL) is mostly write-only. The only read endpoints relevant to this project are segment metadata.
+Out of scope: Attentive segments are handled by hand in the Attentive UI. The tool has no Attentive commands.
 
-### Segments
-Uses the Segments (Open Beta) and Bulk Segment Operations (Open Beta) APIs:
-[List Segments](https://docs.attentive.com/reference/listsegments), [Create Segment](https://docs.attentive.com/reference/createsegment), [Add Bulk Segment Members](https://docs.attentive.com/reference/postbulksegmentmembers), [Bulk job status](https://docs.attentive.com/reference/getbulkjobstatus). If the beta APIs fail or prove error-prone, we fall back to a manual process in the Attentive UI.
-
-- **No automated CA → US migration.** List Segments returns only `externalId`, `name`, `description`, `created` and `updated`: no rules, counts or members, and there is no endpoint to read members. Segment membership will be requested from our Attentive customer success manager and supplied as CSV files.
-- **Export:** `attentive segments export --instance <attentive_ca|attentive_us>` saves all segments (metadata only) to CSV.
-- **Upload:** `attentive segments upload --to <instance> --file <csv> [--segment <name>] [--append] [--dry-run]` uploads one CSV per segment, with columns `segment_name, email, phone`.
-  - It creates an empty, static segment in the target, then adds members in batches of up to 10,000.
-  - **Naming:** the new segment keeps the source title with a suffix naming the source account. Uploads into `attentive_us` add `-CA` (`VIP Customers` → `VIP Customers-CA`); uploads into `attentive_ca` add `-US`.
-  - **Duplicate guard:** before creating, the tool looks up the suffixed name in the target. If it already exists and `--append` isn't given, it stops with an error and nothing is created or added.
-  - **Re-upload with `--append`:** adds the file's members to the existing suffixed segment instead of creating one, so a segment can be uploaded more than once (for example in the catch-up run). With `--append` and no existing segment, the tool stops with an error. Members are only ever added; nothing is removed or replaced. A damaged segment is rebuilt by hand.
-  - **Validation:** the file must have exactly the columns `segment_name, email, phone`; I reformat the CSM's files by hand to match. Every row must have the same `segment_name`, or the file is rejected. Emails are lowercased. Phones are normalised to E.164, assuming `+1` when no country code is given. Rows with neither a valid email nor a valid phone go to `<file>.rejected.csv` and aren't sent. Duplicate rows are removed.
-  - **Dry-run** validates the CSV and reports the suffixed segment name, whether it would be created or appended to, and the valid, rejected and duplicate counts, without writing anything. `--segment` restricts a run to one segment, for a pilot.
-  - **Never subscribes anyone.** The Attentive subscriber migration happens outside this tool and will already be finished before any segment upload. Anyone still not a subscriber in the target is expected to be skipped by Attentive.
-- **Job status:** `attentive segments jobs --instance <instance> [--download-results]`. Member jobs run in the background (Attentive targets 4–12 hours). Job IDs are saved in `state/`. The command reports each job's status and, per segment, the skipped count and percentage, and writes skipped rows with Attentive's reason to `<segment>.skipped.csv` so they can be traced back to gaps in the subscriber migration.
-- **Authentication:** one custom-app API key per instance, sent as a bearer token, with the `segments:all` scope. `attentive whoami --instance <instance>` calls `/v2/me` so the user can confirm which account a key belongs to before any write.
-
-### Out of scope
-Campaigns (with audiences and messages), Lists (with their profiles), Profiles/subscribers, Catalogs and Coupons. The public API has no endpoints to read them. Nothing is built for these: no export, no CSV archive command, no catalog upload-history command.
+Why: the Segments API (Open Beta) only lists segments created through the API. In phase 1, `GET /v2/segments` returned an empty list in both accounts, which both have UI segments, so existing segments can't be listed, and members can't be read at all. Attentive campaigns, lists, subscribers, catalogs and coupons were already out of scope (no read endpoints).
 
 ## Klaviyo
 
@@ -128,39 +107,34 @@ We'll move segments with Klaviyo's "Clone" action in the UI, which works across 
 `klaviyo segments export --instance <instance>` writes:
 - `segments.csv`: segment ID, name, created and updated dates, member count, and three yes/no columns plus a list of the event names each segment's rules use:
   - **Engagement:** Klaviyo email events (opened, clicked, received) and order events (Placed Order, Ordered Product).
-  - **Site activity:** Klaviyo onsite tracking and Shopify browsing events (Viewed Product, Active on Site, Added to Cart).
+  - **Site activity:** Klaviyo onsite tracking and Shopify browsing events (Viewed Product, Active on Site, Added to Cart, Checkout Started), whatever integration sends them (in our accounts some arrive through the API).
   - **Third-party:** any other integration (Eventbrite and the like) or custom events sent through the API.
-  - Rules based only on profile properties or list membership get no label. Labels come from each rule's event and that event's source integration.
+  - Rules based only on profile properties or list membership get no label, and neither do Klaviyo subscription events (Subscribed to List, Subscribed to / Unsubscribed from Email Marketing, Subscribed to Back in Stock). Labels come from each rule's event and that event's source integration.
 - `segment_members.csv`: same shape as `list_members.csv`.
 
 ### Back in Stock
 `klaviyo bis export --instance klaviyo_ca [--since YYYY-MM-DD]` exports signups for upload to STOQ.
 - **Source:** Klaviyo has no list endpoint for Back in Stock subscriptions. They exist only as "Subscribed to Back in Stock" events, which are read with the linked profile email (per STOQ's migration guide).
-- **Products are identified by SKU, never by variant ID.** STOQ runs only on the US store, and product and variant IDs differ between the stores. SKUs are confirmed identical in both stores. The SKU is looked up from the CA variant through Klaviyo's product catalog. The CA variant ID is kept only in a reference column. Rows with no SKU are excluded.
-- **Filtering:** keep the latest signup per email and SKU. Skip variants currently in stock, based on the inventory in the `klaviyo_ca` catalog. That's the right check, because STOQ will watch the CA inventory location for CA subscribers. `--since` drops older signups. Every dropped row goes to `bis.excluded.csv` with the reason.
-- **Output:** STOQ's import template columns exactly (`SKU`, `Email`, `Phone`, `Name`, `Market`, `Quantity`, `GDPR confirmed`, `Accepts marketing`, `Language`, `Date`), so the same file can go to `stoq import` or to the STOQ admin upload.
+- **Products are identified by SKU, never by variant ID.** STOQ runs only on the US store, and product and variant IDs differ between the stores. SKUs are confirmed identical in both stores. The SKU is read from the event's `SKU` property (Klaviyo's API doesn't expose Shopify-synced catalogs, so there is no catalog lookup). The CA variant ID is kept only in a reference column. Rows with no SKU are excluded.
+- **Filtering:** keep the latest signup per email and SKU. There is no stock check: every signup is exported, including ones for variants now in stock, and STOQ handles them. `--since` drops older signups. Every dropped row goes to `bis.excluded.csv` with the reason.
+- **Output:** STOQ's import template columns exactly (`SKU`, `Email`, `Phone`, `Name`, `Market`, `Quantity`, `GDPR confirmed`, `Accepts marketing`, `Language`, `Date`), so the file can be uploaded as-is in STOQ admin.
   - Filled from Klaviyo where the event or profile has the data: `SKU`, `Email`, `Name` (first and last name), `Language` (the `Language` custom property, if present), `Accepts marketing` (from email consent), `Date` (the event time), and `Quantity` if the event carries it.
   - Everything else is left blank for me to fill by hand: `Market`, `GDPR confirmed`, and anything that points a subscriber at an inventory location.
   - `Phone` is left blank. SMS is out of scope, and a phone number could make STOQ send SMS alerts to people who signed up by email only.
 
 ## STOQ
 
-`stoq import --to <stoq_dev|stoq_us> --file <csv>`
-- Reads a CSV in STOQ's template format; I may edit it by hand first. The tool only scripts the upload: any inventory-location or market data I put in the CSV is sent as-is, and it doesn't route subscribers itself. (STOQ watches the US inventory location for US and international subscribers and the CA location for CA subscribers.)
-- Creates one signup per row through STOQ's v1 intents API (`POST https://app.stoqapp.com/api/v1/intents.json`), identifying the store with the `X-Shopify-Shop-Domain` header. No API key is needed.
-- Creating a signup sends nothing to the customer; alerts go out later, on restock.
-- Signups that already exist are counted as duplicates, not errors.
-- Writes are paced to STOQ's rate limit: 360 points per minute at 2 points per write, so about 180 signups per minute, or about an hour per 10,000.
-- The README also documents the no-code alternative: STOQ admin → Back in stock alerts → Settings → Integrations → Import data.
+The tool doesn't write to STOQ. I upload the `klaviyo bis export` file by hand in STOQ admin → Back in stock alerts → Settings → Integrations → Import data, after filling `Market`, `GDPR confirmed` and any inventory-location data. The README documents the steps.
+
+Why: STOQ's v1 intents API needs the US store's Shopify variant and product IDs rather than a SKU, takes the market as a numeric Shopify Market ID, and has no inventory-location field. The admin import takes the template columns, SKU included.
 
 ## Testing and acceptance criteria
 
 ### Test environments
 | Service | Test environment | Consequence |
 |---|---|---|
-| Attentive | **None. Production only.** | Every write is tried first as a dry-run, then as a one-segment pilot on a small segment, before any bulk upload. |
 | Klaviyo | Test account `klaviyo_sandbox` (account ID `T2aEdf`) | Every Klaviyo write is tried there first, on addresses we control, before it touches `klaviyo_us`. |
-| STOQ | Our Shopify dev store (`stoq_dev`) | Trial CSVs must use the dev store's SKUs. |
+| STOQ | Our Shopify dev store | A trial CSV using the dev store's SKUs is uploaded by hand in its STOQ admin. |
 
 ### Automated tests
 Unit tests run against recorded API responses and never call a live account.
@@ -172,8 +146,7 @@ Unit tests run against recorded API responses and never call a live account.
 - **Catch-up run:** in `klaviyo_sandbox`, records changed after a `--since` timestamp are exported and re-imported, and nothing older is included.
 - **Klaviyo segments:** labels are spot-checked by hand against five segments with known rules.
 - **Back in Stock export:** a sample of rows checked against the matching Klaviyo events, with correct SKUs, and every excluded row has a reason.
-- **STOQ:** a 10-row import into `stoq_dev` appears in STOQ Reports → Current waitlist with the right SKUs, and no customer is messaged.
-- **Attentive:** one segment piloted to completion in production. The job results file shows no failures other than expected skips. A second upload of the same file is stopped by the duplicate guard, and succeeds with `--append`.
+- **STOQ:** a 10-row export file, edited to the dev store's SKUs and uploaded in the dev store's STOQ admin, appears in STOQ Reports → Current waitlist with the right SKUs, and no customer is messaged.
 - **README:** every command and flag is documented with an example.
 
 ## Legal review
@@ -185,3 +158,7 @@ Legal is reviewing the transfer of CA consent into the US account, including CAS
 - 2026-09-24: Third review. Klaviyo test account `T2aEdf` confirmed. Catch-up run with `--since` on all Klaviyo exports added. New `klaviyo lists add`. Suppressions are no longer filtered by reason; I choose them, and they override newer US subscribes. Attentive `--append` allows re-uploads. BIS stock check stays on CA stock; STOQ columns filled from Klaviyo where possible, otherwise blank; `Phone` left blank. SKUs, cross-account segment cloning and the CSM CSV format (reformatted by hand) confirmed. Local data deleted after the migration.
 - 2026-09-24: Fourth review. Imports don't resume; re-run instead (`--resume` dropped from `stoq import`). `klaviyo whoami` added. CSV everywhere, JSONL only as a fallback. Klaviyo flows, templates, campaigns and event history confirmed out of scope. UTC ISO 8601 timestamps. `lists add` and `suppressions import` create missing profiles; `lists add` writes consent when the file has it. Ambiguous `--segment` names stop with an error.
 - 2026-09-24: Export count check against the dashboards dropped (counts change while an export runs). No open questions remain.
+- 2026-09-24: Phase 1 finding. Klaviyo's API doesn't expose Shopify-synced catalogs, so the BIS SKU comes from the event's `SKU` property and the in-stock check is dropped; STOQ handles in-stock variants.
+- 2026-09-24: Phase 1 finding. Segment labels: site activity is decided by event name whatever the integration, and includes Checkout Started; Klaviyo subscription events get no label.
+- 2026-09-24: Phase 1 finding. Attentive's List Segments API only sees API-created segments. Attentive dropped from the tool entirely (segment export, upload, jobs, whoami, instances and keys); segments are handled by hand.
+- 2026-09-24: Phase 1 finding. STOQ's v1 intents API needs US Shopify variant and product IDs, not SKUs. `stoq import`, the `stoq_dev`/`stoq_us` instances and their `.env` variables dropped; the BIS export file is uploaded by hand in STOQ admin.

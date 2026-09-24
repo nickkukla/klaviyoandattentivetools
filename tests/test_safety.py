@@ -43,8 +43,8 @@ def test_source_write_refused_without_flag_even_with_yes():
 def test_source_write_refused_before_anything_is_shown():
     shown = []
     with pytest.raises(WriteRefused):
-        confirm_write(get_instance("attentive_ca"), account="LOF CA", record_count=1,
-                      echo=shown.append, prompt=lambda _: "attentive_ca")
+        confirm_write(get_instance("klaviyo_ca"), account="LOF CA", record_count=1,
+                      echo=shown.append, prompt=lambda _: "klaviyo_ca")
     assert shown == []
 
 

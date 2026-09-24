@@ -1,0 +1,38 @@
+{
+  "data": [
+    {
+      "type": "account",
+      "id": "T2aEdf",
+      "attributes": {
+        "test_account": true,
+        "contact_information": {
+          "default_sender_name": "Left In Friday Dev",
+          "default_sender_email": "sender@example.com",
+          "website_url": "https://us-dev.leftonfriday.com/",
+          "organization_name": "Left In Friday Dev",
+          "street_address": {
+            "address1": "1 Example St",
+            "address2": null,
+            "city": "Example City",
+            "region": "ON",
+            "country": "CA",
+            "zip": "A1A 1A1"
+          }
+        },
+        "industry": null,
+        "timezone": "America/Los_Angeles",
+        "preferred_currency": "USD",
+        "public_api_key": "XXXXXX",
+        "locale": "en-US"
+      },
+      "links": {
+        "self": "https://a.klaviyo.com/api/accounts/T2aEdf/"
+      }
+    }
+  ],
+  "links": {
+    "self": "https://a.klaviyo.com/api/accounts/",
+    "next": null,
+    "prev": null
+  }
+}

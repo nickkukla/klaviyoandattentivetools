@@ -59,8 +59,8 @@ class RateLimiter:
     """Token buckets that must all allow a request before it is sent.
 
     Klaviyo publishes a burst (per second) and a steady (per minute) limit per
-    endpoint, which are two `Limit`s here. STOQ's 360 points per minute is one
-    `Limit` with each write costing 2.
+    endpoint, which are two `Limit`s here. `acquire(cost)` also supports
+    points-based limits, where one request uses more than one unit.
     """
 
     def __init__(
