@@ -166,7 +166,6 @@ We'll move segments with Klaviyo's "Clone" action in the UI, which works across 
 Unit tests run against recorded API responses and never call a live account.
 
 ### Done when
-- **Exports:** row counts in `manifest.json` match the counts shown in the Klaviyo and Attentive dashboards, allowing for records that changed while the export ran (proposed tolerance: within 0.1%, or any larger gap explained).
 - **Klaviyo profile import:** a 10-profile trial (`--limit 10`) using addresses we control. Re-exporting them shows the same consent status and timestamp, `ca_consent_*` properties are set, and a suppressed profile stays suppressed.
 - **Klaviyo suppressions:** a 5-row trial appears in the destination's suppression list, including one profile that was subscribed there.
 - **Klaviyo list add:** a 5-row trial adds the profiles to a list without changing their consent; running it again changes nothing.
@@ -180,11 +179,9 @@ Unit tests run against recorded API responses and never call a live account.
 ## Legal review
 Legal is reviewing the transfer of CA consent into the US account, including CASL implied consent (which expires two years after a purchase) and moving personal data from the CA business to the US one (PIPEDA). The build proceeds as specified; the spec will be updated with their feedback.
 
-## Open questions
-1. **Export count tolerance:** the proposed 0.1% in the acceptance criteria needs confirming. Exports take a while (about 6,400 pages for `klaviyo_ca` profiles) and sign-ups keep arriving meanwhile, so an exact match with the dashboard may not be achievable.
-
 ## Change history
 - 2026-09-23: Second review. Import writes to a new LOF Canada Newsletter list; never-subscribed profiles imported (cost accepted); `external_id` stored as `ca_external_id`; phone numbers imported; `migrated_from` and `migration_run_id` tags added; list recreation and overlapping-property cleanup left to the user. Legal review and open questions sections added.
 - 2026-09-23: Spec reviewed and revised. Attentive migration replaced by segment export plus CSV membership upload. Attentive campaigns, lists, profiles, catalogs and coupons dropped. "Last order date" and SMS dropped. Suppressions, SKU matching, the STOQ template format, test environments and acceptance criteria added.
 - 2026-09-24: Third review. Klaviyo test account `T2aEdf` confirmed. Catch-up run with `--since` on all Klaviyo exports added. New `klaviyo lists add`. Suppressions are no longer filtered by reason; I choose them, and they override newer US subscribes. Attentive `--append` allows re-uploads. BIS stock check stays on CA stock; STOQ columns filled from Klaviyo where possible, otherwise blank; `Phone` left blank. SKUs, cross-account segment cloning and the CSM CSV format (reformatted by hand) confirmed. Local data deleted after the migration.
 - 2026-09-24: Fourth review. Imports don't resume; re-run instead (`--resume` dropped from `stoq import`). `klaviyo whoami` added. CSV everywhere, JSONL only as a fallback. Klaviyo flows, templates, campaigns and event history confirmed out of scope. UTC ISO 8601 timestamps. `lists add` and `suppressions import` create missing profiles; `lists add` writes consent when the file has it. Ambiguous `--segment` names stop with an error.
+- 2026-09-24: Export count check against the dashboards dropped (counts change while an export runs). No open questions remain.

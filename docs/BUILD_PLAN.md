@@ -78,7 +78,7 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 - `klaviyo suppressions export`: every suppression with email, reason and date; `--since`.
 
 **Gate:**
-- Full profile export of `klaviyo_ca` completes (about 636k rows); totals in `manifest.json` match the dashboard (active, suppressed, never subscribed).
+- Full profile export of `klaviyo_ca` completes (about 636k rows).
 - An export interrupted mid-run finishes correctly with `--resume`, with no duplicate or missing rows.
 - Segment labels spot-checked against five segments with known rules.
 - `--since` on each export returns only records changed after the timestamp.
