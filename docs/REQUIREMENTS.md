@@ -82,13 +82,20 @@ Also out of scope: flows, templates, campaigns, and event and order history. Non
   - Klaviyo accepts only consent status and timestamp, so the original consent method and source are also stored as custom properties `ca_consent_method` and `ca_consent_source`.
   - Suppressed profiles **must** stay suppressed on the destination. The API can't set the original suppression reason, so the reason and date are also stored as custom properties `ca_suppression_reason` and `ca_suppression_timestamp`.
   - `--limit N` imports only the first N rows, for trials.
+  - Rows without an email are skipped and listed with the reason in `<run>.skipped.csv` (20,429 CA profiles have no email; SMS is out of scope). Repeated emails in a file are skipped after the first.
+  - Klaviyo keeps the existing consent timestamp of a profile that is already subscribed in the destination; only profiles not currently subscribed get the CA timestamp. Unsubscribes are timestamped at import time (the API can't backdate them); the original date is in `ca_suppression_timestamp`.
+  - `$`-prefixed properties (Klaviyo-internal, e.g. `$consent`) are never written. Blank cells never clear destination values.
 
 ### Suppressions across accounts
 Suppression is treated as one more place I attach a chosen set of profiles, like a list. The tool doesn't decide which suppressions to apply; I do, by editing the file.
 - **Export:** `klaviyo suppressions export --instance <instance> [--since <timestamp>]` writes every email suppression with its email, reason and date.
-- **Import:** `klaviyo suppressions import --to <instance> --file <csv>` suppresses every email in the file, **including profiles the external dedupe removed** because they also exist in US. An email with no profile in the destination gets a new, suppressed profile.
+- **Import:** `klaviyo suppressions import --to <instance> --file <csv> [--limit N] [--as-unsubscribe]` suppresses every email in the file, **including profiles the external dedupe removed** because they also exist in US. An email with no profile in the destination gets a new, suppressed profile.
 - **Suppressions trump everything.** A profile suppressed in CA is suppressed in US even if it subscribed more recently on the US store. The number affected is expected to be very low.
 - Can be run more than once; already-suppressed emails are unchanged.
+- Klaviyo applies suppression jobs in the background: in `klaviyo_sandbox` they took about four hours, and the job status stayed `processing` and reported every profile as skipped even after they were suppressed. So the import submits the jobs and doesn't wait for them.
+- **Check:** `klaviyo suppressions check --instance <instance> --file <csv>` (read-only) reports each email's current state (suppressed, unsubscribed only, not suppressed, no profile) and writes those not yet suppressed to a CSV. Run it some hours after the import.
+- `--limit N` sends only the first N rows. The migration pilots the suppression endpoint on a single address (`--limit 1`) and confirms it with `suppressions check` before sending the full file.
+- `--as-unsubscribe` (also on `profiles import`) unsubscribes instead of suppressing. It blocks marketing email immediately, without waiting hours for the suppression jobs, but a later subscribe on the US store lifts it and the Klaviyo reason reads "Unsubscribed" (the original is kept in `ca_suppression_reason`). Use it as a floor, then apply true suppression in the Klaviyo UI.
 
 ### Lists
 `klaviyo lists export --instance <instance> [--since <timestamp>]` writes:
@@ -163,3 +170,5 @@ Legal is reviewing the transfer of CA consent into the US account, including CAS
 - 2026-09-24: Phase 1 finding. Attentive's List Segments API only sees API-created segments. Attentive dropped from the tool entirely (segment export, upload, jobs, whoami, instances and keys); segments are handled by hand.
 - 2026-09-24: Phase 1 finding. STOQ's v1 intents API needs US Shopify variant and product IDs, not SKUs. `stoq import`, the `stoq_dev`/`stoq_us` instances and their `.env` variables dropped; the BIS export file is uploaded by hand in STOQ admin.
 - 2026-09-24: Phase 2. The profile counts previously given for `klaviyo_ca` were `klaviyo_us` figures; CA figures replaced with the full export's counts.
+- 2026-09-24: Phase 3. Rows without an email are skipped. `suppressions import` gets `--limit` for a one-address pilot, and both suppression paths get `--as-unsubscribe` as a fallback. No writes to `klaviyo_ca` or `klaviyo_us` during development.
+- 2026-09-24: Phase 3. Bulk suppression does work in the sandbox but applied about four hours after submission, with a misleading job status; the import no longer waits on suppression jobs, and `suppressions check` confirms the result.

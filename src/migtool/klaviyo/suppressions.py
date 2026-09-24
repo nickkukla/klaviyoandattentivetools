@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 
 from migtool.klaviyo.client import KlaviyoClient
@@ -48,3 +49,35 @@ def export(
         progress(exp.rows)
         if nxt is None:
             break
+
+
+CHECK_COLUMNS = ["email", "state", "reasons"]
+LOOKUP_BATCH = 100
+
+
+def check(client: KlaviyoClient, emails: Iterable[str]) -> dict[str, dict[str, str]]:
+    """Each email's current state: `suppressed` (a suppression other than an
+    unsubscribe), `unsubscribed` (only an unsubscribe), `not suppressed`, or
+    `no profile`. Read-only."""
+    wanted = sorted({e.lower() for e in emails})
+    found: dict[str, dict[str, str]] = {}
+    for i in range(0, len(wanted), LOOKUP_BATCH):
+        listed = ",".join(json.dumps(e) for e in wanted[i:i + LOOKUP_BATCH])
+        params = {
+            "filter": f"any(email,[{listed}])",
+            "additional-fields[profile]": "subscriptions",
+            "fields[profile]": "email,subscriptions",
+            "page[size]": "100",
+        }
+        for page in client.paginate("/profiles/", tier=TIER, params=params):
+            for profile in page["data"]:
+                attrs = profile["attributes"]
+                reasons = [s.get("reason") or "" for s in email_marketing(attrs).get("suppression") or []]
+                if any(r != "UNSUBSCRIBE" for r in reasons):
+                    state = "suppressed"
+                elif reasons:
+                    state = "unsubscribed"
+                else:
+                    state = "not suppressed"
+                found[(attrs.get("email") or "").lower()] = {"state": state, "reasons": ";".join(reasons)}
+    return {e: {"email": e, **found.get(e, {"state": "no profile", "reasons": ""})} for e in wanted}

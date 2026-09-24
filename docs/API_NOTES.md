@@ -95,9 +95,18 @@ Sandbox results (`klaviyo_sandbox`, test lists `migtool phase1 DOI` `WgThjd` (do
 
 - ✅ **Historical-import subscribe skips double opt-in.** `test01`–`test03` into the double-opt-in list: `SUBSCRIBED` and on the list immediately, `consent_timestamp` = the `consented_at` sent (2024-01-15), `method` `API`, `$source` = `custom_source`. The legacy `$consent_timestamp` property shows the import time, so exports must read `subscriptions.email.marketing.consent_timestamp`.
 - ✅ **List relationship on bulk import leaves consent alone.** `test01` (subscribed) kept `SUBSCRIBED`/2024-01-15, `test04` stayed `NEVER_SUBSCRIBED`, and `test05` (no profile) was created `NEVER_SUBSCRIBED`. All three joined the list. A second identical run changed nothing (same `joined_group_at`, same consent).
-- ⏳ **Bulk suppression.** Two jobs (`01M3ACS7…` for `test02`, submitted 19:02; `01M3AD1C…` for `test02` + `test06`, submitted 19:07) showed `total_count` 0 for about 20 minutes. At 19:28 they read `processing`, `total_count` 1 and 2, `completed_count` 0, `skipped_count` 1 and 2. `test06` was created at 19:26 as `NEVER_SUBSCRIBED` but isn't suppressed; `test02` is still `SUBSCRIBED` and unsuppressed. The job has no errors sub-resource (404), so no reason is given. Unknown whether this is final, or something specific to the test account (`test_account: true`). A third job using the list form (`relationships.list` → `migtool phase1 list-add`, job `01M3AED2…`, 19:31) **also skipped every profile** (3 of 3, counted at 19:42; nothing suppressed by 20:12). Both request forms behave the same, so the cause looks account-side, not the payload (which matches the published OpenAPI schema exactly).
-  - **Deferred (2026-09-24):** not settled in phase 1. Only tried in `klaviyo_sandbox`; untested elsewhere. Revisit with the list-form result, a one-address test in `klaviyo_us` (needs approval), or Klaviyo support. Fallback: suppressions handled by hand in the Klaviyo UI.
-  - Either way, suppression jobs can take 20+ minutes to start, so `suppressions import` must poll patiently and report skipped counts.
+- ✅ **Bulk suppression works, but took about four hours to apply, and its job status is wrong** (corrected 2026-09-24; earlier notes said it "skipped every profile"):
+
+  | Job | Submitted | Emails | Suppressed at | Job status afterwards |
+  |---|---|---|---|---|
+  | `01M3ACS7…` | 19:02 | `test02` | 22:58 | `processing`, total 1, skipped 1 |
+  | `01M3AD1C…` | 19:07 | `test02`, `test06` | `test06` 23:00 | `processing`, total 2, skipped 2 |
+  | `01M3AED2…` (list form) | 19:31 | `test01`, `test04`, `test05` | 23:19 | `processing`, total 3, skipped 3 |
+
+  - Each became a `USER_SUPPRESSED` suppression. Consent stayed `SUBSCRIBED` where it was, but `can_receive_email_marketing` went false: suppression wins over consent, as the spec needs.
+  - The job never leaves `processing`, sets `completed_at` early, and reports every profile as `skipped` even when they are later suppressed. **Don't use the job status to judge the result.** Check the profiles instead (`klaviyo suppressions check`).
+  - The missing profile in job 2 (`test06`) was created within about 20 minutes and suppressed about 4 hours later.
+  - Latency in `klaviyo_us` is unknown (no production writes during development). The one-address pilot in the real run confirms it.
 - ✅ **No emails sent.** The test profiles have only `Subscribed to List`, `Subscribed to Email Marketing` and (for `test03`) `Unsubscribed from Email Marketing` events, with no `Received Email`. Historical-import subscribe events are **backdated** to `consented_at`. The bulk import list add logged no events.
 
 ## STOQ
@@ -111,3 +120,12 @@ Source: https://docs.stoqapp.com/v1/ (checked 2026-09-24).
 - Sending only a SKU returns 404 `{"error":"Not found"}`, the same as a fake variant ID or an unknown shop.
 - The v1 docs don't mention rate limits or duplicate responses (the 360 points/min figure isn't on this page).
 - SKU → US IDs: the US storefront's public `/products.json` gives `variants[].{id, product_id, sku}` (235 products and 1,088 variants on page 1), but only for published products. The dev storefront is password-protected (401).
+
+## Phase 3 sandbox trial (2026-09-24)
+
+- **Consent timestamps:** historical-import subscribe sets the original `consented_at` on profiles not currently subscribed (`test06`, `test10`, `test13`). On a profile **already subscribed**, it keeps the existing timestamp (`test02`: file 2020, kept 2024; `test04`: file 2019, kept 2025).
+- **Unsubscribe** (`profile-subscription-bulk-delete-jobs`) applies at once: consent `UNSUBSCRIBED`, a suppression item `{reason: UNSUBSCRIBE}` stamped with the current time, and the profile shows in Klaviyo's suppressed list. It is the immediate fallback while suppression jobs apply, or if they don't (`--as-unsubscribe`).
+- **Bulk import** with only `email` + list relationship leaves every other field and consent untouched; the CA profile `id` and `$`-properties are never sent; `external_id` in the destination stays as it was (`test04` kept `US-04`, `ca_external_id=CA-04`).
+- **Property types** round-trip through the CSV: `3` → number, `01234` → text, `["vip","swim"]` → list.
+- **No emails:** no `Received Email` events on any trial profile, including those subscribed into a double-opt-in list.
+- **Catch-up:** after changing `test13` (property), `test15` (subscribe) and `test10` (unsubscribe), `profiles export --since` returned exactly `test13` and `test15`, and `suppressions export --since` exactly `test10`, out of ~153k sandbox profiles.

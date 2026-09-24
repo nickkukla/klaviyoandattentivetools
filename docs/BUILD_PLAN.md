@@ -84,7 +84,7 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 
 - `klaviyo profiles import`: bulk profile import, then historical-import subscribe (to `--list-id`) using the original consent timestamp, then unsubscribe/suppress where the CSV says so. Writes `ca_consent_method`, `ca_consent_source`, `ca_suppression_reason`, `ca_suppression_timestamp`, `ca_external_id` (from the `external_id` column; the source profile `id` is never sent), `migrated_from=ca` and `migration_run_id` (generated per run, recorded in `manifest.json`). Imports `phone_number`. Supports `--limit`.
 - `klaviyo whoami`.
-- `klaviyo suppressions import` (API behaviour unsettled in phase 1: sandbox bulk suppression jobs skipped every profile; see `API_NOTES.md`. Settle this first; fallback is suppressing by hand in the Klaviyo UI): suppresses every email in the file, whatever its consent in the destination; creates missing profiles as suppressed.
+- `klaviyo suppressions import` (suppression jobs took about four hours to apply in the sandbox, and their status is misleading, so the import doesn't wait on them; `klaviyo suppressions check` confirms the result; `--as-unsubscribe` and the Klaviyo UI are the fallbacks): suppresses every email in the file, whatever its consent in the destination; creates missing profiles as suppressed.
 - `klaviyo lists add`: adds every profile in the file to one list; creates missing profiles; writes consent only when the file has consent columns; safe to repeat.
 - All three track Klaviyo's background jobs and put per-record errors in the errors file.
 
@@ -114,7 +114,7 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 ## Migration run order (after sign-off)
 
 1. Klaviyo: create the LOF Canada Newsletter list in `klaviyo_us`. Export profiles from `klaviyo_ca` and `klaviyo_us`; dedupe outside the tool (including phone uniqueness and removing overlapping Shopify properties); import unique CA profiles into `klaviyo_us` with `--list-id` set to the LOF Canada Newsletter list.
-2. Klaviyo: export CA suppressions; choose which to apply by editing the file; import into `klaviyo_us`.
+2. Klaviyo: export CA suppressions; choose which to apply by editing the file. Pilot one address first (`suppressions import --limit 1`), then run `suppressions check` on it until it shows as suppressed (this took about four hours in the sandbox). Then import the rest and check them the same way. If the pilot never applies, import with `--as-unsubscribe` and apply true suppression in the Klaviyo UI.
 3. Klaviyo: export lists and segments from `klaviyo_ca`; attach chosen sets of profiles to US lists with `lists add` or through the Klaviyo UI (often into existing US lists); clone segments in the Klaviyo UI.
 4. Back in Stock: export from `klaviyo_ca`; review the CSV and fill `Market`, `GDPR confirmed` and inventory-location data; upload it in STOQ admin on the US store.
 5. Catch-up run, immediately before CA Klaviyo sign-ups are turned off: repeat steps 1–4 with `--since` set to the start of the main run (the suppressions export is required: unsubscribes don't move a profile's `updated` time, so only it catches them); dedupe the delta files; re-import.
