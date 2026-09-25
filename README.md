@@ -59,7 +59,30 @@ Every write command (`profiles import`, `suppressions import`, `lists add`):
 
 Every write can be repeated safely. Re-importing a profile updates it, adding a profile to a list it's already on changes nothing, and suppressing a suppressed email changes nothing. A failed import is simply re-run; imports don't resume.
 
+When a write goes wrong partway:
+
+- **Bad rows:** Klaviyo refuses a whole batch if one row is invalid (a bad phone number, say). The tool splits the batch until the bad rows are isolated, sends the rest, and lists the refused rows with Klaviyo's reason in the errors file.
+- **Unknown outcomes:** counts come from Klaviyo's own job results. A profile whose result can't be confirmed (job still running, failed, or its error list unreadable) is counted as failed with "outcome unknown", never as written.
+- **Aborted runs:** if the run stops (a revoked key, an outage after retries, Ctrl-C), it still writes the manifest (status `aborted`), the errors and skipped files and the summary, and exits non-zero. Jobs already submitted are listed in `state/` and may still be applied.
+
 ## Output files
+
+Files are UTF-8. The tool also reads CSVs saved by Excel as "CSV UTF-8" (with a byte-order mark).
+
+**Opening exports in Excel:** customer-entered text (names, properties) can start with `=`, `+`, `-` or `@`, which Excel may treat as a formula. Use Data → From Text/CSV and set the columns to Text, or edit the files in a text editor, rather than double-clicking them. The tool doesn't escape these values, because escaping would change the data on re-import.
+
+### Property types
+
+`profiles export` keeps each custom property's type in its column header, so re-importing restores it exactly:
+
+| Header | Values | Imported as |
+|---|---|---|
+| `properties.zip` (no suffix) | anything | text, always (`01234` and `123` stay text) |
+| `properties.orders#number` | `3`, `2.5` | number |
+| `properties.vip#bool` | `true`, `false` | true/false |
+| `properties.tags#json` | `["vip","swim"]`, `"x"`, `7` | JSON (lists, objects, and properties whose type varies between profiles) |
+
+Keep the suffixes when editing. A column you add without a suffix is imported as text. A cell that doesn't fit its column's type (e.g. `three` in a `#number` column) is reported in the errors file and that row isn't sent. Exports made before this change have no suffixes, so re-export before importing.
 
 Everything goes under `exports/<instance>/<object>/`, named by the run's UTC start time (for example `20260924T195337Z.csv`):
 
@@ -97,7 +120,7 @@ uv run migtool klaviyo whoami --instance klaviyo_us
 
 Writes every profile, whatever its consent or suppression state, to CSV. The layout is the one `profiles import` reads, so an exported file can be edited and re-imported.
 
-Columns: `id`, `email`, `phone_number`, `external_id`, names, `locale`, dates, `location.*`, email consent (`consent`, `consent_timestamp`, `method`, `method_detail`, `custom_method_detail`, `double_optin`, …), suppression (`suppression_reason`, `suppression_timestamp`, all `suppressions` as JSON), custom properties as `properties.<key>` (nested values as JSON text), and with `--with-predictive`, `predictive_analytics.*`.
+Columns: `id`, `email`, `phone_number`, `external_id`, names, `locale`, dates, `location.*`, email consent (`consent`, `consent_timestamp`, `method`, `method_detail`, `custom_method_detail`, `double_optin`, …), suppression (`suppression_reason`, `suppression_timestamp`, all `suppressions` as JSON), custom properties as `properties.<key>` (see [Property types](#property-types)), and with `--with-predictive`, `predictive_analytics.*`.
 
 | Flag | |
 |---|---|
@@ -126,6 +149,17 @@ Imports a `profiles export` CSV (edited as needed) into the destination, keeping
 4. Suppresses rows with any other suppression reason (hard bounce, spam complaint, user-suppressed, invalid email). The jobs are submitted and not waited on; see `suppressions check`.
 
 Never-subscribed rows get no consent change. Rows without an email are skipped and listed in the skipped file.
+
+Klaviyo rules to expect in the errors file or the data:
+
+- A subscribe backdated to before a **newer unsubscribe** in the destination is refused ("backdated consent date … is before current unsubscription date"). That person stays unsubscribed, which is the right outcome.
+- An **invalid phone number** is silently dropped on import, with no error. Validate phone numbers during the dedupe.
+
+Steps 2–4 only run for profiles whose import Klaviyo **confirmed**. If a profile's import failed, was refused or is still pending, its consent is held back (so a subscribe can never create a bare, untagged profile), the row is in the errors file, and the manifest counts it under `steps.consent_held_back`. Fix the rows and re-run them.
+
+A row with a hard bounce or spam complaint in its `suppressions` history is suppressed even if its latest suppression is an unsubscribe.
+
+**Flows:** step 1 adds profiles to the list before step 2's historical subscribe, so a flow triggered by joining that list could fire. For the migration, every destination flow is gated on profile triggers that exclude CA members, so no flow runs for them.
 
 | Flag | |
 |---|---|

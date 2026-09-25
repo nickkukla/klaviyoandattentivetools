@@ -142,3 +142,13 @@ Source: https://docs.stoqapp.com/v1/ (checked 2026-09-24).
 After the 10-row trial upload to the dev store's STOQ admin (01:09–01:10 UTC), the dev store's STOQ integration pushed the signups into `klaviyo_sandbox`. It set `StoqAcceptsMarketing`, `StoqBackInStock` and `StoqLocaleCountry` on all 10 profiles and logged "Customer signed up for alert (STOQ)". It also **subscribed six of them to email marketing (`method: API`)**: some had been unsubscribed, two had `Accepts marketing = false` in the file, and one (`test05`) was "Manually Unsuppressed" first. Profiles that were already subscribed and suppressed stayed suppressed. No `Received Email` events were seen.
 
 Decision: handled by hand. Before uploading, the user compares the BIS emails against the Klaviyo profile exports and removes signups from people who are unsubscribed or never subscribed.
+
+## Review-fix trial (2026-09-25, `klaviyo_sandbox`)
+
+A 4-row file saved like Excel "CSV UTF-8" (byte-order mark, CRLF), run `20260925T022655Z-83dd`:
+- The BOM file read correctly.
+- A bad `#number` cell (`three`) was reported and that row wasn't sent.
+- Typed properties arrived exactly: `code` stayed the text `"123"`, `orders` became the number 5, `vip` true, `tags` a list.
+- ⚠️ **Klaviyo refuses a backdated subscribe older than a newer unsubscribe:** `400 Invalid input.: backdated consent date [2020-01-11 …] is before current unsubscription date [2026-09-24 …]`. The subscribe batch was split, the other row went through, and the refused row is in the errors file. In the migration this means a CA subscriber who has since unsubscribed in US stays unsubscribed.
+- ⚠️ **Klaviyo silently drops an invalid phone number on bulk import** (`+1234`: the profile was imported and the phone not stored, with no import error). The tool can't detect this; the external dedupe should validate phones.
+- `test12`'s historical subscribe was accepted (202) but not visible about 40 s later, unlike the Phase 3 trial (about 15 s). `test12` also has a suppression job pending from the Phase 3 trial. Rechecked at 02:50 UTC.

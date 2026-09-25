@@ -69,7 +69,7 @@ Also out of scope: flows, templates, campaigns, and event and order history. Non
   - "Last order date" is **not** required. It isn't a field on the profile, so it isn't exported or derived.
 - **CSV layout:** export and import use the same layout, so an exported file can be edited and re-imported unchanged.
   - Standard fields as columns: `email`, `phone_number`, `external_id`, `first_name`, `last_name`, `locale`, `location.*`, and so on.
-  - Custom properties as `properties.<key>`, with nested values stored as JSON text. "Language" isn't a native Klaviyo field; if present it appears here.
+  - Custom properties as `properties.<key>`. A property whose values aren't all text gets its type in the header (`properties.orders#number`, `#bool`, `#json`), so import restores it exactly; unmarked columns are imported as text and never guessed at. "Language" isn't a native Klaviyo field; if present it appears here.
   - Email marketing consent as one column per detail: `consent`, `consent_timestamp`, `method`, `method_detail`, `custom_method_detail`, `double_optin`, and suppression details.
 - **Import:** `klaviyo profiles import --to <instance> --file <csv> --list-id <id> [--limit N]`. It works in either direction; the project will use it CA → US only. It is the first Klaviyo write in the migration: every profile goes into one overall migration list, and the CA lists and segments are recreated or cloned and populated afterwards.
   - Background: I manually export profiles from both accounts, dedupe them outside this tool (most recent consent timestamp wins), and import only the profiles unique to CA into US. The tool has **no** dedupe features and doesn't check whether profiles already exist. The import updates matching profiles (by email or phone), and the README says so.
@@ -85,6 +85,8 @@ Also out of scope: flows, templates, campaigns, and event and order history. Non
   - Rows without an email are skipped and listed with the reason in `<run>.skipped.csv` (20,429 CA profiles have no email; SMS is out of scope). Repeated emails in a file are skipped after the first.
   - Klaviyo keeps the existing consent timestamp of a profile that is already subscribed in the destination; only profiles not currently subscribed get the CA timestamp. Unsubscribes are timestamped at import time (the API can't backdate them); the original date is in `ca_suppression_timestamp`.
   - `$`-prefixed properties (Klaviyo-internal, e.g. `$consent`) are never written. Blank cells never clear destination values.
+  - Consent steps run only for profiles whose import Klaviyo confirmed; failed, refused, pending or unknown rows are held back and listed in the errors file. Every suppression reason in a row's history counts, so an old hard bounce behind a newer unsubscribe is still suppressed.
+  - A batch Klaviyo refuses as invalid is split to isolate the bad rows. Batches stay under Klaviyo's 5 MB limit. A run that stops early still writes its manifest (`aborted`), errors and summary.
 
 ### Suppressions across accounts
 Suppression is treated as one more place I attach a chosen set of profiles, like a list. The tool doesn't decide which suppressions to apply; I do, by editing the file.
@@ -173,3 +175,4 @@ Legal is reviewing the transfer of CA consent into the US account, including CAS
 - 2026-09-24: Phase 3. Rows without an email are skipped. `suppressions import` gets `--limit` for a one-address pilot, and both suppression paths get `--as-unsubscribe` as a fallback. No writes to `klaviyo_ca` or `klaviyo_us` during development.
 - 2026-09-24: Phase 3. Bulk suppression does work in the sandbox but applied about four hours after submission, with a misleading job status; the import no longer waits on suppression jobs, and `suppressions check` confirms the result.
 - 2026-09-24: Phase 4. BIS `Language` falls back to the profile locale; `Accepts marketing` means subscribed and not suppressed; `Date` is `dd/mm/yyyy` (STOQ's format); CA IDs move to a separate `bis.reference.csv` so the upload file is exactly the template.
+- 2026-09-25: Review fixes. Consent held back for unconfirmed imports; refused batches split to isolate bad rows; byte-limited batches; counts from job results (unknown is never success); aborted runs still recorded; full suppression history used; typed property columns replace type guessing; Excel BOM accepted. Destination flows are gated on profile triggers for CA members.

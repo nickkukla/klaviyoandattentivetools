@@ -132,6 +132,7 @@ def profiles_export(
         params = {"segment": segment_id, "since": since, "with_predictive": with_predictive}
         exp = ResumableExport(
             instance, "profiles", profiles.COLUMNS, resume=resume, staged=True, unique_by=["id"],
+            typed_prefix="properties.",
             params={k: v for k, v in params.items() if v},
         )
         skipped = profiles.export(
@@ -150,7 +151,7 @@ def suppressions_export(instance: str = INSTANCE, since: str | None = SINCE, res
     since_dt = _since(since)
     with _client(instance) as client:
         exp = ResumableExport(
-            instance, "suppressions", suppressions.COLUMNS, resume=resume,
+            instance, "suppressions", suppressions.COLUMNS, resume=resume, staged=True,
             unique_by=["profile_id", "reason", "timestamp"],
             params={"since": since} if since else None,
         )
@@ -293,15 +294,25 @@ def _write_run(
             store.add_job(inst.name, {"id": job.id, "kind": job.kind, "run_id": run.run_id, "size": job.size})
 
         imp = imports.Importer(Writer(client), log, echo=typer.echo, save_job=save_job, main_step=main_step)
-        counts = body(imp, batch.rows, columns, run) or {}
+        counts: dict = {}
+        aborted: str | None = None
+        try:
+            counts = body(imp, batch.rows, columns, run) or {}
+        except (ApiError, KeyboardInterrupt) as exc:
+            # Stop, but still record what was sent: earlier jobs may be running.
+            aborted = "interrupted" if isinstance(exc, KeyboardInterrupt) else str(exc)
+            log.error("run", f"stopped: {aborted}. Jobs already submitted are in state/ and may still "
+                      "be applied; re-running the file is safe.", stage="aborted")
         for job in imp.unfinished:
-            log.error(f"job {job.id}", f"{job.kind} still {job.status or 'processing'}; check it later",
-                      stage="wait")
+            typer.echo(f"Job {job.id} ({job.kind}) was still {job.status or 'processing'} when the run ended.")
     skipped_path = imports.write_skipped(run, batch.skipped)
     files = {skipped_path.name: len(batch.skipped)} if skipped_path else {}
+    if aborted:
+        status = "aborted"
+    else:
+        status = "complete" if not log.counts["failed"] else "completed with errors"
     write_manifest(
-        run, files=files, counts={**log.counts, **counts, "steps": imp.steps},
-        status="complete" if not log.counts["failed"] else "completed with errors",
+        run, files=files, counts={**log.counts, **counts, "steps": imp.steps}, status=status,
         extra={"migration_run_id": run.run_id, "source_file": str(file), "account": account["id"],
                **(extra_manifest or {})},
     )

@@ -93,8 +93,13 @@ Finding: STOQ's Klaviyo integration then subscribed six of the uploaded addresse
 
 All 11 commands and every flag have a description and at least one example. This was checked by a script that walks the CLI's own command definitions and looks for each one in its README section. The README also covers setup, key scopes, write safety, output files, the run order, STOQ preparation and upload, the catch-up run, warnings, deleting local data and troubleshooting.
 
+## Review (2026-09-25)
+
+An independent review (Codex) found failure-path issues; all were fixed with tests (see the change history in `docs/REQUIREMENTS.md`). One concern, that adding profiles to a list before the historical subscribe could trigger list flows, is resolved operationally: every destination flow is gated on profile triggers that exclude CA members.
+
 ## Open before the migration run
 
 - Result of the scheduled `suppressions check` for `test12` (criterion 2).
+- Re-export CA profiles with the current version before importing (typed property columns).
 - Legal review of consent transfer (CASL, PIPEDA), per `docs/REQUIREMENTS.md`.
 - Give the `klaviyo_us` key write scopes only when the migration run starts.

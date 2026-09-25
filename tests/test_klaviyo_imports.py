@@ -10,35 +10,90 @@ from migtool.cli import app
 from migtool.config import Secret
 from migtool.klaviyo import imports
 from migtool.klaviyo.client import KlaviyoClient
-from migtool.klaviyo.writes import Job, Writer, ca_properties, parse_value, profile_attributes
-from migtool.output import new_run
+from migtool.klaviyo.writes import (
+    Job,
+    Writer,
+    byte_batches,
+    ca_properties,
+    profile_attributes,
+    property_column,
+    typed_value,
+)
+from migtool.output import ResumableExport, new_run
 from migtool.runlog import RunLog
+from migtool.state import StateStore
 
 API = "https://a.klaviyo.com/api"
 
 
-@pytest.mark.parametrize("text,value", [
-    ("true", True), ("3", 3), ("2.5", 2.5), ("01234", "01234"), ("1e3", "1e3"),
-    ('["a",1]', ["a", 1]), ('{"k":"v"}', {"k": "v"}), ("[not json", "[not json"), ("hello", "hello"),
+# --- Reading cells -----------------------------------------------------------
+
+@pytest.mark.parametrize("column,expected", [
+    ("properties.orders#number", ("orders", "number")), ("properties.vip#bool", ("vip", "bool")),
+    ("properties.tags#json", ("tags", "json")), ("properties.zip", ("zip", "text")),
+    ("properties.a#b", ("a#b", "text")),
 ])
-def test_parse_value(text, value):
-    assert parse_value(text) == value
+def test_property_column(column, expected):
+    assert property_column(column) == expected
+
+
+@pytest.mark.parametrize("text,kind,value", [
+    ("123", "text", "123"), ("true", "text", "true"), ("[1,2]", "text", "[1,2]"),
+    ("3", "number", 3), ("2.5", "number", 2.5), ("1e3", "number", 1000.0),
+    ("TRUE", "bool", True), ('["a",1]', "json", ["a", 1]), ('"x"', "json", "x"),
+])
+def test_typed_value_never_guesses_text(text, kind, value):
+    assert typed_value(text, kind) == value
+    assert type(typed_value(text, kind)) is type(value)
 
 
 def test_profile_attributes_never_sends_ids_or_internal_properties():
     row = {"id": "CAPROF", "email": "a@example.com", "external_id": "CA-1", "anonymous_id": "anon",
            "first_name": "A", "last_name": "", "location.city": "Toronto", "location.latitude": "43.6",
-           "properties.Language": "fr", "properties.$consent": '["email"]', "properties.empty": ""}
+           "properties.Language": "fr", "properties.code": "123", "properties.orders#number": "3",
+           "properties.$consent": '["email"]', "properties.empty": ""}
     attrs = profile_attributes(row, ca_properties(row, "RUN1"))
     assert attrs["email"] == "a@example.com" and attrs["first_name"] == "A"
     assert "last_name" not in attrs  # blank cells never clear destination values
     assert not {"id", "external_id", "anonymous_id"} & set(attrs)
     assert attrs["location"] == {"city": "Toronto", "latitude": 43.6}
     props = attrs["properties"]
-    assert props["Language"] == "fr" and "$consent" not in props and "empty" not in props
+    assert props["Language"] == "fr" and props["code"] == "123" and props["orders"] == 3
+    assert "$consent" not in props and "empty" not in props
     assert props["ca_external_id"] == "CA-1"
     assert (props["migrated_from"], props["migration_run_id"]) == ("ca", "RUN1")
 
+
+def test_bad_typed_cell_is_an_error_not_a_guess():
+    with pytest.raises(ValueError, match="properties.orders#number"):
+        profile_attributes({"email": "a@example.com", "properties.orders#number": "three"}, {})
+
+
+def test_read_rows_accepts_excel_bom(tmp_path):
+    f = tmp_path / "excel.csv"
+    f.write_bytes("﻿email,first_name\r\na@example.com,Ann\r\n".encode("utf-8"))
+    columns, rows = imports.read_rows(f)
+    assert columns == ["email", "first_name"] and rows == [{"email": "a@example.com", "first_name": "Ann"}]
+
+
+def test_typed_export_round_trips_through_import(tmp_path):
+    exp = ResumableExport("klaviyo_ca", "profiles", ["id", "email"], staged=True, typed_prefix="properties.",
+                          store=StateStore(tmp_path / "state"), base=tmp_path / "exports", echo=lambda _: None)
+    sent = {"properties.code": "123", "properties.orders": 3, "properties.vip": True,
+            "properties.tags": ["a", "b"], "properties.mixed": "x"}
+    exp.write({"id": "1", "email": "a@example.com", **sent})
+    exp.write({"id": "2", "email": "b@example.com", "properties.mixed": 7, "properties.orders": 2.5})
+    exp.checkpoint(None)
+    exp.finish()
+    _, rows = imports.read_rows(exp.run.path(".csv"))
+    assert set(rows[0]) >= {"properties.code", "properties.orders#number", "properties.vip#bool",
+                            "properties.tags#json", "properties.mixed#json"}
+    props = profile_attributes(rows[0], {})["properties"]
+    assert props == {"code": "123", "orders": 3, "vip": True, "tags": ["a", "b"], "mixed": "x"}
+    assert profile_attributes(rows[1], {})["properties"] == {"mixed": 7, "orders": 2.5}
+
+
+# --- Deciding consent --------------------------------------------------------
 
 def test_plan_profiles_import():
     rows = [
@@ -54,6 +109,14 @@ def test_plan_profiles_import():
     assert plan["suppress"] == ["sub-bounced", "never-spam"]
 
 
+def test_older_hard_bounce_behind_newer_unsubscribe_is_still_suppressed():
+    row = {"email": "a", "consent": "UNSUBSCRIBED", "suppression_reason": "UNSUBSCRIBE",
+           "suppressions": json.dumps([{"reason": "HARD_BOUNCE", "timestamp": "2024-01-01T00:00:00+00:00"},
+                                       {"reason": "UNSUBSCRIBE", "timestamp": "2025-01-01T00:00:00+00:00"}])}
+    plan = imports.plan_profiles_import([row])
+    assert plan["unsubscribe"] == ["a"] and plan["suppress"] == ["a"]
+
+
 def test_usable_skips_rows_with_reasons():
     batch = imports.usable([
         {"email": "A@Example.com"}, {"email": "", "phone_number": "+14165550100"},
@@ -64,6 +127,140 @@ def test_usable_skips_rows_with_reasons():
         "no email (phone +14165550100)", "duplicate email in file", "not a valid email"]
 
 
+# --- The real write client against mocked Klaviyo HTTP ----------------------
+
+def writer():
+    now = [0.0]
+    return Writer(KlaviyoClient(Secret("pk_x")), sleep=lambda s: now.__setitem__(0, now[0] + s),
+                  clock=lambda: now[0], poll_seconds=1)
+
+
+def emails_in(request) -> list[str]:
+    return [p["attributes"]["email"] for p in json.loads(request.content)["data"]["attributes"]["profiles"]["data"]]
+
+
+def job_body(jid, status="queued", **counts):
+    return {"data": {"id": jid, "attributes": {"status": status, **counts}}}
+
+
+@respx.mock
+def test_rejected_batch_is_split_to_isolate_bad_rows():
+    def respond(request):
+        if "bad@example.com" in emails_in(request):
+            return httpx.Response(400, json={"errors": [{"title": "Invalid input.", "detail": "bad phone"}]})
+        return httpx.Response(202, json=job_body(f"j{len(emails_in(request))}"))
+    route = respx.post(f"{API}/profile-bulk-import-jobs/").mock(side_effect=respond)
+    profiles = [{"email": e} for e in ("a@example.com", "b@example.com", "bad@example.com", "c@example.com")]
+    jobs, rejected = writer().import_profiles(profiles, list_id="L1")
+    assert rejected == [("bad@example.com", "400 Invalid input.: bad phone")]
+    assert sorted(e for j in jobs for e in j.emails) == ["a@example.com", "b@example.com", "c@example.com"]
+    first = json.loads(route.calls[0].request.content)["data"]
+    assert first["relationships"] == {"lists": {"data": [{"type": "list", "id": "L1"}]}}
+
+
+@respx.mock
+def test_server_error_stops_instead_of_splitting():
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(401, text="nope"))
+    with pytest.raises(Exception):
+        writer().import_profiles([{"email": "a@example.com"}], list_id=None)
+
+
+def test_byte_batches_respect_size_and_count():
+    items = [{"p": "x" * 1000} for _ in range(10)]
+    by_size = list(byte_batches(items, count=100, max_bytes=3500))
+    assert [len(b) for b in by_size] == [3, 3, 3, 1]
+    assert [len(b) for b in byte_batches(items, count=4, max_bytes=10**9)] == [4, 4, 2]
+
+
+@respx.mock
+def test_oversized_profile_is_refused_before_sending():
+    route = respx.post(f"{API}/profile-bulk-import-jobs/")
+    jobs, rejected = writer().import_profiles([{"email": "big@example.com", "properties": {"x": "y" * 4_600_000}}],
+                                              list_id=None)
+    assert (jobs, route.call_count) == ([], 0)
+    assert rejected[0][0] == "big@example.com"
+
+
+@pytest.mark.parametrize("status,counts,errors,expected", [
+    ("complete", {"failed_count": 0}, None, ({"a", "b"}, [], set())),
+    ("complete", {"failed_count": 1}, [{"email": "b"}], ({"a"}, [("b", "Bad: phone")], set())),
+    ("complete", {"failed_count": 1}, "unreadable", (set(), [], {"a", "b"})),
+    ("complete", {"failed_count": 2}, [{"email": "b"}], (set(), [("b", "Bad: phone")], {"a"})),
+    ("failed", {}, None, (set(), [], {"a", "b"})),
+    ("processing", {}, None, (set(), [], {"a", "b"})),
+])
+@respx.mock
+def test_import_result_never_assumes_success(status, counts, errors, expected):
+    job = Job("profile-bulk-import-jobs", "J", 2, {"status": status, **counts}, ["a", "b"])
+    route = respx.get(f"{API}/profile-bulk-import-jobs/J/import-errors/")
+    if errors == "unreadable":
+        route.mock(return_value=httpx.Response(404))
+    elif errors is not None:
+        route.mock(return_value=httpx.Response(200, json={"links": {"next": None}, "data": [
+            {"attributes": {"title": "Bad", "detail": "phone", "original_payload": p}} for p in errors]}))
+    assert writer().import_result(job) == expected
+
+
+def run_import(tmp_path, monkeypatch, csv_text, extra_args=()):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    monkeypatch.setattr(imports, "IMPORT_WAIT", 0)
+    f = tmp_path / "in.csv"
+    f.write_text(csv_text)
+    respx.get(f"{API}/accounts/").mock(return_value=httpx.Response(200, json={"data": [
+        {"id": "T2aEdf", "attributes": {"contact_information": {"organization_name": "Dev"}}}]}))
+    result = CliRunner().invoke(app, ["klaviyo", "profiles", "import", "--to", "klaviyo_sandbox",
+                                      "--file", str(f), "--list-id", "L1", "--yes", *extra_args])
+    [manifest] = (tmp_path / "exports/klaviyo_sandbox/profiles-import").glob("manifest.json")
+    return result, json.loads(manifest.read_text())["runs"][-1]
+
+
+PROFILES_CSV = ("email,consent,consent_timestamp,suppression_reason\n"
+                "ok@example.com,SUBSCRIBED,2022-01-01T00:00:00Z,\n"
+                "fails@example.com,SUBSCRIBED,2022-01-01T00:00:00Z,\n")
+
+
+@respx.mock
+def test_consent_is_held_back_for_profiles_whose_import_failed(tmp_path, monkeypatch):
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(202, json=job_body("J")))
+    respx.get(f"{API}/profile-bulk-import-jobs/J/").mock(
+        return_value=httpx.Response(200, json=job_body("J", "complete", completed_count=1, failed_count=1)))
+    respx.get(f"{API}/profile-bulk-import-jobs/J/import-errors/").mock(return_value=httpx.Response(200, json={
+        "links": {"next": None}, "data": [{"attributes": {"title": "Invalid", "detail": "phone",
+                                                          "original_payload": {"email": "fails@example.com"}}}]}))
+    subscribe = respx.post(f"{API}/profile-subscription-bulk-create-jobs/").mock(return_value=httpx.Response(202))
+    result, run = run_import(tmp_path, monkeypatch, PROFILES_CSV)
+    assert result.exit_code == 1
+    sent = json.loads(subscribe.calls.last.request.content)["data"]["attributes"]
+    assert [p["attributes"]["email"] for p in sent["profiles"]["data"]] == ["ok@example.com"]
+    assert sent["historical_import"] is True
+    assert run["counts"]["written"] == 1 and run["counts"]["failed"] == 1
+    assert run["counts"]["steps"]["consent_held_back"] == 1
+
+
+@respx.mock
+def test_pending_import_holds_back_all_consent(tmp_path, monkeypatch):
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(202, json=job_body("J")))
+    respx.get(f"{API}/profile-bulk-import-jobs/J/").mock(return_value=httpx.Response(200, json=job_body("J", "processing")))
+    subscribe = respx.post(f"{API}/profile-subscription-bulk-create-jobs/")
+    result, run = run_import(tmp_path, monkeypatch, PROFILES_CSV)
+    assert result.exit_code == 1 and subscribe.call_count == 0
+    assert run["counts"]["written"] == 0 and run["counts"]["failed"] == 2
+
+
+@respx.mock
+def test_aborted_run_still_writes_manifest_and_summary(tmp_path, monkeypatch):
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(401, text="revoked"))
+    result, run = run_import(tmp_path, monkeypatch, PROFILES_CSV)
+    assert result.exit_code == 1
+    assert run["status"] == "aborted" and "migration_run_id" in run
+    assert "read 2" in result.output
+    [errors] = (tmp_path / "exports/klaviyo_sandbox/profiles-import").glob("*.errors.csv")
+    assert "stopped" in errors.read_text()
+
+
+# --- Importer steps with a fake writer ---------------------------------------
+
 class FakeWriter:
     def __init__(self, existing=()):
         self.existing = set(existing)
@@ -73,24 +270,26 @@ class FakeWriter:
         return {e for e in emails if e in self.existing}
 
     def import_profiles(self, profiles, *, list_id):
-        self.calls.append(("import", [p["email"] for p in profiles], list_id,
-                           [sorted(p.get("properties", {})) for p in profiles]))
-        return Job("profile-bulk-import-jobs", f"j{len(self.calls)}", len(profiles), {"status": "complete"})
+        emails = [p["email"] for p in profiles]
+        self.calls.append(("import", emails, list_id, [sorted(p.get("properties", {})) for p in profiles]))
+        return [Job("profile-bulk-import-jobs", f"j{len(self.calls)}", len(profiles), {"status": "complete"}, emails)], []
+
+    def import_result(self, job):
+        return set(job.emails), [], set()
 
     def subscribe(self, rows, *, list_id):
         self.calls.append(("subscribe", list(rows), list_id))
+        return []
 
     def unsubscribe(self, emails):
         self.calls.append(("unsubscribe", list(emails)))
+        return []
 
     def suppress(self, emails):
         self.calls.append(("suppress", list(emails)))
-        return Job("profile-suppression-bulk-create-jobs", "s1", len(emails), {"status": "complete", "completed_count": len(emails)})
+        return [Job("profile-suppression-bulk-create-jobs", "s1", len(emails), {"status": "queued"}, list(emails))], []
 
     def wait(self, jobs, *, timeout, progress):
-        return []
-
-    def import_errors(self, job):
         return []
 
 
@@ -139,26 +338,41 @@ def test_profiles_import_subscribed_without_timestamp_is_an_error(tmp_path):
     imports.profiles_import(imp, [{"email": "a@example.com", "consent": "SUBSCRIBED", "consent_timestamp": ""}],
                             list_id="L1", run_id="R")
     assert log.counts["failed"] == 1
-    assert not [c for c in w.calls if c[0] == "subscribe" and c[1]]
+    assert not [c for c in w.calls if c[0] == "subscribe"]
+
+
+def test_suppress_submits_without_waiting(tmp_path):
+    class NoWait(FakeWriter):
+        def wait(self, jobs, *, timeout, progress):
+            raise AssertionError("suppression jobs must not be waited on")
+    w = NoWait()
+    imp, log = importer(tmp_path, w, "suppress")
+    imp.suppress([f"p{i}@example.com" for i in range(150)])
+    assert log.counts["written"] == 150
+
+
+@respx.mock
+def test_suppress_batches_of_100_and_saves_emails():
+    route = respx.post(f"{API}/profile-suppression-bulk-create-jobs/").mock(
+        return_value=httpx.Response(202, json=job_body("S")))
+    jobs, rejected = writer().suppress([f"p{i}@example.com" for i in range(150)])
+    assert [len(emails_in(c.request)) for c in route.calls] == [100, 50]
+    assert rejected == [] and len(jobs[0].emails) == 100
 
 
 @respx.mock
 def test_wait_returns_unfinished_jobs_after_timeout():
     respx.get(f"{API}/profile-suppression-bulk-create-jobs/s1/").mock(
         return_value=httpx.Response(200, json={"data": {"attributes": {"status": "processing"}}}))
-    now = [0.0]
-    w = Writer(KlaviyoClient(Secret("pk_x")), sleep=lambda s: now.__setitem__(0, now[0] + s),
-               clock=lambda: now[0], poll_seconds=10)
     job = Job("profile-suppression-bulk-create-jobs", "s1", 1)
-    assert w.wait([job], timeout=30) == [job]
+    assert writer().wait([job], timeout=30) == [job]
 
 
 @respx.mock
 def test_existing_emails_uses_any_filter():
     route = respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json={
         "data": [{"attributes": {"email": "A@example.com"}}], "links": {"next": None}}))
-    w = Writer(KlaviyoClient(Secret("pk_x")))
-    assert w.existing_emails(["a@example.com", "b@example.com"]) == {"a@example.com"}
+    assert writer().existing_emails(["a@example.com", "b@example.com"]) == {"a@example.com"}
     assert route.calls.last.request.url.params["filter"] == 'any(email,["a@example.com","b@example.com"])'
 
 
@@ -175,17 +389,6 @@ def test_import_to_source_instance_is_refused_without_flag(tmp_path, monkeypatch
                                           "--file", str(f), "--yes"])
     assert result.exit_code != 0
     assert posts.call_count == 0
-
-
-def test_suppress_submits_without_waiting(tmp_path):
-    class NoWait(FakeWriter):
-        def wait(self, jobs, *, timeout, progress):
-            raise AssertionError("suppression jobs must not be waited on")
-    w = NoWait()
-    imp, log = importer(tmp_path, w, "suppress")
-    imp.suppress([f"p{i}@example.com" for i in range(150)])
-    assert [len(c[1]) for c in w.calls] == [100, 50]
-    assert log.counts == {"read": 0, "written": 150, "skipped": 0, "failed": 0}
 
 
 @respx.mock
