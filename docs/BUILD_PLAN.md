@@ -118,7 +118,7 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 3. Klaviyo: export lists and segments from `klaviyo_ca`; attach chosen sets of profiles to US lists with `lists add` or through the Klaviyo UI (often into existing US lists); clone segments in the Klaviyo UI.
 4. Back in Stock: export from `klaviyo_ca`; review the CSV, remove signups from unsubscribed or never-subscribed people (STOQ's Klaviyo integration may subscribe everyone uploaded), and fill `Market`, `GDPR confirmed` and inventory-location data; upload it in STOQ admin on the US store.
 5. Catch-up run, immediately before CA Klaviyo sign-ups are turned off: repeat steps 1–4 with `--since` set to the start of the main run (the suppressions export is required: unsubscribes don't move a profile's `updated` time, so only it catches them); dedupe the delta files; re-import.
-6. Delete `exports/` and `state/`.
+6. Delete `exports/` (except the kept snapshot in `exports/og_exports/`) and `state/`.
 
 ## Risks
 

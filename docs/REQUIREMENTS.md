@@ -26,7 +26,7 @@ API references:
 - Output goes to `./exports/<instance>/<object>/<timestamp>.csv` with a `manifest.json` of record counts per run. Every export is CSV wherever the data fits in columns (nested values as JSON text in a cell). Only an export whose data is too complex for a usable CSV falls back to `.jsonl`, and the README says which ones do.
 - All timestamps, in files and on the command line, are UTC ISO 8601 (`2026-09-24T15:30:00Z`).
 - A README documents every command and flag, with an example of each, and the STOQ CSV preparation and admin upload steps.
-- Exports hold personal data. I delete `exports/` and `state/` immediately after the migration; the README's run order ends with that step.
+- Exports hold personal data. I delete `exports/` and `state/` immediately after the migration, except `exports/og_exports/`, a snapshot of the original production exports that I keep on purpose; the README's run order ends with that step.
 
 ### Write safety
 - Every write command names its target with `--to <instance>`. Before writing it prints the account name, the target instance and the record count, and asks the user to type the instance name to confirm.
@@ -178,3 +178,4 @@ Legal is reviewing the transfer of CA consent into the US account, including CAS
 - 2026-09-25: Review fixes. Consent held back for unconfirmed imports; refused batches split to isolate bad rows; byte-limited batches; counts from job results (unknown is never success); aborted runs still recorded; full suppression history used; typed property columns replace type guessing; Excel BOM accepted. Destination flows are gated on profile triggers for CA members.
 - 2026-09-25: Second review fixes. Accepted jobs saved immediately; refused rows found from Klaviyo's error pointer, and request-wide errors (e.g. a bad list ID) stop the run; any unexpected error still records the run; non-finite numbers refused and whole numbers kept exact; 100 KB per-profile limit; `#text` for property names ending in a type suffix.
 - 2026-09-25: Third review fixes. Full API error bodies kept for row isolation (only messages are shortened); refused rows logged as soon as they're known; `#json` cells must be strict JSON.
+- 2026-09-25: The original exports are kept as a snapshot in `exports/og_exports/`; local-data cleanup deletes everything else.
