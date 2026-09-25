@@ -129,3 +129,10 @@ Source: https://docs.stoqapp.com/v1/ (checked 2026-09-24).
 - **Property types** round-trip through the CSV: `3` → number, `01234` → text, `["vip","swim"]` → list.
 - **No emails:** no `Received Email` events on any trial profile, including those subscribed into a double-opt-in list.
 - **Catch-up:** after changing `test13` (property), `test15` (subscribe) and `test10` (unsubscribe), `profiles export --since` returned exactly `test13` and `test15`, and `suppressions export --since` exactly `test10`, out of ~153k sandbox profiles.
+
+## Phase 4 Back in Stock export (2026-09-24)
+
+- `klaviyo_ca`: 43,445 `Subscribed to Back in Stock` events (2021-01-11 → 2026-09-24), all with a `SKU` and a linked profile. 37,783 have `Channels: ["EMAIL"]`, and 5,662 have no `Channels` key. 8,935 carry a `Tags` property. No profile has a `Language` property; locales are mostly `en-CA`, `en` or blank.
+- ⚠️ `GET /events/?include=profile&additional-fields[profile]=subscriptions` is accepted, but every included profile comes back with `subscriptions: null`. Consent is read separately with `GET /profiles/?filter=any(id,[…])&additional-fields[profile]=subscriptions` (≤100 ids per call, cached).
+- Export: 40,015 rows (5,214 distinct SKUs), 3,430 excluded (3,423 older duplicates, 7 profiles with no email). `Accepts marketing`: 24,057 true, 15,958 false. 25 random rows matched their Klaviyo events (SKU, email, date, consent).
+- STOQ's admin import ("Import your waitlist"): CSV only; headers matching the template map automatically; `SKU` can be a SKU or a Shopify variant ID; `GDPR confirmed`/`Accepts marketing` take `true`/`false` (blank = false); `Language` takes a locale code; `Date` takes `dd/mm/yyyy` or `mm/dd/yyyy`; `Quantity` defaults to 1; it sends no email; it skips a customer already waiting on the same variant; and it blocks test or disposable addresses (`example.com`, `mailinator.com` and so on).

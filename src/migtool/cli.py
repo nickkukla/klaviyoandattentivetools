@@ -11,7 +11,7 @@ import typer
 
 from migtool.config import INSTANCES, ConfigError, credential, get_instance, load_env
 from migtool.http import ApiError
-from migtool.klaviyo import groups, imports, profiles, segments, suppressions
+from migtool.klaviyo import bis, groups, imports, profiles, segments, suppressions
 from migtool.klaviyo.client import KlaviyoClient
 from migtool.klaviyo.writes import Job, Writer
 from migtool.output import (
@@ -36,10 +36,12 @@ profiles_app = typer.Typer(no_args_is_help=True, help="Profiles.")
 lists_app = typer.Typer(no_args_is_help=True, help="Lists and their members.")
 segments_app = typer.Typer(no_args_is_help=True, help="Segments and their members.")
 suppressions_app = typer.Typer(no_args_is_help=True, help="Email suppressions.")
+bis_app = typer.Typer(no_args_is_help=True, help="Back in Stock signups, for upload to STOQ.")
 klaviyo_app.add_typer(profiles_app, name="profiles")
 klaviyo_app.add_typer(lists_app, name="lists")
 klaviyo_app.add_typer(segments_app, name="segments")
 klaviyo_app.add_typer(suppressions_app, name="suppressions")
+klaviyo_app.add_typer(bis_app, name="bis")
 
 INSTANCE = typer.Option(..., "--instance", help="Klaviyo instance to export from.")
 SINCE = typer.Option(
@@ -220,6 +222,40 @@ def segments_export(instance: str = INSTANCE) -> None:
                 **segments.labels(a.get("definition"), known)}
 
     _export_groups(instance, "segment", segments.COLUMNS, "name,created,updated,definition", None, row)
+
+
+@bis_app.command("export")
+def bis_export(
+    instance: str = INSTANCE,
+    since: str | None = typer.Option(None, "--since", help="Only signups after this date or UTC time, e.g. 2026-09-01."),
+) -> None:
+    """Export Back in Stock signups as a STOQ import file (bis.csv), plus reference and excluded files."""
+    since_dt = _since(since)
+    run = new_run(instance, "bis")
+    paths = {k: run.path(f".{k}.csv") for k in ("bis", "reference", "excluded")}
+    writers = {
+        "bis": CsvWriter(paths["bis"], bis.STOQ_COLUMNS),
+        "reference": CsvWriter(paths["reference"], bis.REFERENCE_COLUMNS),
+        "excluded": CsvWriter(paths["excluded"], bis.EXCLUDED_COLUMNS),
+    }
+    with _client(instance) as client:
+        try:
+            metric = bis.metric_id(client)
+        except LookupError as exc:
+            raise ConfigError(str(exc)) from exc
+        counts = bis.build(
+            bis.events(client, metric, since_dt),
+            write=writers["bis"].write, reference=writers["reference"].write, exclude=writers["excluded"].write,
+        )
+    for w in writers.values():
+        w.close()
+    write_manifest(
+        run, files={p.name: writers[k].count for k, p in paths.items()}, counts=counts,
+        extra={"params": {"since": iso(since_dt)}} if since_dt else None,
+    )
+    typer.echo(f"{counts['events']:,} signups read: {counts['exported']:,} exported, {counts['excluded']:,} excluded")
+    for k in ("bis", "reference", "excluded"):
+        typer.echo(f"  {paths[k]}")
 
 
 def _write_run(
