@@ -298,9 +298,9 @@ def _write_run(
         aborted: str | None = None
         try:
             counts = body(imp, batch.rows, columns, run) or {}
-        except (ApiError, KeyboardInterrupt) as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             # Stop, but still record what was sent: earlier jobs may be running.
-            aborted = "interrupted" if isinstance(exc, KeyboardInterrupt) else str(exc)
+            aborted = "interrupted" if isinstance(exc, KeyboardInterrupt) else f"{type(exc).__name__}: {exc}"
             log.error("run", f"stopped: {aborted}. Jobs already submitted are in state/ and may still "
                       "be applied; re-running the file is safe.", stage="aborted")
         for job in imp.unfinished:

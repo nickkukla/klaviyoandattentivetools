@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from migtool.cli import app
 from migtool.config import Secret
+from migtool.http import ApiError
 from migtool.klaviyo import imports
 from migtool.klaviyo.client import KlaviyoClient
 from migtool.klaviyo.writes import (
@@ -31,7 +32,7 @@ API = "https://a.klaviyo.com/api"
 @pytest.mark.parametrize("column,expected", [
     ("properties.orders#number", ("orders", "number")), ("properties.vip#bool", ("vip", "bool")),
     ("properties.tags#json", ("tags", "json")), ("properties.zip", ("zip", "text")),
-    ("properties.a#b", ("a#b", "text")),
+    ("properties.a#b", ("a#b", "text")), ("properties.code#number#text", ("code#number", "text")),
 ])
 def test_property_column(column, expected):
     assert property_column(column) == expected
@@ -40,6 +41,7 @@ def test_property_column(column, expected):
 @pytest.mark.parametrize("text,kind,value", [
     ("123", "text", "123"), ("true", "text", "true"), ("[1,2]", "text", "[1,2]"),
     ("3", "number", 3), ("2.5", "number", 2.5), ("1e3", "number", 1000.0),
+    ("9007199254740993", "number", 9007199254740993), ("-7", "number", -7),
     ("TRUE", "bool", True), ('["a",1]', "json", ["a", 1]), ('"x"', "json", "x"),
 ])
 def test_typed_value_never_guesses_text(text, kind, value):
@@ -62,6 +64,15 @@ def test_profile_attributes_never_sends_ids_or_internal_properties():
     assert "$consent" not in props and "empty" not in props
     assert props["ca_external_id"] == "CA-1"
     assert (props["migrated_from"], props["migration_run_id"]) == ("ca", "RUN1")
+
+
+@pytest.mark.parametrize("column,text", [
+    ("properties.x#number", "nan"), ("properties.x#number", "inf"), ("properties.x#number", "1e999"),
+    ("location.latitude", "NaN"),
+])
+def test_non_finite_numbers_are_refused(column, text):
+    with pytest.raises(ValueError, match=column):
+        profile_attributes({"email": "a@example.com", column: text}, {})
 
 
 def test_bad_typed_cell_is_an_error_not_a_guess():
@@ -91,6 +102,19 @@ def test_typed_export_round_trips_through_import(tmp_path):
     props = profile_attributes(rows[0], {})["properties"]
     assert props == {"code": "123", "orders": 3, "vip": True, "tags": ["a", "b"], "mixed": "x"}
     assert profile_attributes(rows[1], {})["properties"] == {"mixed": 7, "orders": 2.5}
+
+
+def test_property_named_like_a_type_suffix_does_not_collide(tmp_path):
+    exp = ResumableExport("klaviyo_ca", "profiles", ["id", "email"], staged=True, typed_prefix="properties.",
+                          store=StateStore(tmp_path / "state"), base=tmp_path / "exports", echo=lambda _: None)
+    exp.write({"id": "1", "email": "a@example.com", "properties.code": 5, "properties.code#number": "text value",
+               "properties.big": 9007199254740993})
+    exp.checkpoint(None)
+    exp.finish()
+    columns, rows = imports.read_rows(exp.run.path(".csv"))
+    assert {"properties.code#number", "properties.code#number#text"} <= set(columns)
+    assert profile_attributes(rows[0], {})["properties"] == {
+        "code": 5, "code#number": "text value", "big": 9007199254740993}
 
 
 # --- Deciding consent --------------------------------------------------------
@@ -143,26 +167,59 @@ def job_body(jid, status="queued", **counts):
     return {"data": {"id": jid, "attributes": {"status": status, **counts}}}
 
 
+def row_error(index, detail="bad phone"):
+    return {"errors": [{"status": 400, "title": "Invalid input.", "detail": detail,
+                        "source": {"pointer": f"/data/attributes/profiles/data/{index}/attributes/phone_number"}}]}
+
+
 @respx.mock
-def test_rejected_batch_is_split_to_isolate_bad_rows():
+def test_row_errors_drop_only_the_pointed_rows_and_resend_the_rest():
     def respond(request):
-        if "bad@example.com" in emails_in(request):
-            return httpx.Response(400, json={"errors": [{"title": "Invalid input.", "detail": "bad phone"}]})
-        return httpx.Response(202, json=job_body(f"j{len(emails_in(request))}"))
+        emails = emails_in(request)
+        for i, e in enumerate(emails):
+            if e.startswith("bad"):
+                return httpx.Response(400, json=row_error(i))
+        return httpx.Response(202, json=job_body(f"j{len(emails)}"))
     route = respx.post(f"{API}/profile-bulk-import-jobs/").mock(side_effect=respond)
-    profiles = [{"email": e} for e in ("a@example.com", "b@example.com", "bad@example.com", "c@example.com")]
-    jobs, rejected = writer().import_profiles(profiles, list_id="L1")
-    assert rejected == [("bad@example.com", "400 Invalid input.: bad phone")]
-    assert sorted(e for j in jobs for e in j.emails) == ["a@example.com", "b@example.com", "c@example.com"]
+    profiles = [{"email": e} for e in ("a@example.com", "bad1@example.com", "b@example.com", "bad2@example.com")]
+    jobs = []
+    rejected = writer().import_profiles(profiles, list_id="L1", on_job=jobs.append)
+    assert rejected == [("bad1@example.com", "400 Invalid input.: bad phone"),
+                        ("bad2@example.com", "400 Invalid input.: bad phone")]
+    assert [j.emails for j in jobs] == [["a@example.com", "b@example.com"]]
+    assert route.call_count == 3  # not one request per row
     first = json.loads(route.calls[0].request.content)["data"]
     assert first["relationships"] == {"lists": {"data": [{"type": "list", "id": "L1"}]}}
+
+
+@pytest.mark.parametrize("pointer", ["/data", "/data/relationships/lists/data/0/id", None])
+@respx.mock
+def test_request_wide_error_stops_without_splitting(pointer):
+    body = {"errors": [{"status": 400, "title": "Invalid input.", "detail": "List ID X does not exist.",
+                        **({"source": {"pointer": pointer}} if pointer else {})}]}
+    route = respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(400, json=body))
+    with pytest.raises(ApiError, match="does not exist"):
+        writer().import_profiles([{"email": f"p{i}@example.com"} for i in range(8)], list_id="X", on_job=lambda j: None)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_too_large_request_is_halved():
+    def respond(request):
+        n = len(emails_in(request))
+        return httpx.Response(413, text="too large") if n > 2 else httpx.Response(202, json=job_body(f"j{n}"))
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(side_effect=respond)
+    jobs = []
+    assert writer().import_profiles([{"email": f"p{i}@example.com"} for i in range(8)], list_id=None,
+                                    on_job=jobs.append) == []
+    assert sorted(len(j.emails) for j in jobs) == [2, 2, 2, 2]
 
 
 @respx.mock
 def test_server_error_stops_instead_of_splitting():
     respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(401, text="nope"))
-    with pytest.raises(Exception):
-        writer().import_profiles([{"email": "a@example.com"}], list_id=None)
+    with pytest.raises(ApiError):
+        writer().import_profiles([{"email": "a@example.com"}], list_id=None, on_job=lambda j: None)
 
 
 def test_byte_batches_respect_size_and_count():
@@ -173,12 +230,12 @@ def test_byte_batches_respect_size_and_count():
 
 
 @respx.mock
-def test_oversized_profile_is_refused_before_sending():
+def test_profile_over_100kb_is_refused_before_sending():
     route = respx.post(f"{API}/profile-bulk-import-jobs/")
-    jobs, rejected = writer().import_profiles([{"email": "big@example.com", "properties": {"x": "y" * 4_600_000}}],
-                                              list_id=None)
-    assert (jobs, route.call_count) == ([], 0)
-    assert rejected[0][0] == "big@example.com"
+    rejected = writer().import_profiles([{"email": "big@example.com", "properties": {"x": "y" * 150_000}}],
+                                        list_id=None, on_job=lambda j: None)
+    assert route.call_count == 0
+    assert rejected == [("big@example.com", "profile is larger than Klaviyo's 100 KB limit")]
 
 
 @pytest.mark.parametrize("status,counts,errors,expected", [
@@ -249,6 +306,39 @@ def test_pending_import_holds_back_all_consent(tmp_path, monkeypatch):
 
 
 @respx.mock
+def test_accepted_job_is_saved_when_a_later_batch_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr("migtool.klaviyo.writes.IMPORT_BATCH", 1)
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(side_effect=[
+        httpx.Response(202, json=job_body("FIRST")), httpx.Response(401, text="revoked")])
+    result, run = run_import(tmp_path, monkeypatch, PROFILES_CSV)
+    assert result.exit_code == 1 and run["status"] == "aborted"
+    saved = json.loads((tmp_path / "state/klaviyo_sandbox/jobs.json").read_text())
+    assert [j["id"] for j in saved] == ["FIRST"]
+
+
+@respx.mock
+def test_unexpected_error_still_writes_manifest(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("unexpected")
+    monkeypatch.setattr(Writer, "import_profiles", boom)
+    result, run = run_import(tmp_path, monkeypatch, PROFILES_CSV)
+    assert result.exit_code == 1 and run["status"] == "aborted"
+
+
+@respx.mock
+def test_suppress_job_saved_when_a_later_batch_fails(tmp_path):
+    respx.post(f"{API}/profile-suppression-bulk-create-jobs/").mock(side_effect=[
+        httpx.Response(202, json=job_body("S1")), httpx.Response(401, text="revoked")])
+    w = writer()
+    log = RunLog(new_run("klaviyo_sandbox", "t", base=tmp_path), echo=lambda _: None)
+    saved = []
+    imp = imports.Importer(w, log, echo=lambda _: None, save_job=saved.append, main_step="suppress")
+    with pytest.raises(ApiError):
+        imp.suppress([f"p{i}@example.com" for i in range(150)])
+    assert [j.id for j in saved] == ["S1"] and log.counts["written"] == 100
+
+
+@respx.mock
 def test_aborted_run_still_writes_manifest_and_summary(tmp_path, monkeypatch):
     respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(401, text="revoked"))
     result, run = run_import(tmp_path, monkeypatch, PROFILES_CSV)
@@ -269,25 +359,29 @@ class FakeWriter:
     def existing_emails(self, emails):
         return {e for e in emails if e in self.existing}
 
-    def import_profiles(self, profiles, *, list_id):
+    def import_profiles(self, profiles, *, list_id, on_job):
         emails = [p["email"] for p in profiles]
         self.calls.append(("import", emails, list_id, [sorted(p.get("properties", {})) for p in profiles]))
-        return [Job("profile-bulk-import-jobs", f"j{len(self.calls)}", len(profiles), {"status": "complete"}, emails)], []
+        on_job(Job("profile-bulk-import-jobs", f"j{len(self.calls)}", len(profiles), {"status": "complete"}, emails))
+        return []
 
     def import_result(self, job):
         return set(job.emails), [], set()
 
-    def subscribe(self, rows, *, list_id):
+    def subscribe(self, rows, *, list_id, on_sent):
         self.calls.append(("subscribe", list(rows), list_id))
+        on_sent(len(rows))
         return []
 
-    def unsubscribe(self, emails):
+    def unsubscribe(self, emails, *, on_sent):
         self.calls.append(("unsubscribe", list(emails)))
+        on_sent(len(emails))
         return []
 
-    def suppress(self, emails):
+    def suppress(self, emails, *, on_job):
         self.calls.append(("suppress", list(emails)))
-        return [Job("profile-suppression-bulk-create-jobs", "s1", len(emails), {"status": "queued"}, list(emails))], []
+        on_job(Job("profile-suppression-bulk-create-jobs", "s1", len(emails), {"status": "queued"}, list(emails)))
+        return []
 
     def wait(self, jobs, *, timeout, progress):
         return []
@@ -355,7 +449,8 @@ def test_suppress_submits_without_waiting(tmp_path):
 def test_suppress_batches_of_100_and_saves_emails():
     route = respx.post(f"{API}/profile-suppression-bulk-create-jobs/").mock(
         return_value=httpx.Response(202, json=job_body("S")))
-    jobs, rejected = writer().suppress([f"p{i}@example.com" for i in range(150)])
+    jobs = []
+    rejected = writer().suppress([f"p{i}@example.com" for i in range(150)], on_job=jobs.append)
     assert [len(emails_in(c.request)) for c in route.calls] == [100, 50]
     assert rejected == [] and len(jobs[0].emails) == 100
 

@@ -192,6 +192,9 @@ def _read_rows(path: Path) -> Iterable[dict[str, Any]]:
             yield from csv.DictReader(f)
 
 
+TYPE_SUFFIXES = ("number", "bool", "json", "text")
+
+
 def column_type(values: set[type]) -> str:
     """How a column of JSON values is written: `text` when every value is a
     string, `number`, `bool`, else `json` (lists, objects and mixed types)."""
@@ -240,7 +243,18 @@ def finalize_csv(
                 if k.startswith(typed_prefix) and v is not None:
                     types.setdefault(k, set()).add(type(v))
     kinds = {k: column_type(t) for k, t in types.items()}
-    header = {k: (f"{k}#{kinds[k]}" if kinds.get(k, "text") != "text" else k) for k in first + sorted(extra)}
+
+    def column_name(k: str) -> str:
+        kind = kinds.get(k, "text")
+        if kind != "text":
+            return f"{k}#{kind}"
+        # A text property whose own name ends in a type suffix is marked #text,
+        # so it can't be read as that type or collide with a typed column.
+        if typed_prefix and k.startswith(typed_prefix) and k.rpartition("#")[2] in TYPE_SUFFIXES:
+            return f"{k}#text"
+        return k
+
+    header = {k: column_name(k) for k in first + sorted(extra)}
     keep = _last_occurrences(_read_rows(src), unique_by) if unique_by else None
     tmp = dest.with_name(dest.name + ".tmp")
     writer = CsvWriter(tmp, list(header.values()))

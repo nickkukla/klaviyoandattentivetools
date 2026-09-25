@@ -8,6 +8,8 @@ column works too.
 from __future__ import annotations
 
 import json
+import math
+import re
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -18,14 +20,18 @@ from migtool.klaviyo.client import KlaviyoClient
 
 IMPORT_BATCH = 1000  # profiles per bulk import job (limit 10,000 and 5 MB)
 IMPORT_MAX_BYTES = 4_500_000  # stay under Klaviyo's 5 MB request limit
+PROFILE_MAX_BYTES = 100_000  # Klaviyo's limit for one profile in a bulk import
 SUBSCRIBE_BATCH = 1000  # limit 1,000
 UNSUBSCRIBE_BATCH = 100
 SUPPRESS_BATCH = 100  # limit 100
 LOOKUP_BATCH = 100  # emails per `any(email,[…])` lookup
-# Statuses meaning "this batch was refused as invalid". Klaviyo validates a
-# bulk request as a whole, so one bad row rejects the batch; it is split to
-# find the bad rows. Anything else (auth, 5xx after retries) stops the run.
-REJECTED_STATUSES = {400, 409, 413, 422}
+# Klaviyo validates a bulk request as a whole, so one bad row refuses the
+# batch. Its error points at the row (`/data/attributes/profiles/data/<i>/…`),
+# which is dropped and the rest resent. An error pointing anywhere else (a bad
+# list ID: `/data`, `/data/relationships/…`) is about the whole request, so the
+# run stops instead. 413 (too large) has no row to point at and is halved.
+REJECTED_STATUSES = {400, 409, 422}
+ROW_POINTER = re.compile(r"^/data/attributes/profiles/data/(\d+)(/|$)")
 
 # Fields copied onto the destination profile. The source `id`, `external_id`
 # and `anonymous_id` are never sent.
@@ -36,12 +42,14 @@ MIGRATED_FROM = "ca"
 CUSTOM_SOURCE = "migtool CA migration"
 
 
-PROPERTY_TYPES = ("number", "bool", "json")
+PROPERTY_TYPES = ("number", "bool", "json", "text")
+INTEGER = re.compile(r"[+-]?\d+")
 
 
 def property_column(column: str) -> tuple[str, str]:
     """`properties.orders#number` → (`orders`, `number`). Columns without a
-    `#type` suffix are text."""
+    `#type` suffix are text; `#text` marks a text property whose own name ends
+    in a type suffix (`code#number#text` → `code#number`)."""
     name = column.removeprefix("properties.")
     key, sep, kind = name.rpartition("#")
     if sep and kind in PROPERTY_TYPES:
@@ -49,12 +57,23 @@ def property_column(column: str) -> tuple[str, str]:
     return name, "text"
 
 
+def finite_number(text: str) -> int | float:
+    """Whole numbers exactly (no float rounding); others as floats. NaN and
+    infinity are refused: they can't be sent as JSON."""
+    text = text.strip()
+    if INTEGER.fullmatch(text):
+        return int(text)
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(f"'{text}' is not a finite number")
+    return number
+
+
 def typed_value(text: str, kind: str) -> Any:
     """A property cell as the type its column says. Text is never guessed at,
     so `"123"` in a text column stays a string."""
     if kind == "number":
-        number = float(text)
-        return int(number) if number.is_integer() and not any(c in text for c in ".eE") else number
+        return finite_number(text)
     if kind == "bool":
         if text.lower() not in ("true", "false"):
             raise ValueError(f"'{text}' is not true or false")
@@ -68,10 +87,15 @@ def profile_attributes(row: dict[str, str], extra_properties: dict[str, Any]) ->
     """Profile attributes for a bulk import. Blank cells are left out, so they
     never clear a value in the destination."""
     attrs: dict[str, Any] = {k: row[k] for k in FIELDS if row.get(k)}
-    location = {
-        k.removeprefix("location."): (float(v) if k.removeprefix("location.") in NUMERIC_LOCATION else v)
-        for k, v in row.items() if k.startswith("location.") and v
-    }
+    location: dict[str, Any] = {}
+    for column, text in row.items():
+        if not column.startswith("location.") or not text:
+            continue
+        key = column.removeprefix("location.")
+        try:
+            location[key] = float(finite_number(text)) if key in NUMERIC_LOCATION else text
+        except ValueError as exc:
+            raise ValueError(f"{column}: {exc}") from exc
     if location:
         attrs["location"] = location
     props: dict[str, Any] = {}
@@ -123,6 +147,22 @@ def byte_batches(items: Sequence[Any], *, count: int, max_bytes: int) -> Iterato
         yield batch
 
 
+def row_errors(exc: ApiError) -> dict[int, str] | None:
+    """{row index: reason} when every error in Klaviyo's response points at a
+    profile in the request; None when any error is about the request itself."""
+    try:
+        errors = json.loads(exc.detail)["errors"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    rows: dict[int, str] = {}
+    for err in errors:
+        match = ROW_POINTER.match(((err.get("source") or {}).get("pointer")) or "")
+        if not match:
+            return None
+        rows[int(match.group(1))] = f"{exc.status} {err.get('title', '')}: {err.get('detail', '')}".strip(": ")
+    return rows
+
+
 def api_error_detail(exc: ApiError) -> str:
     """The first error detail from a Klaviyo error body, or the raw text."""
     try:
@@ -166,43 +206,57 @@ class Writer:
         self.poll_seconds = poll_seconds
 
     def isolate(
-        self, items: list[Any], send: Callable[[list[Any]], Any], who: Callable[[Any], str]
-    ) -> tuple[list[Any], list[tuple[str, str]]]:
-        """Send `items` with `send`. If Klaviyo refuses the batch as invalid,
-        split it in half and retry each half, down to single rows. Returns
-        (results of the accepted sends, (identifier, reason) for refused rows)."""
-        try:
-            return [send(items)], []
-        except ApiError as exc:
-            if exc.status not in REJECTED_STATUSES:
-                raise
-            if len(items) == 1:
-                return [], [(who(items[0]), api_error_detail(exc))]
-        mid = len(items) // 2
-        left, bad_left = self.isolate(items[:mid], send, who)
-        right, bad_right = self.isolate(items[mid:], send, who)
-        return left + right, bad_left + bad_right
+        self,
+        items: list[Any],
+        send: Callable[[list[Any]], Any],
+        who: Callable[[Any], str],
+        on_sent: Callable[[list[Any], Any], None] = lambda chunk, result: None,
+    ) -> list[tuple[str, str]]:
+        """Send `items` with `send`, calling `on_sent(chunk, result)` as soon as
+        each request is accepted (so nothing accepted is lost if a later one
+        fails). Rows Klaviyo points at as invalid are dropped and the rest
+        resent. Returns (identifier, reason) for each refused row. Raises for
+        errors about the whole request, and for anything else unexpected."""
+        rejected: list[tuple[str, str]] = []
+        pending = list(items)
+        while pending:
+            try:
+                result = send(pending)
+            except ApiError as exc:
+                if exc.status == 413 and len(pending) > 1:
+                    mid = len(pending) // 2
+                    return (rejected + self.isolate(pending[:mid], send, who, on_sent)
+                            + self.isolate(pending[mid:], send, who, on_sent))
+                bad = row_errors(exc) if exc.status in REJECTED_STATUSES else None
+                if bad is None or not bad or max(bad) >= len(pending):
+                    raise
+                for i in sorted(bad, reverse=True):
+                    rejected.append((who(pending[i]), bad[i]))
+                    del pending[i]
+                continue
+            on_sent(pending, result)
+            break
+        return rejected
 
     def import_profiles(
-        self, profiles: Sequence[dict[str, Any]], *, list_id: str | None
-    ) -> tuple[list[Job], list[tuple[str, str]]]:
-        """Submit bulk import jobs, batched by count and size. Returns the jobs
-        and the rows Klaviyo refused (including any single profile too big to send)."""
-        jobs: list[Job] = []
+        self, profiles: Sequence[dict[str, Any]], *, list_id: str | None, on_job: Callable[[Job], None]
+    ) -> list[tuple[str, str]]:
+        """Submit bulk import jobs, batched by count and size, passing each job
+        to `on_job` as soon as Klaviyo accepts it. Returns refused rows,
+        including any profile over Klaviyo's per-profile size limit."""
         rejected: list[tuple[str, str]] = []
         fits = []
         for p in profiles:
-            if len(json.dumps(p, ensure_ascii=False).encode()) > IMPORT_MAX_BYTES:
-                rejected.append((p.get("email", ""), "profile is larger than Klaviyo's request limit"))
+            if len(json.dumps(p, ensure_ascii=False).encode()) > PROFILE_MAX_BYTES:
+                rejected.append((p.get("email", ""), f"profile is larger than Klaviyo's {PROFILE_MAX_BYTES // 1000} KB limit"))
             else:
                 fits.append(p)
         for chunk in byte_batches(fits, count=IMPORT_BATCH, max_bytes=IMPORT_MAX_BYTES):
-            done, bad = self.isolate(
-                chunk, lambda c: self._import_job(c, list_id), lambda p: p.get("email", "")
+            rejected += self.isolate(
+                chunk, lambda c: self._import_job(c, list_id), lambda p: p.get("email", ""),
+                lambda c, job: on_job(job),
             )
-            jobs += done
-            rejected += bad
-        return jobs, rejected
+        return rejected
 
     def _import_job(self, profiles: Sequence[dict[str, Any]], list_id: str | None) -> Job:
         body: dict[str, Any] = {"data": {
@@ -239,12 +293,15 @@ class Writer:
             return set(), [f for f in failures if f[0]], emails - failed
         return emails - failed, failures, set()
 
-    def subscribe(self, rows: Sequence[tuple[str, str]], *, list_id: str) -> list[tuple[str, str]]:
+    def subscribe(
+        self, rows: Sequence[tuple[str, str]], *, list_id: str, on_sent: Callable[[int], None]
+    ) -> list[tuple[str, str]]:
         """Historical-import subscribe: (email, consented_at) pairs, no job to
-        track. Returns refused rows."""
+        track. `on_sent(n)` is called as each request is accepted. Returns refused rows."""
         rejected: list[tuple[str, str]] = []
         for chunk in batches(list(rows), SUBSCRIBE_BATCH):
-            rejected += self.isolate(list(chunk), lambda c: self._subscribe(c, list_id), lambda r: r[0])[1]
+            rejected += self.isolate(list(chunk), lambda c: self._subscribe(c, list_id), lambda r: r[0],
+                                     lambda c, _: on_sent(len(c)))
         return rejected
 
     def _subscribe(self, rows: Sequence[tuple[str, str]], list_id: str) -> None:
@@ -262,11 +319,12 @@ class Writer:
             "relationships": {"list": {"data": {"type": "list", "id": list_id}}},
         }}, tier="L")
 
-    def unsubscribe(self, emails: Sequence[str]) -> list[tuple[str, str]]:
-        """Unsubscribe from email marketing, no job to track. Returns refused rows."""
+    def unsubscribe(self, emails: Sequence[str], *, on_sent: Callable[[int], None]) -> list[tuple[str, str]]:
+        """Unsubscribe from email marketing, no job to track. `on_sent(n)` is
+        called as each request is accepted. Returns refused rows."""
         rejected: list[tuple[str, str]] = []
         for chunk in batches(list(emails), UNSUBSCRIBE_BATCH):
-            rejected += self.isolate(list(chunk), self._unsubscribe, lambda e: e)[1]
+            rejected += self.isolate(list(chunk), self._unsubscribe, lambda e: e, lambda c, _: on_sent(len(c)))
         return rejected
 
     def _unsubscribe(self, emails: Sequence[str]) -> None:
@@ -279,15 +337,13 @@ class Writer:
             ]}},
         }}, tier="L")
 
-    def suppress(self, emails: Sequence[str]) -> tuple[list[Job], list[tuple[str, str]]]:
-        """Submit suppression jobs. Returns the jobs and refused rows."""
-        jobs: list[Job] = []
+    def suppress(self, emails: Sequence[str], *, on_job: Callable[[Job], None]) -> list[tuple[str, str]]:
+        """Submit suppression jobs, passing each to `on_job` as soon as it's
+        accepted. Returns refused rows."""
         rejected: list[tuple[str, str]] = []
         for chunk in batches(list(emails), SUPPRESS_BATCH):
-            done, bad = self.isolate(list(chunk), self._suppress, lambda e: e)
-            jobs += done
-            rejected += bad
-        return jobs, rejected
+            rejected += self.isolate(list(chunk), self._suppress, lambda e: e, lambda c, job: on_job(job))
+        return rejected
 
     def _suppress(self, emails: Sequence[str]) -> Job:
         data = self.client.post("/profile-suppression-bulk-create-jobs/", {"data": {

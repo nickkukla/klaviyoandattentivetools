@@ -152,3 +152,16 @@ A 4-row file saved like Excel "CSV UTF-8" (byte-order mark, CRLF), run `20260925
 - ⚠️ **Klaviyo refuses a backdated subscribe older than a newer unsubscribe:** `400 Invalid input.: backdated consent date [2020-01-11 …] is before current unsubscription date [2026-09-24 …]`. The subscribe batch was split, the other row went through, and the refused row is in the errors file. In the migration this means a CA subscriber who has since unsubscribed in US stays unsubscribed.
 - ⚠️ **Klaviyo silently drops an invalid phone number on bulk import** (`+1234`: the profile was imported and the phone not stored, with no import error). The tool can't detect this; the external dedupe should validate phones.
 - `test12`'s historical subscribe was accepted (202) but not visible about 40 s later, unlike the Phase 3 trial (about 15 s). `test12` also has a suppression job pending from the Phase 3 trial. Rechecked at 02:50 UTC.
+
+## Klaviyo error pointers (2026-09-25, refused requests to `klaviyo_sandbox`)
+
+Klaviyo refuses a bulk request as a whole and says where the problem is in `errors[].source.pointer`:
+
+| Problem | Status | `source.pointer` |
+|---|---|---|
+| Backdated subscribe before a newer unsubscribe (row) | 400 | `/data/attributes/profiles/data/0/attributes/subscriptions/email/marketing/consented_at` |
+| Malformed email on bulk import (row) | 400 | `/data/attributes/profiles/data/0/attributes/email` |
+| Unknown list ID on bulk import (request) | 400 | `/data` ("List ID … does not exist.") |
+| Unknown list ID on bulk subscribe (request) | 400 | `/data/relationships/list/data/id` ("List not found with id …") |
+
+The index in a row pointer is the profile's position in the request. The writer drops exactly those rows and resends the rest; any other pointer stops the run. Re-running the bad-rows trial confirmed both: `test11` alone refused (others applied); a made-up `--list-id` aborted after one request with the manifest recorded. Nothing was changed by the four probes.

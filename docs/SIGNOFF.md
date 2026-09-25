@@ -95,7 +95,7 @@ All 11 commands and every flag have a description and at least one example. This
 
 ## Review (2026-09-25)
 
-An independent review (Codex) found failure-path issues; all were fixed with tests (see the change history in `docs/REQUIREMENTS.md`). One concern, that adding profiles to a list before the historical subscribe could trigger list flows, is resolved operationally: every destination flow is gated on profile triggers that exclude CA members.
+An independent review (Codex) found failure-path and data-fidelity issues. A second review of those fixes found six more, including a regression (a job accepted before a later failure could go unrecorded). All were fixed with tests, and the failure paths were re-tried in `klaviyo_sandbox` (see the change history in `docs/REQUIREMENTS.md` and `docs/API_NOTES.md`). One concern from the first review, that adding profiles to a list before the historical subscribe could trigger list flows, is resolved operationally: every destination flow is gated on profile triggers that exclude CA members.
 
 ## Open before the migration run
 

@@ -128,10 +128,14 @@ class Importer:
         failed, refused and unknown ones are logged."""
         if not profiles:
             return set()
-        jobs, rejected = self.w.import_profiles(profiles, list_id=list_id)
+        jobs: list[Job] = []
+
+        def accepted(job: Job) -> None:
+            self.save_job(job)  # saved at once, so a later failure can't lose it
+            jobs.append(job)
+
+        rejected = self.w.import_profiles(profiles, list_id=list_id, on_job=accepted)
         self._refused(rejected, stage)
-        for job in jobs:
-            self.save_job(job)
         self.echo(f"{stage}: {len(profiles):,} profiles in {len(jobs)} job(s)")
         pending = self.w.wait(jobs, timeout=IMPORT_WAIT, progress=self.echo)
         self.unfinished += pending
@@ -158,18 +162,19 @@ class Importer:
                                stage="subscribe")
         if not ready:
             return
-        rejected = self.w.subscribe(ready, list_id=list_id)
+        before = self.steps.get("subscribe", 0)
+        rejected = self.w.subscribe(ready, list_id=list_id, on_sent=lambda n: self._count("subscribe", n))
         self._refused(rejected, "subscribe")
-        self._count("subscribe", len(ready) - len(rejected))
-        self.echo(f"subscribe: {len(ready) - len(rejected):,} profiles (historical import, original timestamps)")
+        sent = self.steps.get("subscribe", 0) - before
+        self.echo(f"subscribe: {sent:,} profiles (historical import, original timestamps)")
 
     def unsubscribe(self, emails: list[str], *, step: str = "unsubscribe") -> None:
         if not emails:
             return
-        rejected = self.w.unsubscribe(emails)
+        before = self.steps.get(step, 0)
+        rejected = self.w.unsubscribe(emails, on_sent=lambda n: self._count(step, n))
         self._refused(rejected, step)
-        self._count(step, len(emails) - len(rejected))
-        self.echo(f"{step}: {len(emails) - len(rejected):,} profiles"
+        self.echo(f"{step}: {self.steps.get(step, 0) - before:,} profiles"
                   + (" (as unsubscribe)" if step == "suppress" else ""))
 
     def suppress(self, emails: list[str], *, as_unsubscribe: bool = False) -> None:
@@ -184,12 +189,16 @@ class Importer:
         if as_unsubscribe:
             self.unsubscribe(emails, step="suppress")
             return
-        jobs, rejected = self.w.suppress(emails)
-        self._refused(rejected, "suppress")
-        for job in jobs:
+        jobs: list[Job] = []
+
+        def accepted(job: Job) -> None:
             self.save_job(job)
-        sent = len(emails) - len(rejected)
-        self._count("suppress", sent)
+            jobs.append(job)
+            self._count("suppress", job.size)
+
+        rejected = self.w.suppress(emails, on_job=accepted)
+        self._refused(rejected, "suppress")
+        sent = sum(j.size for j in jobs)
         self.echo(
             f"suppress: {sent:,} profiles submitted in {len(jobs)} job(s). Klaviyo can take hours to "
             "apply them, and the job status isn't reliable; run `klaviyo suppressions check` later."
