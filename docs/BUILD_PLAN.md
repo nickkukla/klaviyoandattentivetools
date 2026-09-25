@@ -98,9 +98,9 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 
 ## Phase 4: Back in Stock
 
-- `klaviyo bis export`: read Back in Stock events with profile email, take SKU from the event, keep latest per email + SKU, apply `--since`, write STOQ template columns, write `bis.excluded.csv` with reasons.
+- `klaviyo bis export`: read Back in Stock events with profile email, take SKU from the event, keep latest per email + SKU, apply `--since`, write STOQ template columns (`bis.csv`), `bis.reference.csv` (CA IDs and names) and `bis.excluded.csv` with reasons.
 
-**Trial:** 10 rows of the export, edited to the dev store's SKUs, uploaded by hand in the dev store's STOQ admin (checks the file format).
+**Trial:** a 10-row file in the export's format, using the dev store's SKU and our test addresses (never real customers), uploaded by hand in the dev store's STOQ admin. Checks the file format, including that `dd/mm/yyyy` dates are read day-first.
 
 **Gate:** the 10 rows appear in STOQ Reports → Current waitlist with the right SKUs and no customer is messaged. A sample of the real `klaviyo_ca` export checked against the matching Klaviyo events, and every excluded row has a reason.
 
