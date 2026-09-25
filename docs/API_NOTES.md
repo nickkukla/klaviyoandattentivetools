@@ -175,3 +175,10 @@ Two later suppression jobs for `test14` (submitted 02:27 and 02:40 UTC by the re
 ### Isolated suppression result: `test14` (2026-09-25)
 
 `test14@0xb8.net` (touched by nothing else) was sent to the suppression endpoint by `profiles import` for an older hard bounce. Its first suppression job was submitted at 02:27:09 UTC, and a `USER_SUPPRESSED` suppression appeared at **04:32:17 UTC (about 2 h)**, next to its earlier `UNSUBSCRIBE`. `can_receive_email_marketing` is false. The jobs still read `processing`. The time to apply in the sandbox has ranged from about 2 to 4 hours, so allow a few hours when checking the migration pilot.
+
+## Historical subscribe on an already-subscribed profile (2026-09-25, `klaviyo_sandbox`)
+
+Klaviyo's rule depends on the date:
+- `consented_at` **earlier** than the profile's current subscription date: accepted, and the existing (later) date is kept (Phase 3 trial).
+- `consented_at` **later** than the current subscription date: **refused**, `400 Invalid input.: backdated consent date [2025-07-22 18:22:22+00:00] is after current subscription date [2020-02-21 05:29:23+00:00]`, with the row pointer. The profile stays subscribed but isn't added to the request's list. The tool now adds such profiles to the list with a list-only bulk import (`steps.subscribe_list_only`), with no consent change.
+- Before a newer **unsubscribe**: refused ("… is before current unsubscription date"). This stays an error, and the person stays unsubscribed.

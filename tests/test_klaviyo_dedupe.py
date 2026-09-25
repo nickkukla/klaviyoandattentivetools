@@ -234,3 +234,29 @@ def test_type_map_reads_export_header(tmp_path):
     f = tmp_path / "export.csv"
     f.write_text("id,email,properties.Shopify Tags#json,properties.coupon,properties.Checked in#bool\n")
     assert dedupe.type_map(f) == {"Shopify Tags": "json", "coupon": "text", "Checked in": "bool"}
+
+
+def test_suppress_rerun_treats_migration_created_profiles_as_ca():
+    rows = [{"email": "us@example.com", "ca_suppression_reason": "HARD_BOUNCE"},
+            {"email": "created@example.com", "ca_suppression_reason": "SPAM_COMPLAINT"}]
+    p = dedupe.plan(dedupe.ROLES["suppress"], rows, {}, "RUN2",
+                    lambda e, ph: {"us@example.com", "created@example.com"},
+                    migrated=lambda emails: {"created@example.com"} & set(emails))
+    assert p.existing == {"us@example.com"} and (p.updates, p.creates) == (1, 1)
+    by = {a["email"]: a["properties"] for a in p.payloads}
+    assert "migrated_from" not in by["us@example.com"] and by["created@example.com"]["migrated_from"] == "ca"
+    imp = FakeImporter()
+    dedupe.run(imp, p, join_list="Sc9zHg", subscribe_list=None)
+    assert imp.calls[:2] == [("import", ["us@example.com"], "Sc9zHg", "update"),
+                             ("import", ["created@example.com"], None, "create")]
+
+
+@respx.mock
+def test_migrated_emails_reads_the_tag():
+    from migtool.config import Secret
+    from migtool.klaviyo.client import KlaviyoClient
+    from migtool.klaviyo.writes import Writer
+    respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json={"links": {"next": None}, "data": [
+        {"attributes": {"email": "Created@example.com", "properties": {"migrated_from": "ca"}}},
+        {"attributes": {"email": "us@example.com", "properties": {"other": 1}}}]}))
+    assert Writer(KlaviyoClient(Secret("pk_x"))).migrated_emails(["created@example.com", "us@example.com"]) == {"created@example.com"}

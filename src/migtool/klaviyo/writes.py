@@ -397,6 +397,19 @@ class Writer:
                 found.update((p["attributes"].get("email") or "").lower() for p in page["data"])
         return found
 
+    def migrated_emails(self, emails: Iterable[str]) -> set[str]:
+        """Which of `emails` have a profile already tagged `migrated_from=ca`,
+        i.e. one this migration created (compared lowercased)."""
+        found: set[str] = set()
+        for chunk in batches(sorted({e.lower() for e in emails}), LOOKUP_BATCH):
+            listed = ",".join(json.dumps(e) for e in chunk)
+            params = {"filter": f"any(email,[{listed}])", "fields[profile]": "email,properties", "page[size]": "100"}
+            for page in self.client.paginate("/profiles/", tier="L", params=params):
+                for p in page["data"]:
+                    if (p["attributes"].get("properties") or {}).get("migrated_from") == MIGRATED_FROM:
+                        found.add((p["attributes"].get("email") or "").lower())
+        return found
+
     def existing_phones(self, phones: Iterable[str]) -> set[str]:
         """Which of `phones` (E.164) already have a profile."""
         found: set[str] = set()

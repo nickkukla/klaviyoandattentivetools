@@ -28,6 +28,9 @@ from migtool.runlog import RunLog
 
 SKIPPED_COLUMNS = ["email", "reason"]
 IMPORT_WAIT = 60 * 60  # seconds to wait for import jobs
+# Klaviyo's reason when a historical subscribe is dated after the profile's
+# existing (earlier) subscription: the profile is already subscribed.
+ALREADY_SUBSCRIBED = "is after current subscription date"
 
 
 def read_rows(path: Path, *, limit: int | None = None) -> tuple[list[str], list[dict[str, str]]]:
@@ -166,10 +169,25 @@ class Importer:
         if not ready:
             return
         before = self.steps.get("subscribe", 0)
-        self.w.subscribe(ready, list_id=list_id, on_sent=lambda n: self._count("subscribe", n),
-                         on_refused=self._refused("subscribe"))
+        already: list[str] = []
+        log_refused = self._refused("subscribe")
+
+        def refused(who: str, reason: str) -> None:
+            # Klaviyo won't backdate a subscribe to after an existing, earlier
+            # subscription. The profile is already subscribed, so only the list
+            # membership is missing; it's added below without touching consent.
+            if ALREADY_SUBSCRIBED in reason:
+                already.append(who)
+            else:
+                log_refused(who, reason)
+
+        self.w.subscribe(ready, list_id=list_id, on_sent=lambda n: self._count("subscribe", n), on_refused=refused)
         sent = self.steps.get("subscribe", 0) - before
         self.echo(f"subscribe: {sent:,} profiles (historical import, original timestamps)")
+        if already:
+            self.echo(f"subscribe: {len(already):,} already subscribed with an earlier date; "
+                      "adding them to the list without changing consent")
+            self.import_profiles([{"email": e} for e in already], list_id=list_id, stage="subscribe_list_only")
 
     def unsubscribe(self, emails: list[str], *, step: str = "unsubscribe") -> None:
         if not emails:
