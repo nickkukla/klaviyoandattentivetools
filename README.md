@@ -83,7 +83,7 @@ Files are UTF-8. The tool also reads CSVs saved by Excel as "CSV UTF-8" (with a 
 | `properties.vip#bool` | `true`, `false` | true/false |
 | `properties.tags#json` | `["vip","swim"]`, `"x"`, `7` | JSON (lists, objects, and properties whose type varies between profiles) |
 
-Keep the suffixes when editing. A column you add without a suffix is imported as text. A text property whose own name ends in a suffix is exported with an extra `#text` (`properties.code#number#text` is the text property `code#number`), so it can't clash with a typed column. Whole numbers are restored exactly, however large. A cell that doesn't fit its column's type (`three`, `NaN` or `inf` in a `#number` column) is reported in the errors file and that row isn't sent. Exports made before this change have no suffixes, so re-export before importing.
+Keep the suffixes when editing. A column you add without a suffix is imported as text. A text property whose own name ends in a suffix is exported with an extra `#text` (`properties.code#number#text` is the text property `code#number`), so it can't clash with a typed column. Whole numbers are restored exactly, however large. A cell that doesn't fit its column's type (`three`, `NaN` or `inf` in a `#number` column, or anything but strict JSON, such as `{"score":NaN}`, in a `#json` column) is reported in the errors file and that row isn't sent. Exports made before this change have no suffixes, so re-export before importing.
 
 Everything goes under `exports/<instance>/<object>/`, named by the run's UTC start time (for example `20260924T195337Z.csv`):
 

@@ -75,6 +75,12 @@ def test_non_finite_numbers_are_refused(column, text):
         profile_attributes({"email": "a@example.com", column: text}, {})
 
 
+@pytest.mark.parametrize("text", ['{"score":NaN}', "[1e999]", '{"a":{"b":[Infinity]}}', "-Infinity"])
+def test_json_cells_must_be_strict_json(text):
+    with pytest.raises(ValueError, match="properties.x#json"):
+        profile_attributes({"email": "a@example.com", "properties.x#json": text}, {})
+
+
 def test_bad_typed_cell_is_an_error_not_a_guess():
     with pytest.raises(ValueError, match="properties.orders#number"):
         profile_attributes({"email": "a@example.com", "properties.orders#number": "three"}, {})
@@ -190,6 +196,43 @@ def test_row_errors_drop_only_the_pointed_rows_and_resend_the_rest():
     assert route.call_count == 3  # not one request per row
     first = json.loads(route.calls[0].request.content)["data"]
     assert first["relationships"] == {"lists": {"data": [{"type": "list", "id": "L1"}]}}
+
+
+@respx.mock
+def test_long_error_response_still_isolates_rows():
+    detail = "The phone number provided either does not exist or is ineligible to receive SMS. " * 2
+    def respond(request):
+        emails = emails_in(request)
+        bad = [i for i, e in enumerate(emails) if e.startswith("bad")]
+        if bad:
+            return httpx.Response(400, json={"errors": [
+                {"status": 400, "title": "Invalid input.", "detail": detail,
+                 "source": {"pointer": f"/data/attributes/profiles/data/{i}/attributes/phone_number"}} for i in bad]})
+        return httpx.Response(202, json=job_body("OK"))
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(side_effect=respond)
+    profiles = [{"email": f"bad{i}@example.com"} for i in range(4)] + [{"email": "good@example.com"}]
+    jobs = []
+    rejected = writer().import_profiles(profiles, list_id=None, on_job=jobs.append)
+    assert len(rejected) == 4 and [j.emails for j in jobs] == [["good@example.com"]]
+
+
+def test_api_error_keeps_full_body_but_short_message():
+    body = "x" * 2000
+    exc = ApiError("POST", "https://a.klaviyo.com/api/x/", 400, body)
+    assert exc.body == body and len(exc.detail) == 500 and len(str(exc)) < 700
+
+
+@respx.mock
+def test_refused_row_is_logged_even_if_the_next_request_fails(tmp_path):
+    respx.post(f"{API}/profile-bulk-import-jobs/").mock(side_effect=[
+        httpx.Response(400, json=row_error(0, "Invalid email address")), httpx.Response(401, text="revoked")])
+    log = RunLog(new_run("klaviyo_sandbox", "t", base=tmp_path), echo=lambda _: None)
+    imp = imports.Importer(writer(), log, echo=lambda _: None, save_job=lambda j: None, main_step="import")
+    with pytest.raises(ApiError):
+        imp.import_profiles([{"email": "bad@example.com"}, {"email": "ok@example.com"}], list_id=None, stage="import")
+    log.finish()
+    assert "bad@example.com" in log.errors_path.read_text()
+    assert "Invalid email address" in log.errors_path.read_text()
 
 
 @pytest.mark.parametrize("pointer", ["/data", "/data/relationships/lists/data/0/id", None])
@@ -359,7 +402,7 @@ class FakeWriter:
     def existing_emails(self, emails):
         return {e for e in emails if e in self.existing}
 
-    def import_profiles(self, profiles, *, list_id, on_job):
+    def import_profiles(self, profiles, *, list_id, on_job, on_refused=None):
         emails = [p["email"] for p in profiles]
         self.calls.append(("import", emails, list_id, [sorted(p.get("properties", {})) for p in profiles]))
         on_job(Job("profile-bulk-import-jobs", f"j{len(self.calls)}", len(profiles), {"status": "complete"}, emails))
@@ -368,17 +411,17 @@ class FakeWriter:
     def import_result(self, job):
         return set(job.emails), [], set()
 
-    def subscribe(self, rows, *, list_id, on_sent):
+    def subscribe(self, rows, *, list_id, on_sent, on_refused=None):
         self.calls.append(("subscribe", list(rows), list_id))
         on_sent(len(rows))
         return []
 
-    def unsubscribe(self, emails, *, on_sent):
+    def unsubscribe(self, emails, *, on_sent, on_refused=None):
         self.calls.append(("unsubscribe", list(emails)))
         on_sent(len(emails))
         return []
 
-    def suppress(self, emails, *, on_job):
+    def suppress(self, emails, *, on_job, on_refused=None):
         self.calls.append(("suppress", list(emails)))
         on_job(Job("profile-suppression-bulk-create-jobs", "s1", len(emails), {"status": "queued"}, list(emails)))
         return []

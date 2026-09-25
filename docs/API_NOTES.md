@@ -165,3 +165,9 @@ Klaviyo refuses a bulk request as a whole and says where the problem is in `erro
 | Unknown list ID on bulk subscribe (request) | 400 | `/data/relationships/list/data/id` ("List not found with id …") |
 
 The index in a row pointer is the profile's position in the request. The writer drops exactly those rows and resends the rest; any other pointer stops the run. Re-running the bad-rows trial confirmed both: `test11` alone refused (others applied); a made-up `--list-id` aborted after one request with the manifest recorded. Nothing was changed by the four probes.
+
+## Suppression check results (2026-09-25)
+
+`suppressions check` on the Phase 3 step 3 file at 02:50 UTC (4h06m after submission): `test01` and `test02` were suppressed. `test03` and `test05` weren't, because the STOQ trial upload had re-subscribed them. `test12` wasn't suppressed, but the review-fix trials had re-subscribed it at 02:26–02:40 (its historical subscribe finally showed at 2020-01-12), so the result is inconclusive. The job `…K5FE3E` still reads `processing`, total 5, skipped 5. Klaviyo logs no profile event when a bulk suppression applies.
+
+Two later suppression jobs for `test14` (submitted 02:27 and 02:40 UTC by the review trials) are a clean test: nothing else touches `test14`.

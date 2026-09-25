@@ -69,6 +69,10 @@ def finite_number(text: str) -> int | float:
     return number
 
 
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not valid JSON")
+
+
 def typed_value(text: str, kind: str) -> Any:
     """A property cell as the type its column says. Text is never guessed at,
     so `"123"` in a text column stays a string."""
@@ -79,7 +83,9 @@ def typed_value(text: str, kind: str) -> Any:
             raise ValueError(f"'{text}' is not true or false")
         return text.lower() == "true"
     if kind == "json":
-        return json.loads(text)
+        value = json.loads(text, parse_constant=_no_constant)
+        json.dumps(value, allow_nan=False)  # refuses 1e999 → inf anywhere inside
+        return value
     return text
 
 
@@ -151,7 +157,7 @@ def row_errors(exc: ApiError) -> dict[int, str] | None:
     """{row index: reason} when every error in Klaviyo's response points at a
     profile in the request; None when any error is about the request itself."""
     try:
-        errors = json.loads(exc.detail)["errors"]
+        errors = json.loads(exc.body)["errors"]
     except (ValueError, KeyError, TypeError):
         return None
     rows: dict[int, str] = {}
@@ -166,10 +172,17 @@ def row_errors(exc: ApiError) -> dict[int, str] | None:
 def api_error_detail(exc: ApiError) -> str:
     """The first error detail from a Klaviyo error body, or the raw text."""
     try:
-        err = json.loads(exc.detail)["errors"][0]
+        err = json.loads(exc.body)["errors"][0]
         return f"{exc.status} {err.get('title', '')}: {err.get('detail', '')}".strip(": ")
     except (ValueError, KeyError, IndexError, TypeError):
         return f"{exc.status}: {exc.detail[:200]}"
+
+
+Refused = Callable[[str, str], None]  # (identifier, reason), reported as it happens
+
+
+def _ignore(who: str, reason: str) -> None:
+    pass
 
 
 @dataclass
@@ -211,12 +224,14 @@ class Writer:
         send: Callable[[list[Any]], Any],
         who: Callable[[Any], str],
         on_sent: Callable[[list[Any], Any], None] = lambda chunk, result: None,
+        on_refused: Refused = _ignore,
     ) -> list[tuple[str, str]]:
         """Send `items` with `send`, calling `on_sent(chunk, result)` as soon as
         each request is accepted (so nothing accepted is lost if a later one
-        fails). Rows Klaviyo points at as invalid are dropped and the rest
-        resent. Returns (identifier, reason) for each refused row. Raises for
-        errors about the whole request, and for anything else unexpected."""
+        fails). Rows Klaviyo points at as invalid are dropped, reported to
+        `on_refused` at once, and the rest resent. Returns (identifier, reason)
+        for each refused row. Raises for errors about the whole request, and for
+        anything else unexpected."""
         rejected: list[tuple[str, str]] = []
         pending = list(items)
         while pending:
@@ -225,13 +240,14 @@ class Writer:
             except ApiError as exc:
                 if exc.status == 413 and len(pending) > 1:
                     mid = len(pending) // 2
-                    return (rejected + self.isolate(pending[:mid], send, who, on_sent)
-                            + self.isolate(pending[mid:], send, who, on_sent))
+                    return (rejected + self.isolate(pending[:mid], send, who, on_sent, on_refused)
+                            + self.isolate(pending[mid:], send, who, on_sent, on_refused))
                 bad = row_errors(exc) if exc.status in REJECTED_STATUSES else None
                 if bad is None or not bad or max(bad) >= len(pending):
                     raise
                 for i in sorted(bad, reverse=True):
                     rejected.append((who(pending[i]), bad[i]))
+                    on_refused(who(pending[i]), bad[i])
                     del pending[i]
                 continue
             on_sent(pending, result)
@@ -239,7 +255,8 @@ class Writer:
         return rejected
 
     def import_profiles(
-        self, profiles: Sequence[dict[str, Any]], *, list_id: str | None, on_job: Callable[[Job], None]
+        self, profiles: Sequence[dict[str, Any]], *, list_id: str | None, on_job: Callable[[Job], None],
+        on_refused: Refused = _ignore,
     ) -> list[tuple[str, str]]:
         """Submit bulk import jobs, batched by count and size, passing each job
         to `on_job` as soon as Klaviyo accepts it. Returns refused rows,
@@ -248,13 +265,15 @@ class Writer:
         fits = []
         for p in profiles:
             if len(json.dumps(p, ensure_ascii=False).encode()) > PROFILE_MAX_BYTES:
-                rejected.append((p.get("email", ""), f"profile is larger than Klaviyo's {PROFILE_MAX_BYTES // 1000} KB limit"))
+                reason = f"profile is larger than Klaviyo's {PROFILE_MAX_BYTES // 1000} KB limit"
+                rejected.append((p.get("email", ""), reason))
+                on_refused(p.get("email", ""), reason)
             else:
                 fits.append(p)
         for chunk in byte_batches(fits, count=IMPORT_BATCH, max_bytes=IMPORT_MAX_BYTES):
             rejected += self.isolate(
                 chunk, lambda c: self._import_job(c, list_id), lambda p: p.get("email", ""),
-                lambda c, job: on_job(job),
+                lambda c, job: on_job(job), on_refused,
             )
         return rejected
 
@@ -294,14 +313,15 @@ class Writer:
         return emails - failed, failures, set()
 
     def subscribe(
-        self, rows: Sequence[tuple[str, str]], *, list_id: str, on_sent: Callable[[int], None]
+        self, rows: Sequence[tuple[str, str]], *, list_id: str, on_sent: Callable[[int], None],
+        on_refused: Refused = _ignore,
     ) -> list[tuple[str, str]]:
         """Historical-import subscribe: (email, consented_at) pairs, no job to
         track. `on_sent(n)` is called as each request is accepted. Returns refused rows."""
         rejected: list[tuple[str, str]] = []
         for chunk in batches(list(rows), SUBSCRIBE_BATCH):
             rejected += self.isolate(list(chunk), lambda c: self._subscribe(c, list_id), lambda r: r[0],
-                                     lambda c, _: on_sent(len(c)))
+                                     lambda c, _: on_sent(len(c)), on_refused)
         return rejected
 
     def _subscribe(self, rows: Sequence[tuple[str, str]], list_id: str) -> None:
@@ -319,12 +339,15 @@ class Writer:
             "relationships": {"list": {"data": {"type": "list", "id": list_id}}},
         }}, tier="L")
 
-    def unsubscribe(self, emails: Sequence[str], *, on_sent: Callable[[int], None]) -> list[tuple[str, str]]:
+    def unsubscribe(
+        self, emails: Sequence[str], *, on_sent: Callable[[int], None], on_refused: Refused = _ignore
+    ) -> list[tuple[str, str]]:
         """Unsubscribe from email marketing, no job to track. `on_sent(n)` is
         called as each request is accepted. Returns refused rows."""
         rejected: list[tuple[str, str]] = []
         for chunk in batches(list(emails), UNSUBSCRIBE_BATCH):
-            rejected += self.isolate(list(chunk), self._unsubscribe, lambda e: e, lambda c, _: on_sent(len(c)))
+            rejected += self.isolate(list(chunk), self._unsubscribe, lambda e: e, lambda c, _: on_sent(len(c)),
+                                     on_refused)
         return rejected
 
     def _unsubscribe(self, emails: Sequence[str]) -> None:
@@ -337,12 +360,15 @@ class Writer:
             ]}},
         }}, tier="L")
 
-    def suppress(self, emails: Sequence[str], *, on_job: Callable[[Job], None]) -> list[tuple[str, str]]:
+    def suppress(
+        self, emails: Sequence[str], *, on_job: Callable[[Job], None], on_refused: Refused = _ignore
+    ) -> list[tuple[str, str]]:
         """Submit suppression jobs, passing each to `on_job` as soon as it's
         accepted. Returns refused rows."""
         rejected: list[tuple[str, str]] = []
         for chunk in batches(list(emails), SUPPRESS_BATCH):
-            rejected += self.isolate(list(chunk), self._suppress, lambda e: e, lambda c, job: on_job(job))
+            rejected += self.isolate(list(chunk), self._suppress, lambda e: e, lambda c, job: on_job(job),
+                                     on_refused)
         return rejected
 
     def _suppress(self, emails: Sequence[str]) -> Job:

@@ -21,13 +21,21 @@ Clock = Callable[[], float]
 
 
 class ApiError(Exception):
-    """A request that failed for good: a non-retryable error, or retries used up."""
+    """A request that failed for good: a non-retryable error, or retries used up.
 
-    def __init__(self, method: str, url: str, status: int | None, detail: str) -> None:
+    `body` is the full response text, for code that parses it (Klaviyo lists
+    one error per refused row, which can run long). `detail` is a shortened
+    copy for messages and logs."""
+
+    DETAIL_LIMIT = 500
+
+    def __init__(self, method: str, url: str, status: int | None, body: str) -> None:
         self.method = method
         self.url = url
         self.status = status
-        self.detail = detail
+        self.body = body
+        self.detail = body[: self.DETAIL_LIMIT]
+        detail = self.detail
         where = f"{method} {url}"
         super().__init__(f"{where} -> {status}: {detail}" if status else f"{where}: {detail}")
 
@@ -163,7 +171,7 @@ class HttpClient:
                 self._sleep(self.backoff(attempt) if wait is None else wait)
                 continue
             if response.is_error:
-                raise ApiError(method, str(response.url), response.status_code, response.text[:500])
+                raise ApiError(method, str(response.url), response.status_code, response.text)
             return response
         raise AssertionError("unreachable")
 
