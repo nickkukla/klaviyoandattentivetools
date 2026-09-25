@@ -15,7 +15,7 @@ Read these before running anything that writes.
 
 - **`profiles import` overwrites matching profiles.** A CA row whose email or phone matches an existing US profile updates it. Dedupe the CA and US exports first (outside this tool), and import only profiles unique to CA.
 - **Suppressions override newer US subscribes.** `suppressions import` suppresses every email in the file, including people who subscribed more recently on the US store. Edit the file to choose which suppressions to apply.
-- **Suppression jobs are slow, and their status can't be trusted.** In the sandbox, Klaviyo applied bulk suppressions about four hours after submission. The job status stayed `processing` and reported every profile as skipped. Confirm with `klaviyo suppressions check`, not the job status, and pilot one address first.
+- **Suppression jobs are slow, and their status can't be trusted.** In the sandbox, Klaviyo applied bulk suppressions two to four hours after submission. The job status stayed `processing` and reported every profile as skipped. Confirm with `klaviyo suppressions check`, not the job status, and pilot one address first.
 - **Uploading to STOQ can change Klaviyo consent.** In the dev store, STOQ's Klaviyo integration subscribed uploaded signups to email marketing (including some marked `Accepts marketing = false`, some previously unsubscribed, and one suppressed profile). Before uploading, remove BIS rows for people who are unsubscribed or never subscribed (see [STOQ](#stoq-preparing-and-uploading-the-back-in-stock-file)).
 - **`Phone` is left blank in the STOQ file on purpose.** SMS is out of scope, and a phone number could make STOQ send SMS alerts to people who signed up by email only.
 - **Exports hold personal data.** Delete `exports/` and `state/` as soon as the migration is finished (see [Deleting local data](#deleting-local-data)).
@@ -201,7 +201,7 @@ uv run migtool klaviyo suppressions export --instance klaviyo_ca --resume
 
 ### `migtool klaviyo suppressions import`
 
-Suppresses every email in the file (a `suppressions export` file, or any CSV with an `email` column). An email with no profile first gets one, tagged `migrated_from=ca` and `migration_run_id`. Then all the emails are submitted for suppression. Klaviyo applies suppression jobs in the background, which took about four hours in the sandbox, so confirm the result later with `suppressions check`.
+Suppresses every email in the file (a `suppressions export` file, or any CSV with an `email` column). An email with no profile first gets one, tagged `migrated_from=ca` and `migration_run_id`. Then all the emails are submitted for suppression. Klaviyo applies suppression jobs in the background, which took two to four hours in the sandbox, so confirm the result later with `suppressions check`.
 
 | Flag | |
 |---|---|

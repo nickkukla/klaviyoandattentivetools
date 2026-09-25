@@ -95,7 +95,7 @@ Sandbox results (`klaviyo_sandbox`, test lists `migtool phase1 DOI` `WgThjd` (do
 
 - ✅ **Historical-import subscribe skips double opt-in.** `test01`–`test03` into the double-opt-in list: `SUBSCRIBED` and on the list immediately, `consent_timestamp` = the `consented_at` sent (2024-01-15), `method` `API`, `$source` = `custom_source`. The legacy `$consent_timestamp` property shows the import time, so exports must read `subscriptions.email.marketing.consent_timestamp`.
 - ✅ **List relationship on bulk import leaves consent alone.** `test01` (subscribed) kept `SUBSCRIBED`/2024-01-15, `test04` stayed `NEVER_SUBSCRIBED`, and `test05` (no profile) was created `NEVER_SUBSCRIBED`. All three joined the list. A second identical run changed nothing (same `joined_group_at`, same consent).
-- ✅ **Bulk suppression works, but took about four hours to apply, and its job status is wrong** (corrected 2026-09-24; earlier notes said it "skipped every profile"):
+- ✅ **Bulk suppression works, but took two to four hours to apply, and its job status is wrong** (corrected 2026-09-24; earlier notes said it "skipped every profile"):
 
   | Job | Submitted | Emails | Suppressed at | Job status afterwards |
   |---|---|---|---|---|
@@ -171,3 +171,7 @@ The index in a row pointer is the profile's position in the request. The writer 
 `suppressions check` on the Phase 3 step 3 file at 02:50 UTC (4h06m after submission): `test01` and `test02` were suppressed. `test03` and `test05` weren't, because the STOQ trial upload had re-subscribed them. `test12` wasn't suppressed, but the review-fix trials had re-subscribed it at 02:26–02:40 (its historical subscribe finally showed at 2020-01-12), so the result is inconclusive. The job `…K5FE3E` still reads `processing`, total 5, skipped 5. Klaviyo logs no profile event when a bulk suppression applies.
 
 Two later suppression jobs for `test14` (submitted 02:27 and 02:40 UTC by the review trials) are a clean test: nothing else touches `test14`.
+
+### Isolated suppression result: `test14` (2026-09-25)
+
+`test14@0xb8.net` (touched by nothing else) was sent to the suppression endpoint by `profiles import` for an older hard bounce. Its first suppression job was submitted at 02:27:09 UTC, and a `USER_SUPPRESSED` suppression appeared at **04:32:17 UTC (about 2 h)**, next to its earlier `UNSUBSCRIBE`. `can_receive_email_marketing` is false. The jobs still read `processing`. The time to apply in the sandbox has ranged from about 2 to 4 hours, so allow a few hours when checking the migration pilot.
