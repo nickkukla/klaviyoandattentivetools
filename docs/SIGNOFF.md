@@ -7,7 +7,7 @@ Status: ✅ met · ⚠️ met, with a qualification · ⏳ pending
 | # | Criterion | Status |
 |---|---|---|
 | 1 | Klaviyo profile import | ⚠️ |
-| 2 | Klaviyo suppressions | ⚠️ |
+| 2 | Klaviyo suppressions | ✅ |
 | 3 | Klaviyo list add | ✅ |
 | 4 | Catch-up run | ✅ |
 | 5 | Klaviyo segments | ✅ |
@@ -29,17 +29,19 @@ Trial on 2026-09-24 (run `20260924T224403Z-912e`): a 10-profile file (`test04`, 
 - **No emails:** there were no `Received Email` events on any trial profile, including those subscribed into a double-opt-in list.
 - Re-export with `profiles export --since` on 2026-09-25 confirmed the properties and `external_id`. By then `test07`–`test10` showed as subscribed. The STOQ trial upload did that (see 7), not the import; the import results above were recorded before it.
 
-## 2. Klaviyo suppressions ⚠️
+## 2. Klaviyo suppressions ✅
 
 > A 5-row trial appears in the destination's suppression list, including one profile that was subscribed there.
 
 The trial was `suppressions import` of `test01`, `test02`, `test03`, `test05` and a new `test12`, submitted at 22:44 UTC on 2026-09-24.
 
-- **Suppression does apply in the sandbox, but slowly.** Jobs applied about four hours after submission, while the job status stayed `processing` and reported every profile as skipped. So the import no longer waits on the jobs, and `suppressions check` confirms the result.
+- **Suppression does apply in the sandbox, but slowly.** Jobs applied two to four hours after submission, while the job status stayed `processing` and reported every profile as skipped. So the import no longer waits on the jobs, and `suppressions check` confirms the result.
 - **Subscribed profiles:** `test01` and `test02` were subscribed in the sandbox and are now `USER_SUPPRESSED` (from jobs with the same addresses submitted earlier), with `can_receive_email_marketing = false`. That meets "including one that was subscribed".
 - **`suppressions check` at 02:50 UTC on 2026-09-25** (4h06m after the import): `test01` and `test02` were suppressed. `test03` and `test05` weren't: the STOQ trial upload had re-subscribed them (and unsuppressed `test05`, see 7).
 - **Missing profile:** `test12` was created and tagged by the import, but its suppression result is **inconclusive**. The review-fix trials re-subscribed `test12` before four hours had passed, and Klaviyo logs no event when a bulk suppression applies, so the order can't be told apart. The job still reads `processing`, total 5, skipped 5.
-- **Qualification:** the criterion (a trial row, including a subscribed profile, appears in the suppression list) is met. "Creates a missing profile and suppresses it" wasn't cleanly shown in this trial; the Phase 1 job did create `test06` and suppress it about four hours later.
+- **Clean end-to-end result (`test14`):** a profile nothing else touched was submitted for bulk suppression at 02:27:09 UTC on 2026-09-25 by `profiles import`, which sent it to the suppression endpoint for its older hard bounce. It became `USER_SUPPRESSED` at 04:32:17 UTC (about 2 hours later), with `can_receive_email_marketing = false`. A scheduled `suppressions check` recorded it as `suppressed` at 06:30 UTC.
+- **Missing profiles:** the Phase 1 job created `test06` and suppressed it about four hours later, which shows the "creates a missing profile, suppressed" behaviour. `test12` from this trial stays inconclusive (see above).
+- **Result:** the criterion is met. A trial row, including profiles subscribed in the destination, appears in the suppression list, and the isolated `test14` case confirms bulk suppression end to end.
 - **In the real migration,** the one-address pilot plus `suppressions check` confirms how long it takes in `klaviyo_us`.
 
 ## 3. Klaviyo list add ✅
