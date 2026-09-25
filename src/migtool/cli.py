@@ -193,7 +193,12 @@ def _export_groups(
 
 
 @lists_app.command("export")
-def lists_export(instance: str = INSTANCE, since: str | None = SINCE) -> None:
+def lists_export(
+    instance: str = INSTANCE,
+    since: str | None = typer.Option(
+        None, "--since", help="Only memberships that joined after this UTC ISO 8601 time."
+    ),
+) -> None:
     """Export every list (lists.csv) and its members (list_members.csv)."""
 
     def row(client, group, count):
@@ -347,7 +352,7 @@ def suppressions_import(
 
 @suppressions_app.command("check")
 def suppressions_check(
-    instance: str = INSTANCE,
+    instance: str = typer.Option(..., "--instance", help="Klaviyo instance to check."),
     file: Path = typer.Option(..., "--file", exists=True, dir_okay=False, help="CSV with an email column."),
 ) -> None:
     """Report whether each email in the file is suppressed now (read-only).

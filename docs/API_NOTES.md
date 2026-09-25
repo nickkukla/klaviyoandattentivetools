@@ -136,3 +136,9 @@ Source: https://docs.stoqapp.com/v1/ (checked 2026-09-24).
 - ⚠️ `GET /events/?include=profile&additional-fields[profile]=subscriptions` is accepted, but every included profile comes back with `subscriptions: null`. Consent is read separately with `GET /profiles/?filter=any(id,[…])&additional-fields[profile]=subscriptions` (≤100 ids per call, cached).
 - Export: 40,015 rows (5,214 distinct SKUs), 3,430 excluded (3,423 older duplicates, 7 profiles with no email). `Accepts marketing`: 24,057 true, 15,958 false. 25 random rows matched their Klaviyo events (SKU, email, date, consent).
 - STOQ's admin import ("Import your waitlist"): CSV only; headers matching the template map automatically; `SKU` can be a SKU or a Shopify variant ID; `GDPR confirmed`/`Accepts marketing` take `true`/`false` (blank = false); `Language` takes a locale code; `Date` takes `dd/mm/yyyy` or `mm/dd/yyyy`; `Quantity` defaults to 1; it sends no email; it skips a customer already waiting on the same variant; and it blocks test or disposable addresses (`example.com`, `mailinator.com` and so on).
+
+### STOQ upload side effect in Klaviyo (observed 2026-09-25)
+
+After the 10-row trial upload to the dev store's STOQ admin (01:09–01:10 UTC), the dev store's STOQ integration pushed the signups into `klaviyo_sandbox`. It set `StoqAcceptsMarketing`, `StoqBackInStock` and `StoqLocaleCountry` on all 10 profiles and logged "Customer signed up for alert (STOQ)". It also **subscribed six of them to email marketing (`method: API`)**: some had been unsubscribed, two had `Accepts marketing = false` in the file, and one (`test05`) was "Manually Unsuppressed" first. Profiles that were already subscribed and suppressed stayed suppressed. No `Received Email` events were seen.
+
+Decision: handled by hand. Before uploading, the user compares the BIS emails against the Klaviyo profile exports and removes signups from people who are unsubscribed or never subscribed.
