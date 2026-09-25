@@ -61,7 +61,8 @@ Every write can be repeated safely. Re-importing a profile updates it, adding a 
 
 When a write goes wrong partway:
 
-- **Bad rows:** Klaviyo refuses a whole batch if one row is invalid (a bad phone number, say). The tool splits the batch until the bad rows are isolated, sends the rest, and lists the refused rows with Klaviyo's reason in the errors file.
+- **Bad rows:** Klaviyo refuses a whole batch if one row is invalid (a malformed email, say), and says which row. The tool drops that row, resends the rest, and lists refused rows with Klaviyo's reason in the errors file. A profile over Klaviyo's 100 KB per-profile limit is refused before sending.
+- **Bad settings:** an error about the request itself rather than a row (for example a `--list-id` that doesn't exist) stops the run straight away, recorded as `aborted`. Fix the option and re-run.
 - **Unknown outcomes:** counts come from Klaviyo's own job results. A profile whose result can't be confirmed (job still running, failed, or its error list unreadable) is counted as failed with "outcome unknown", never as written.
 - **Aborted runs:** if the run stops (a revoked key, an outage after retries, Ctrl-C), it still writes the manifest (status `aborted`), the errors and skipped files and the summary, and exits non-zero. Jobs already submitted are listed in `state/` and may still be applied.
 
@@ -82,7 +83,7 @@ Files are UTF-8. The tool also reads CSVs saved by Excel as "CSV UTF-8" (with a 
 | `properties.vip#bool` | `true`, `false` | true/false |
 | `properties.tags#json` | `["vip","swim"]`, `"x"`, `7` | JSON (lists, objects, and properties whose type varies between profiles) |
 
-Keep the suffixes when editing. A column you add without a suffix is imported as text. A cell that doesn't fit its column's type (e.g. `three` in a `#number` column) is reported in the errors file and that row isn't sent. Exports made before this change have no suffixes, so re-export before importing.
+Keep the suffixes when editing. A column you add without a suffix is imported as text. A text property whose own name ends in a suffix is exported with an extra `#text` (`properties.code#number#text` is the text property `code#number`), so it can't clash with a typed column. Whole numbers are restored exactly, however large. A cell that doesn't fit its column's type (`three`, `NaN` or `inf` in a `#number` column) is reported in the errors file and that row isn't sent. Exports made before this change have no suffixes, so re-export before importing.
 
 Everything goes under `exports/<instance>/<object>/`, named by the run's UTC start time (for example `20260924T195337Z.csv`):
 
