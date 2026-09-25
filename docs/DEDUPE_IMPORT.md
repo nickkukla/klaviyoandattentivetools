@@ -89,6 +89,13 @@ Files with the real files' exact headers, filled with `test16`–`test25@0xb8.ne
 - **hold (05):** `migration_hold` became `false` on all 12 profiles.
 - No `Received Email` events on any trial profile.
 
+## Real-data pilot (2026-09-25, `klaviyo_sandbox` only)
+
+The first 10 rows of each real file were imported into three pilot lists in the dev account. Many of these customers already exist there, so it exercised updates as well as creates. **Klaviyo accepted every real row:** nothing was unreadable, and no import refused a profile. It found two things, both now fixed:
+
+1. **Already-subscribed profiles.** Klaviyo refuses a historical subscribe dated **after** a profile's existing, earlier subscription ("backdated consent date … is after current subscription date"). That hit 1 of 10 in 03a and 5 of 10 in 04a. On the real run it would affect most of 04a: about 16,466 of 16,935 are already subscribed in US, and CA won because its date is later. The tool now treats that refusal as **already subscribed**: it adds the profile to `--subscribe-list` with a list-only import, keeping its existing subscription date and consent, and counts it under `steps.subscribe_list_only` rather than as an error. On the re-run, all 20 of 03a's and 04a's pilot rows were on the pilot newsletter list, with 0 failures. Any other subscribe refusal is still an error.
+2. **Re-running 02.** On a second run, profiles 02 had created were "existing", so they were handled as US profiles and joined Updated US Profiles. Now an existing profile counts as a US profile only if it isn't tagged `migrated_from=ca`. A re-run of the pilot showed "6 existing, 4 new", the same as the first run.
+
 ## Keep these files out of Excel
 
 Opening and saving these CSVs in Excel damages them: phone numbers lose their `+`, long IDs turn into scientific notation, and dates, zip codes and some addresses are rewritten. Regenerate from DuckDB, or edit with a script. To look at a file in Excel, use Data → From Text/CSV with every column set to Text, and don't save it.

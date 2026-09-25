@@ -552,3 +552,41 @@ def test_suppressions_check_reports_states(tmp_path, monkeypatch):
         states = {r["email"]: r["state"] for r in csv.DictReader(fh)}
     assert states == {"unsub@example.com": "unsubscribed", "clear@example.com": "not suppressed",
                       "missing@example.com": "no profile"}
+
+
+@respx.mock
+def test_already_subscribed_refusal_adds_to_list_without_error(tmp_path):
+    def sub(request):
+        emails = emails_in(request)
+        if "old@example.com" in emails:
+            i = emails.index("old@example.com")
+            return httpx.Response(400, json={"errors": [{"status": 400, "title": "Invalid input.",
+                "detail": "backdated consent date [2025-07-22 18:22:22+00:00] is after current subscription date [2020-02-21 05:29:23+00:00]",
+                "source": {"pointer": f"/data/attributes/profiles/data/{i}/attributes/subscriptions/email/marketing/consented_at"}}]})
+        return httpx.Response(202)
+    respx.post(f"{API}/profile-subscription-bulk-create-jobs/").mock(side_effect=sub)
+    imports_ = respx.post(f"{API}/profile-bulk-import-jobs/").mock(
+        return_value=httpx.Response(202, json=job_body("L")))
+    respx.get(f"{API}/profile-bulk-import-jobs/L/").mock(
+        return_value=httpx.Response(200, json=job_body("L", "complete", completed_count=1, failed_count=0)))
+    log = RunLog(new_run("klaviyo_sandbox", "t", base=tmp_path), echo=lambda _: None)
+    imp = imports.Importer(writer(), log, echo=lambda _: None, save_job=lambda j: None, main_step="import")
+    imp.subscribe([{"email": "new@example.com", "consent_timestamp": "2024-01-01T00:00:00Z"},
+                   {"email": "old@example.com", "consent_timestamp": "2025-07-22T18:22:22Z"}], list_id="NEWS")
+    assert log.counts["failed"] == 0
+    assert imp.steps == {"subscribe": 1, "subscribe_list_only": 1}
+    body = json.loads(imports_.calls.last.request.content)["data"]
+    assert body["relationships"]["lists"]["data"] == [{"type": "list", "id": "NEWS"}]
+    assert body["attributes"]["profiles"]["data"] == [{"type": "profile", "attributes": {"email": "old@example.com"}}]
+
+
+@respx.mock
+def test_other_subscribe_refusals_stay_errors(tmp_path):
+    respx.post(f"{API}/profile-subscription-bulk-create-jobs/").mock(return_value=httpx.Response(400, json={"errors": [
+        {"status": 400, "title": "Invalid input.", "detail": "backdated consent date [2020] is before current unsubscription date [2026]",
+         "source": {"pointer": "/data/attributes/profiles/data/0/attributes/subscriptions/email/marketing/consented_at"}}]}))
+    imports_ = respx.post(f"{API}/profile-bulk-import-jobs/")
+    log = RunLog(new_run("klaviyo_sandbox", "t", base=tmp_path), echo=lambda _: None)
+    imp = imports.Importer(writer(), log, echo=lambda _: None, save_job=lambda j: None, main_step="import")
+    imp.subscribe([{"email": "u@example.com", "consent_timestamp": "2020-01-01T00:00:00Z"}], list_id="NEWS")
+    assert log.counts["failed"] == 1 and imports_.call_count == 0

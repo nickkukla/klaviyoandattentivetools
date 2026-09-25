@@ -182,10 +182,16 @@ def usable(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[tuple
 def plan(
     role: Role, rows: list[dict[str, str]], types: dict[str, str], run_id: str,
     existing: Callable[[list[str], list[str]], set[str]],
+    migrated: Callable[[list[str]], set[str]] = lambda emails: set(),
 ) -> Plan:
     """Parse every row and look up which profiles exist (a read), so the
     confirmation shows exactly what will happen. `existing(emails, phones)`
-    returns the identities that already have a profile."""
+    returns the identities that already have a profile; `migrated(emails)`
+    those whose profile this migration created (tagged `migrated_from=ca`).
+
+    For `suppress`, "existing" means an existing *US* profile: a profile the
+    migration created on an earlier run is handled as new again, so re-running
+    02 never puts CA-only profiles on the Updated US Profiles list."""
     result = Plan(role)
     kept, result.skipped = usable(rows)
     parsed = []
@@ -200,6 +206,8 @@ def plan(
     emails = [r["email"] for r, _ in parsed if r["email"]]
     phones = [r["phone_number"] for r, _ in parsed if not r["email"]]
     result.existing = existing(emails, phones) if (emails or phones) else set()
+    if role.name == "suppress" and result.existing:
+        result.existing -= migrated(sorted(e for e in result.existing if "@" in e))
     for row, instruction in parsed:
         present = identity(row) in result.existing
         if not role.creates and not present:

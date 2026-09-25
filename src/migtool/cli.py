@@ -466,7 +466,8 @@ def dedupe_import(
     with KlaviyoClient(credential(inst)) as client:
         account = client.account()
         w = Writer(client)
-        p = dedupe.plan(r, raw, types, run.run_id, lambda e, ph: w.existing_emails(e) | w.existing_phones(ph))
+        p = dedupe.plan(r, raw, types, run.run_id, lambda e, ph: w.existing_emails(e) | w.existing_phones(ph),
+                        migrated=w.migrated_emails)
         if r.consent and p.count("SUBSCRIBED") and not subscribe_list:
             raise typer.BadParameter(
                 f"{p.count('SUBSCRIBED'):,} rows say Subscribe; give --subscribe-list.", param_hint="--subscribe-list"
