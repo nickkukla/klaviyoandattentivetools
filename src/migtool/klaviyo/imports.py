@@ -16,6 +16,7 @@ from typing import Any
 
 from migtool.klaviyo.writes import (
     CONSENT_COLUMNS,
+    identity,
     MIGRATED_FROM,
     Job,
     Writer,
@@ -123,7 +124,7 @@ class Importer:
                 payloads.append(profile_attributes(row, extra(row)))
                 kept.append(row)
             except ValueError as exc:
-                self.log.error(row["email"], f"not sent: {exc}", stage="read")
+                self.log.error(identity(row), f"not sent: {exc}", stage="read")
         return payloads, kept
 
     def import_profiles(self, profiles: list[dict[str, Any]], *, list_id: str | None, stage: str) -> set[str]:
@@ -207,7 +208,7 @@ class Importer:
     def skip_unconfirmed(self, rows: list[dict[str, str]], ok: set[str], step: str) -> list[dict[str, str]]:
         """Rows whose profile write is confirmed. The others were already logged;
         their consent isn't touched, so a missing profile is never created bare."""
-        kept = [r for r in rows if r["email"] in ok]
+        kept = [r for r in rows if identity(r) in ok]
         if len(kept) < len(rows):
             self.steps[f"{step}_held_back"] = len(rows) - len(kept)
             self.echo(f"{step}: {len(rows) - len(kept):,} rows held back because their profile write "

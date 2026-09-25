@@ -133,6 +133,12 @@ def ca_properties(row: dict[str, str], run_id: str) -> dict[str, Any]:
     }
 
 
+def identity(profile: dict[str, Any]) -> str:
+    """How a profile or row is identified: its email, or its phone number when
+    it has no email (phone-only profiles)."""
+    return (profile.get("email") or "").lower() or (profile.get("phone_number") or "")
+
+
 def batches(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
     for i in range(0, len(items), size):
         yield items[i:i + size]
@@ -266,13 +272,13 @@ class Writer:
         for p in profiles:
             if len(json.dumps(p, ensure_ascii=False).encode()) > PROFILE_MAX_BYTES:
                 reason = f"profile is larger than Klaviyo's {PROFILE_MAX_BYTES // 1000} KB limit"
-                rejected.append((p.get("email", ""), reason))
-                on_refused(p.get("email", ""), reason)
+                rejected.append((identity(p), reason))
+                on_refused(identity(p), reason)
             else:
                 fits.append(p)
         for chunk in byte_batches(fits, count=IMPORT_BATCH, max_bytes=IMPORT_MAX_BYTES):
             rejected += self.isolate(
-                chunk, lambda c: self._import_job(c, list_id), lambda p: p.get("email", ""),
+                chunk, lambda c: self._import_job(c, list_id), identity,
                 lambda c, job: on_job(job), on_refused,
             )
         return rejected
@@ -286,12 +292,13 @@ class Writer:
             body["data"]["relationships"] = {"lists": {"data": [{"type": "list", "id": list_id}]}}
         data = self.client.post("/profile-bulk-import-jobs/", body, tier="M")["data"]
         return Job("profile-bulk-import-jobs", data["id"], len(profiles), data["attributes"],
-                   [p.get("email", "") for p in profiles])
+                   [identity(p) for p in profiles])
 
     def import_result(self, job: Job) -> tuple[set[str], list[tuple[str, str]], set[str]]:
-        """(succeeded emails, (email, reason) failures, emails with unknown outcome)
-        for a finished import job. Counts come from the job itself; anything that
-        can't be attributed is unknown, never assumed successful."""
+        """(succeeded, (identity, reason) failures, unknown outcome) for a
+        finished import job, by identity (email, or phone for phone-only rows).
+        Counts come from the job itself; anything that can't be attributed is
+        unknown, never assumed successful."""
         emails = {e for e in job.emails if e}
         if job.status != "complete":
             return set(), [], emails
@@ -302,13 +309,13 @@ class Writer:
             for page in self.client.paginate(f"/{job.kind}/{job.id}/import-errors/"):
                 for err in page["data"]:
                     a = err["attributes"]
-                    email = ((a.get("original_payload") or {}).get("email") or "").lower()
-                    failures.append((email, f"{a.get('title', '')}: {a.get('detail', '')}".strip(": ")))
+                    who = identity(a.get("original_payload") or {})
+                    failures.append((who, f"{a.get('title', '')}: {a.get('detail', '')}".strip(": ")))
         except ApiError:
             return set(), [], emails
         failed = {e for e, _ in failures if e}
         if len(failed) < (job.attributes.get("failed_count") or 0):
-            # Some failures can't be tied to an email: the rest are unknown.
+            # Some failures can't be tied to a profile: the rest are unknown.
             return set(), [f for f in failures if f[0]], emails - failed
         return emails - failed, failures, set()
 
@@ -388,6 +395,16 @@ class Writer:
             params = {"filter": f"any(email,[{listed}])", "fields[profile]": "email", "page[size]": "100"}
             for page in self.client.paginate("/profiles/", tier="L", params=params):
                 found.update((p["attributes"].get("email") or "").lower() for p in page["data"])
+        return found
+
+    def existing_phones(self, phones: Iterable[str]) -> set[str]:
+        """Which of `phones` (E.164) already have a profile."""
+        found: set[str] = set()
+        for chunk in batches(sorted(set(phones)), LOOKUP_BATCH):
+            listed = ",".join(json.dumps(p) for p in chunk)
+            params = {"filter": f"any(phone_number,[{listed}])", "fields[profile]": "phone_number", "page[size]": "100"}
+            for page in self.client.paginate("/profiles/", tier="L", params=params):
+                found.update(p["attributes"].get("phone_number") or "" for p in page["data"])
         return found
 
     def wait(

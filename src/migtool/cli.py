@@ -11,7 +11,7 @@ import typer
 
 from migtool.config import INSTANCES, ConfigError, credential, get_instance, load_env
 from migtool.http import ApiError
-from migtool.klaviyo import bis, groups, imports, profiles, segments, suppressions
+from migtool.klaviyo import bis, dedupe, groups, imports, profiles, segments, suppressions
 from migtool.klaviyo.client import KlaviyoClient
 from migtool.klaviyo.writes import Job, Writer
 from migtool.output import (
@@ -37,11 +37,13 @@ lists_app = typer.Typer(no_args_is_help=True, help="Lists and their members.")
 segments_app = typer.Typer(no_args_is_help=True, help="Segments and their members.")
 suppressions_app = typer.Typer(no_args_is_help=True, help="Email suppressions.")
 bis_app = typer.Typer(no_args_is_help=True, help="Back in Stock signups, for upload to STOQ.")
+dedupe_app = typer.Typer(no_args_is_help=True, help="Import the dedupe files (Klaviyo UI-import layout).")
 klaviyo_app.add_typer(profiles_app, name="profiles")
 klaviyo_app.add_typer(lists_app, name="lists")
 klaviyo_app.add_typer(segments_app, name="segments")
 klaviyo_app.add_typer(suppressions_app, name="suppressions")
 klaviyo_app.add_typer(bis_app, name="bis")
+klaviyo_app.add_typer(dedupe_app, name="dedupe")
 
 INSTANCE = typer.Option(..., "--instance", help="Klaviyo instance to export from.")
 SINCE = typer.Option(
@@ -412,6 +414,117 @@ def lists_add(
         return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
 
     _write_run(to, "lists-add", "add", file, limit, yes, allow_write_to_source, body, {"list_id": list_id})
+
+
+def _list_name(client: KlaviyoClient, list_id: str) -> str:
+    try:
+        return client.get(f"/lists/{list_id}/", tier="S", params={"fields[list]": "name"})["data"]["attributes"]["name"]
+    except ApiError as exc:
+        raise ConfigError(f"List {list_id} wasn't found in this account ({exc.status}).") from exc
+
+
+@dedupe_app.command("import")
+def dedupe_import(
+    to: str = TO,
+    file: Path = FILE,
+    role: str = typer.Option(
+        ..., "--role",
+        help="What the file is: " + "; ".join(f"{r.name} ({r.files})" for r in dedupe.ROLES.values()) + ".",
+    ),
+    join_list: str | None = typer.Option(None, "--join-list", help="List the profiles join (roles suppress, new, kept)."),
+    subscribe_list: str | None = typer.Option(
+        None, "--subscribe-list", help="List Subscribe rows subscribe to, as a historical import (roles new, kept)."
+    ),
+    types_from: Path | None = typer.Option(
+        None, "--types-from", exists=True, dir_okay=False,
+        help="A `profiles export` CSV whose header gives each custom property's type (required for role new).",
+    ),
+    limit: int | None = LIMIT,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+) -> None:
+    """Import one dedupe file under the rules of its role (see docs/DEDUPE_IMPORT.md)."""
+    if role not in dedupe.ROLES:
+        raise typer.BadParameter(f"'{role}' isn't one of {', '.join(dedupe.ROLES)}.", param_hint="--role")
+    r = dedupe.ROLES[role]
+    if r.join_list and not join_list:
+        raise typer.BadParameter(f"role {role} needs --join-list.", param_hint="--join-list")
+    if not r.join_list and join_list:
+        raise typer.BadParameter(f"role {role} doesn't join a list.", param_hint="--join-list")
+    if subscribe_list and not r.consent:
+        raise typer.BadParameter(f"role {role} doesn't subscribe anyone.", param_hint="--subscribe-list")
+    if role == "new" and not types_from:
+        raise typer.BadParameter("role new needs --types-from (the CA profile export).", param_hint="--types-from")
+    inst = get_instance(to, "klaviyo")
+    try:
+        columns, raw = imports.read_rows(file, limit=limit)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    types = dedupe.type_map(types_from) if types_from else {}
+    run = new_run(inst.name, f"dedupe-{role}")
+    store = StateStore()
+    with KlaviyoClient(credential(inst)) as client:
+        account = client.account()
+        w = Writer(client)
+        p = dedupe.plan(r, raw, types, run.run_id, lambda e, ph: w.existing_emails(e) | w.existing_phones(ph))
+        if r.consent and p.count("SUBSCRIBED") and not subscribe_list:
+            raise typer.BadParameter(
+                f"{p.count('SUBSCRIBED'):,} rows say Subscribe; give --subscribe-list.", param_hint="--subscribe-list"
+            )
+        typer.echo(f"File:            {file} ({len(raw):,} rows)")
+        typer.echo(f"Role:            {role} ({'creates and updates' if r.creates else 'updates existing profiles only'})")
+        typer.echo(f"To send:         {len(p.rows):,} ({p.updates:,} existing, {p.creates:,} new)")
+        typer.echo(f"Not sent:        {len(p.skipped):,} skipped, {len(p.unreadable):,} unreadable")
+        if join_list:
+            typer.echo(f"Join list:       {join_list} ({_list_name(client, join_list)})"
+                       + (" (existing profiles only)" if role == "suppress" else ""))
+        if r.consent:
+            if subscribe_list:
+                typer.echo(f"Subscribe to:    {subscribe_list} ({_list_name(client, subscribe_list)}), "
+                           f"{p.count('SUBSCRIBED'):,} rows")
+            typer.echo(f"Unsubscribe:     {p.count('UNSUBSCRIBED'):,} rows")
+        if role == "suppress":
+            typer.echo(f"Suppress:        {sum(1 for x in p.rows if x['email']):,} emails")
+        typer.echo(f"Migration tags:  {'yes' if r.tags else 'no'}")
+        confirm_write(
+            inst, account=f"{account['name']} ({account['id']})", record_count=len(p.rows),
+            yes=yes, allow_write_to_source=allow_write_to_source,
+        )
+        log = RunLog(run)
+        log.read(len(raw))
+        log.skipped(len(p.skipped))
+        for who, reason in p.unreadable:
+            log.error(who, reason, stage="read")
+
+        def save_job(job: Job) -> None:
+            store.add_job(inst.name, {"id": job.id, "kind": job.kind, "run_id": run.run_id, "size": job.size})
+
+        main_step = {"hold": "update", "kept": "update", "suppress": "suppress"}.get(role, "import")
+        imp = imports.Importer(w, log, echo=typer.echo, save_job=save_job, main_step=main_step)
+        aborted: str | None = None
+        try:
+            dedupe.run(imp, p, join_list=join_list, subscribe_list=subscribe_list)
+        except (Exception, KeyboardInterrupt) as exc:
+            aborted = "interrupted" if isinstance(exc, KeyboardInterrupt) else f"{type(exc).__name__}: {exc}"
+            log.error("run", f"stopped: {aborted}. Jobs already submitted are in state/ and may still "
+                      "be applied; re-running the file is safe.", stage="aborted")
+        for job in imp.unfinished:
+            typer.echo(f"Job {job.id} ({job.kind}) was still {job.status or 'processing'} when the run ended.")
+    skipped_path = imports.write_skipped(run, p.skipped)
+    status = "aborted" if aborted else ("complete" if not log.counts["failed"] else "completed with errors")
+    write_manifest(
+        run, files={skipped_path.name: len(p.skipped)} if skipped_path else {},
+        counts={**log.counts, "steps": imp.steps}, status=status,
+        extra={"migration_run_id": run.run_id, "source_file": str(file), "account": account["id"], "role": role,
+               "join_list": join_list, "subscribe_list": subscribe_list,
+               "types_from": str(types_from) if types_from else None},
+    )
+    typer.echo(f"migration_run_id: {run.run_id}")
+    if skipped_path:
+        typer.echo(f"Skipped rows written to {skipped_path}")
+    code = log.finish()
+    if code:
+        raise typer.Exit(code)
 
 
 def main() -> None:

@@ -6,6 +6,7 @@ Command-line tools for moving the Canada Klaviyo account (`klaviyo_ca`) into the
 - Build phases and the migration run order: `docs/BUILD_PLAN.md`
 - What the Klaviyo and STOQ APIs actually do (tested): `docs/API_NOTES.md`
 - Acceptance criteria and their results: `docs/SIGNOFF.md`
+- Importing the dedupe files (the main migration run): `docs/DEDUPE_IMPORT.md`
 
 Attentive segments and the STOQ upload are done by hand. The tool has no Attentive commands and never writes to STOQ.
 
@@ -182,6 +183,39 @@ uv run migtool klaviyo profiles import --to klaviyo_ca --file fix.csv --list-id 
 ```
 
 The run's `migration_run_id` is printed and saved in the manifest. Every imported profile carries it, so a bad batch can be found and segmented or deleted in Klaviyo.
+
+### `migtool klaviyo dedupe import`
+
+Imports one of the dedupe files (Klaviyo UI-import layout) under the rules of its role. **The file-by-file rules, list IDs and full command sequence are in `docs/DEDUPE_IMPORT.md`.**
+
+| Role | Files | Behaviour |
+|---|---|---|
+| `hold` | 01, 05 | Updates existing profiles only. Sends `migration_hold` and nothing else. No list, no consent, no tags. |
+| `hold-new` | 01b | Creates or updates. `migration_hold` plus migration tags. No list, no consent. |
+| `suppress` | 02 | Existing profiles join `--join-list` and get `ca_suppression_*`. Missing ones are created (tagged). Then all are submitted for suppression. |
+| `new` | 03a–03d | Creates or updates, joins `--join-list`, adds tags. Consent from `Email Marketing Consent`: `Subscribe` → historical subscribe to `--subscribe-list`; `Unsubscribed` → unsubscribe. |
+| `kept` | 04a, 04b | Updates existing profiles only, joins `--join-list`, adds tags. Consent as for `new`, using `ca_consent_timestamp`. |
+
+| Flag | |
+|---|---|
+| `--to` (required) | Instance to write to |
+| `--file` (required) | The dedupe CSV |
+| `--role` (required) | `hold`, `hold-new`, `suppress`, `new` or `kept` |
+| `--join-list` | List the profiles join (required for `suppress`, `new`, `kept`; refused for the others) |
+| `--subscribe-list` | List `Subscribe` rows subscribe to (roles `new`, `kept`; required when the file has `Subscribe` rows) |
+| `--types-from` | A `profiles export` CSV whose header gives each custom property's type (required for `new`) |
+| `--limit` | Only the first N rows, for a pilot |
+| `--yes` | Skip the typed confirmation |
+| `--allow-write-to-source` | Allow writing to a `_ca` instance |
+
+```
+uv run migtool klaviyo dedupe import --to klaviyo_us --role hold --file dedupe/exports/01_hold_only.csv
+uv run migtool klaviyo dedupe import --to klaviyo_us --role new --file dedupe/exports/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u --types-from exports/mainrun/klaviyo_ca/profiles/20260925T151451Z.csv --limit 5
+uv run migtool klaviyo dedupe import --to klaviyo_sandbox --role kept --file trial_04a.csv --join-list Sc9zHg --subscribe-list XrGL9u --yes
+uv run migtool klaviyo dedupe import --to klaviyo_ca --role hold --file fix.csv --allow-write-to-source   # never needed for the migration
+```
+
+Before sending anything, it works out and shows the plan: rows to send (existing and new), rows skipped or unreadable, lists by name, and subscribe and unsubscribe counts.
 
 ### `migtool klaviyo suppressions export`
 
