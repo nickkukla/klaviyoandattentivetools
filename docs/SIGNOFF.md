@@ -7,7 +7,7 @@ Status: ✅ met · ⚠️ met, with a qualification · ⏳ pending
 | # | Criterion | Status |
 |---|---|---|
 | 1 | Klaviyo profile import | ⚠️ |
-| 2 | Klaviyo suppressions | ⏳ one of five rows |
+| 2 | Klaviyo suppressions | ⚠️ |
 | 3 | Klaviyo list add | ✅ |
 | 4 | Catch-up run | ✅ |
 | 5 | Klaviyo segments | ✅ |
@@ -29,7 +29,7 @@ Trial on 2026-09-24 (run `20260924T224403Z-912e`): a 10-profile file (`test04`, 
 - **No emails:** there were no `Received Email` events on any trial profile, including those subscribed into a double-opt-in list.
 - Re-export with `profiles export --since` on 2026-09-25 confirmed the properties and `external_id`. By then `test07`–`test10` showed as subscribed. The STOQ trial upload did that (see 7), not the import; the import results above were recorded before it.
 
-## 2. Klaviyo suppressions ⏳
+## 2. Klaviyo suppressions ⚠️
 
 > A 5-row trial appears in the destination's suppression list, including one profile that was subscribed there.
 
@@ -37,8 +37,9 @@ The trial was `suppressions import` of `test01`, `test02`, `test03`, `test05` an
 
 - **Suppression does apply in the sandbox, but slowly.** Jobs applied about four hours after submission, while the job status stayed `processing` and reported every profile as skipped. So the import no longer waits on the jobs, and `suppressions check` confirms the result.
 - **Subscribed profiles:** `test01` and `test02` were subscribed in the sandbox and are now `USER_SUPPRESSED` (from jobs with the same addresses submitted earlier), with `can_receive_email_marketing = false`. That meets "including one that was subscribed".
-- **Missing profile:** `test12` was created and tagged by the import. Its suppression job hadn't applied yet at the last check. A read-only `suppressions check` is scheduled for 02:50 UTC on 2026-09-25.
-- `test03` was unsubscribed (not suppressed) in Phase 1. `test05` was suppressed and then unsuppressed by the STOQ trial upload (see 7).
+- **`suppressions check` at 02:50 UTC on 2026-09-25** (4h06m after the import): `test01` and `test02` were suppressed. `test03` and `test05` weren't: the STOQ trial upload had re-subscribed them (and unsuppressed `test05`, see 7).
+- **Missing profile:** `test12` was created and tagged by the import, but its suppression result is **inconclusive**. The review-fix trials re-subscribed `test12` before four hours had passed, and Klaviyo logs no event when a bulk suppression applies, so the order can't be told apart. The job still reads `processing`, total 5, skipped 5.
+- **Qualification:** the criterion (a trial row, including a subscribed profile, appears in the suppression list) is met. "Creates a missing profile and suppresses it" wasn't cleanly shown in this trial; the Phase 1 job did create `test06` and suppress it about four hours later.
 - **In the real migration,** the one-address pilot plus `suppressions check` confirms how long it takes in `klaviyo_us`.
 
 ## 3. Klaviyo list add ✅
@@ -95,11 +96,10 @@ All 11 commands and every flag have a description and at least one example. This
 
 ## Review (2026-09-25)
 
-An independent review (Codex) found failure-path and data-fidelity issues. A second review of those fixes found six more, including a regression (a job accepted before a later failure could go unrecorded). All were fixed with tests, and the failure paths were re-tried in `klaviyo_sandbox` (see the change history in `docs/REQUIREMENTS.md` and `docs/API_NOTES.md`). One concern from the first review, that adding profiles to a list before the historical subscribe could trigger list flows, is resolved operationally: every destination flow is gated on profile triggers that exclude CA members.
+An independent review (Codex) found failure-path and data-fidelity issues. A second review of those fixes found six more, including a regression (a job accepted before a later failure could go unrecorded), and a third found three more (long error responses truncated before parsing, refused rows logged late, non-finite numbers inside JSON cells). All were fixed with tests, and the failure paths were re-tried in `klaviyo_sandbox` (see the change history in `docs/REQUIREMENTS.md` and `docs/API_NOTES.md`). One concern from the first review, that adding profiles to a list before the historical subscribe could trigger list flows, is resolved operationally: every destination flow is gated on profile triggers that exclude CA members.
 
 ## Open before the migration run
 
-- Result of the scheduled `suppressions check` for `test12` (criterion 2).
 - Re-export CA profiles with the current version before importing (typed property columns).
 - Legal review of consent transfer (CASL, PIPEDA), per `docs/REQUIREMENTS.md`.
 - Give the `klaviyo_us` key write scopes only when the migration run starts.

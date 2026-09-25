@@ -107,9 +107,12 @@ class Importer:
         if step == self.main_step:
             self.log.written(n)
 
-    def _refused(self, rejected: list[tuple[str, str]], stage: str) -> None:
-        for who, reason in rejected:
+    def _refused(self, stage: str):
+        """A callback logging each refused row as soon as it's known, so the
+        errors file keeps it even if a later request stops the run."""
+        def log(who: str, reason: str) -> None:
             self.log.error(who, f"refused by Klaviyo: {reason}", stage=stage)
+        return log
 
     def attributes(self, rows: list[dict[str, str]], extra) -> tuple[list[dict], list[dict[str, str]]]:
         """Profile payloads for `rows`; rows with an unreadable cell are logged
@@ -134,8 +137,7 @@ class Importer:
             self.save_job(job)  # saved at once, so a later failure can't lose it
             jobs.append(job)
 
-        rejected = self.w.import_profiles(profiles, list_id=list_id, on_job=accepted)
-        self._refused(rejected, stage)
+        self.w.import_profiles(profiles, list_id=list_id, on_job=accepted, on_refused=self._refused(stage))
         self.echo(f"{stage}: {len(profiles):,} profiles in {len(jobs)} job(s)")
         pending = self.w.wait(jobs, timeout=IMPORT_WAIT, progress=self.echo)
         self.unfinished += pending
@@ -163,8 +165,8 @@ class Importer:
         if not ready:
             return
         before = self.steps.get("subscribe", 0)
-        rejected = self.w.subscribe(ready, list_id=list_id, on_sent=lambda n: self._count("subscribe", n))
-        self._refused(rejected, "subscribe")
+        self.w.subscribe(ready, list_id=list_id, on_sent=lambda n: self._count("subscribe", n),
+                         on_refused=self._refused("subscribe"))
         sent = self.steps.get("subscribe", 0) - before
         self.echo(f"subscribe: {sent:,} profiles (historical import, original timestamps)")
 
@@ -172,8 +174,7 @@ class Importer:
         if not emails:
             return
         before = self.steps.get(step, 0)
-        rejected = self.w.unsubscribe(emails, on_sent=lambda n: self._count(step, n))
-        self._refused(rejected, step)
+        self.w.unsubscribe(emails, on_sent=lambda n: self._count(step, n), on_refused=self._refused(step))
         self.echo(f"{step}: {self.steps.get(step, 0) - before:,} profiles"
                   + (" (as unsubscribe)" if step == "suppress" else ""))
 
@@ -196,8 +197,7 @@ class Importer:
             jobs.append(job)
             self._count("suppress", job.size)
 
-        rejected = self.w.suppress(emails, on_job=accepted)
-        self._refused(rejected, "suppress")
+        self.w.suppress(emails, on_job=accepted, on_refused=self._refused("suppress"))
         sent = sum(j.size for j in jobs)
         self.echo(
             f"suppress: {sent:,} profiles submitted in {len(jobs)} job(s). Klaviyo can take hours to "
