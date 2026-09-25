@@ -18,7 +18,7 @@ Read these before running anything that writes.
 - **Suppression jobs are slow, and their status can't be trusted.** In the sandbox, Klaviyo applied bulk suppressions two to four hours after submission. The job status stayed `processing` and reported every profile as skipped. Confirm with `klaviyo suppressions check`, not the job status, and pilot one address first.
 - **Uploading to STOQ can change Klaviyo consent.** In the dev store, STOQ's Klaviyo integration subscribed uploaded signups to email marketing (including some marked `Accepts marketing = false`, some previously unsubscribed, and one suppressed profile). Before uploading, remove BIS rows for people who are unsubscribed or never subscribed (see [STOQ](#stoq-preparing-and-uploading-the-back-in-stock-file)).
 - **`Phone` is left blank in the STOQ file on purpose.** SMS is out of scope, and a phone number could make STOQ send SMS alerts to people who signed up by email only.
-- **Exports hold personal data.** Delete `exports/` and `state/` as soon as the migration is finished (see [Deleting local data](#deleting-local-data)).
+- **Exports hold personal data.** Delete them as soon as the migration is finished, except the kept snapshot in `exports/og_exports/` (see [Deleting local data](#deleting-local-data)).
 - **Nothing is written to `klaviyo_ca`** unless you pass `--allow-write-to-source`. The migration never needs it.
 
 ## Setup
@@ -350,7 +350,7 @@ The full order, with the reasons, is in `docs/BUILD_PLAN.md`. In short:
 3. **Lists and segments.** Export both from `klaviyo_ca`. Attach chosen sets of profiles to US lists with `lists add` or through the Klaviyo UI. Clone segments in the UI.
 4. **Back in Stock.** `bis export` from `klaviyo_ca`, prepare the file (above), including removing unsubscribed and never-subscribed people, and upload it in the US store's STOQ admin.
 5. **Catch-up run.** Do this immediately before sign-ups are turned off on the CA Klaviyo site (next section).
-6. **Delete local data** (below).
+6. **Delete local data** (below), keeping `exports/og_exports/`.
 
 ## Catch-up run
 
@@ -369,11 +369,14 @@ uv run migtool klaviyo bis export          --instance klaviyo_ca --since 2026-10
 
 ## Deleting local data
 
-The exports hold customer personal data. As soon as the migration is finished:
+The exports hold customer personal data. As soon as the migration is finished, delete everything under `exports/` **except `exports/og_exports/`**, and `state/`:
 
 ```
-rm -rf exports/ state/
+find exports -mindepth 1 -maxdepth 1 ! -name og_exports -exec rm -rf {} +
+rm -rf state/
 ```
+
+**`exports/og_exports/`** is a snapshot of the original exports, kept on purpose. It includes the first full `klaviyo_ca` exports of 2026-09-24: profiles, suppressions, segments and Back in Stock (the lists export there covers only memberships since 2026-09-01). It also has the sandbox trial files. It still holds CA customer personal data, is git-ignored, and should be deleted when it's no longer needed. The tool never writes to it. Its profile files predate typed property columns, so re-export rather than re-import from them.
 
 ## Troubleshooting
 
