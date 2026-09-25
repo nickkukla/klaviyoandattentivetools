@@ -1,13 +1,349 @@
 # migtool
 
-Command-line tools for the Klaviyo migration (including the Back in Stock export for STOQ). See `docs/REQUIREMENTS.md` for what they do and `docs/BUILD_PLAN.md` for build status.
+Command-line tools for moving the Canada Klaviyo account (`klaviyo_ca`) into the US account (`klaviyo_us`), and for exporting Klaviyo Back in Stock signups for upload to STOQ.
+
+- What the tools do and why: `docs/REQUIREMENTS.md`
+- Build phases and the migration run order: `docs/BUILD_PLAN.md`
+- What the Klaviyo and STOQ APIs actually do (tested): `docs/API_NOTES.md`
+- Acceptance criteria and their results: `docs/SIGNOFF.md`
+
+Attentive segments and the STOQ upload are done by hand. The tool has no Attentive commands and never writes to STOQ.
+
+## Warnings
+
+Read these before running anything that writes.
+
+- **`profiles import` overwrites matching profiles.** A CA row whose email or phone matches an existing US profile updates it. Dedupe the CA and US exports first (outside this tool), and import only profiles unique to CA.
+- **Suppressions override newer US subscribes.** `suppressions import` suppresses every email in the file, including people who subscribed more recently on the US store. Edit the file to choose which suppressions to apply.
+- **Suppression jobs are slow, and their status can't be trusted.** In the sandbox, Klaviyo applied bulk suppressions about four hours after submission. The job status stayed `processing` and reported every profile as skipped. Confirm with `klaviyo suppressions check`, not the job status, and pilot one address first.
+- **Uploading to STOQ can change Klaviyo consent.** In the dev store, STOQ's Klaviyo integration subscribed uploaded signups to email marketing (including some marked `Accepts marketing = false`, some previously unsubscribed, and one suppressed profile). Before uploading, remove BIS rows for people who are unsubscribed or never subscribed (see [STOQ](#stoq-preparing-and-uploading-the-back-in-stock-file)).
+- **`Phone` is left blank in the STOQ file on purpose.** SMS is out of scope, and a phone number could make STOQ send SMS alerts to people who signed up by email only.
+- **Exports hold personal data.** Delete `exports/` and `state/` as soon as the migration is finished (see [Deleting local data](#deleting-local-data)).
+- **Nothing is written to `klaviyo_ca`** unless you pass `--allow-write-to-source`. The migration never needs it.
 
 ## Setup
 
+Requires [uv](https://docs.astral.sh/uv/) (Python 3.12 is installed by uv).
+
 ```
 uv sync
-cp .env.example .env   # then fill in the keys
+cp .env.example .env      # then fill in the keys
+uv run migtool instances  # shows which keys are set (never their values)
+```
+
+Run every command from the repository root, since `.env` and the `exports/` and `state/` folders are relative to it.
+
+### Instances and keys
+
+| Instance | `.env` variable | Account | Key scopes |
+|---|---|---|---|
+| `klaviyo_ca` | `KLAVIYO_CA_API_KEY` | `Ka6Lvr`, Left On Friday Canada (source) | Read only: `accounts:read`, `profiles:read`, `lists:read`, `segments:read`, `metrics:read`, `events:read` |
+| `klaviyo_us` | `KLAVIYO_US_API_KEY` | `KF4XLe`, Left On Friday (destination) | The read scopes, plus `profiles:write`, `subscriptions:write`, `lists:write`. **Keep it read-only until the migration run.** |
+| `klaviyo_sandbox` | `KLAVIYO_SANDBOX_API_KEY` | `T2aEdf`, Left In Friday Dev (test account) | Read and write scopes as for `klaviyo_us` |
+
+Keys never appear in output, logs or error messages. Check a key before using it:
+
+```
+uv run migtool klaviyo whoami --instance klaviyo_us
+```
+
+Run the tests with `uv run pytest`. They use recorded responses and never call a live account.
+
+## How writes are protected
+
+Every write command (`profiles import`, `suppressions import`, `lists add`):
+
+1. names its target with `--to <instance>`;
+2. prints the account name and ID, the instance and the number of records, and asks you to type the instance name to confirm (`--yes` skips this, for scripted runs);
+3. refuses to write to a `_ca` instance unless `--allow-write-to-source` is given, even with `--yes`.
+
+Every write can be repeated safely. Re-importing a profile updates it, adding a profile to a list it's already on changes nothing, and suppressing a suppressed email changes nothing. A failed import is simply re-run; imports don't resume.
+
+## Output files
+
+Everything goes under `exports/<instance>/<object>/`, named by the run's UTC start time (for example `20260924T195337Z.csv`):
+
+- `manifest.json`: one entry per run, with row counts, options, and for imports the `migration_run_id`, the source file and the per-step counts.
+- `<run>.errors.csv`: per-record errors. The run carries on, and exits non-zero if there were any.
+- `<run>.skipped.csv` (imports): rows not sent, with the reason (for example no email).
+
+Every run ends with a summary (read, written, skipped, failed). Timestamps in files and on the command line are UTC ISO 8601 (`2026-09-24T15:30:00Z`). The one exception is the STOQ file's `Date` column, which uses STOQ's `dd/mm/yyyy`.
+
+`state/` holds checkpoints for `--resume` and the IDs of Klaviyo bulk jobs.
+
+## Commands
+
+### `migtool instances`
+
+Lists every instance and whether its `.env` variable is set.
+
+```
 uv run migtool instances
 ```
 
-Run the tests with `uv run pytest`.
+### `migtool klaviyo whoami`
+
+Shows the account ID and name a key belongs to. Use it before any write.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to check |
+
+```
+uv run migtool klaviyo whoami --instance klaviyo_us
+```
+
+### `migtool klaviyo profiles export`
+
+Writes every profile, whatever its consent or suppression state, to CSV. The layout is the one `profiles import` reads, so an exported file can be edited and re-imported.
+
+Columns: `id`, `email`, `phone_number`, `external_id`, names, `locale`, dates, `location.*`, email consent (`consent`, `consent_timestamp`, `method`, `method_detail`, `custom_method_detail`, `double_optin`, …), suppression (`suppression_reason`, `suppression_timestamp`, all `suppressions` as JSON), custom properties as `properties.<key>` (nested values as JSON text), and with `--with-predictive`, `predictive_analytics.*`.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to export from |
+| `--segment` | Only that segment's members, by ID or exact name. An ambiguous name stops with the matching IDs. |
+| `--since` | Only profiles updated after this time. **Unsubscribes don't change a profile's update time**, so a catch-up run also needs `suppressions export --since`. |
+| `--with-predictive` | Add predictive analytics columns (Klaviyo's rate limit drops from 700 to 150 requests per minute) |
+| `--resume` | Continue the unfinished export with the same options. The export saves its position after every 100 profiles. |
+
+```
+uv run migtool klaviyo profiles export --instance klaviyo_ca
+uv run migtool klaviyo profiles export --instance klaviyo_ca --resume
+uv run migtool klaviyo profiles export --instance klaviyo_ca --since 2026-10-01T00:00:00Z
+uv run migtool klaviyo profiles export --instance klaviyo_ca --segment "VIP Customers" --with-predictive
+```
+
+A full `klaviyo_ca` export (291,337 profiles) takes about 40 minutes. Klaviyo can return a record twice if it changes during the export; the export keeps the last copy and records `duplicates_dropped` in the manifest.
+
+### `migtool klaviyo profiles import`
+
+Imports a `profiles export` CSV (edited as needed) into the destination, keeping consent and suppression:
+
+1. Bulk-imports every row's fields into `--list-id`, with `ca_external_id`, `ca_consent_method`, `ca_consent_source`, `ca_suppression_reason`, `ca_suppression_timestamp`, `migrated_from=ca` and `migration_run_id`. The source `id`, `external_id` and `$…` properties are never sent. Blank cells never clear a destination value.
+2. Subscribes `SUBSCRIBED` rows in historical-import mode with their original consent timestamp. There's no double opt-in and no list flows. A profile that's already subscribed in the destination keeps its existing timestamp.
+3. Unsubscribes `UNSUBSCRIBED` rows. Klaviyo stamps the unsubscribe with the import time; the original date is in `ca_suppression_timestamp`.
+4. Suppresses rows with any other suppression reason (hard bounce, spam complaint, user-suppressed, invalid email). The jobs are submitted and not waited on; see `suppressions check`.
+
+Never-subscribed rows get no consent change. Rows without an email are skipped and listed in the skipped file.
+
+| Flag | |
+|---|---|
+| `--to` (required) | Instance to write to |
+| `--file` (required) | CSV to import |
+| `--list-id` (required) | List every imported profile joins, and that subscribed rows subscribe to (for the migration: the LOF Canada Newsletter list in `klaviyo_us`) |
+| `--limit` | Only the first N rows, for trials |
+| `--as-unsubscribe` | Unsubscribe instead of suppressing in step 4 (see `suppressions import`) |
+| `--yes` | Skip the typed confirmation |
+| `--allow-write-to-source` | Allow writing to a `_ca` instance |
+
+```
+uv run migtool klaviyo profiles import --to klaviyo_sandbox --file trial.csv --list-id TQ9jRX --limit 10
+uv run migtool klaviyo profiles import --to klaviyo_us --file ca_unique_profiles.csv --list-id <LOF Canada Newsletter list ID>
+uv run migtool klaviyo profiles import --to klaviyo_us --file ca_unique_profiles.csv --list-id <ID> --as-unsubscribe
+uv run migtool klaviyo profiles import --to klaviyo_sandbox --file trial.csv --list-id TQ9jRX --yes   # no prompt
+# Writing back into the CA account is never needed for the migration, and is refused without this flag:
+uv run migtool klaviyo profiles import --to klaviyo_ca --file fix.csv --list-id <ID> --allow-write-to-source
+```
+
+The run's `migration_run_id` is printed and saved in the manifest. Every imported profile carries it, so a bad batch can be found and segmented or deleted in Klaviyo.
+
+### `migtool klaviyo suppressions export`
+
+Writes one row per email suppression: `email`, `profile_id`, `reason`, `timestamp`.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to export from |
+| `--since` | Only suppressions after this time |
+| `--resume` | Continue the unfinished export with the same options |
+
+```
+uv run migtool klaviyo suppressions export --instance klaviyo_ca
+uv run migtool klaviyo suppressions export --instance klaviyo_ca --since 2026-10-01T00:00:00Z
+uv run migtool klaviyo suppressions export --instance klaviyo_ca --resume
+```
+
+### `migtool klaviyo suppressions import`
+
+Suppresses every email in the file (a `suppressions export` file, or any CSV with an `email` column). An email with no profile first gets one, tagged `migrated_from=ca` and `migration_run_id`. Then all the emails are submitted for suppression. Klaviyo applies suppression jobs in the background, which took about four hours in the sandbox, so confirm the result later with `suppressions check`.
+
+| Flag | |
+|---|---|
+| `--to` (required) | Instance to write to |
+| `--file` (required) | CSV with an `email` column |
+| `--limit` | Only the first N rows. Use `--limit 1` for the one-address pilot. |
+| `--as-unsubscribe` | Unsubscribe instead of suppressing. It blocks marketing email immediately, but a later subscribe lifts it, and Klaviyo shows the reason as "Unsubscribed". Use it as a floor, then suppress in the Klaviyo UI. |
+| `--yes` | Skip the typed confirmation |
+| `--allow-write-to-source` | Allow writing to a `_ca` instance |
+
+```
+uv run migtool klaviyo suppressions import --to klaviyo_us --file ca_suppressions.csv --limit 1
+uv run migtool klaviyo suppressions import --to klaviyo_us --file ca_suppressions.csv
+uv run migtool klaviyo suppressions import --to klaviyo_us --file ca_suppressions.csv --as-unsubscribe
+uv run migtool klaviyo suppressions import --to klaviyo_sandbox --file trial_suppressions.csv --yes
+uv run migtool klaviyo suppressions import --to klaviyo_ca --file ca_fix.csv --allow-write-to-source   # never needed for the migration
+```
+
+### `migtool klaviyo suppressions check`
+
+Read-only. Reports each email's current state in the instance: `suppressed`, `unsubscribed` (only unsubscribed), `not suppressed` or `no profile`. Writes the ones that aren't suppressed to `<run>.not_suppressed.csv`, which can be fed back into `suppressions import`.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to check |
+| `--file` (required) | CSV with an `email` column |
+
+```
+uv run migtool klaviyo suppressions check --instance klaviyo_us --file ca_suppressions.csv
+```
+
+### `migtool klaviyo lists export`
+
+Writes `<run>.lists.csv` (ID, name, dates, opt-in setting, member count) and `<run>.list_members.csv` (list ID and name, profile ID, email, join date).
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to export from |
+| `--since` | Only memberships that joined after this time |
+
+```
+uv run migtool klaviyo lists export --instance klaviyo_ca
+uv run migtool klaviyo lists export --instance klaviyo_ca --since 2026-10-01T00:00:00Z
+```
+
+### `migtool klaviyo lists add`
+
+Adds every profile in the file to one list, by the `email` column. The file can be just emails (for example `list_members.csv` filtered by hand) or the full profile layout.
+
+- Existing profiles are only added to the list. Their fields and consent don't change.
+- Missing profiles are created from the file's fields, following the same rules as `profiles import`, and tagged `migrated_from=ca` and `migration_run_id`.
+- If the file has `consent` and `consent_timestamp` columns, `SUBSCRIBED` rows (not suppressed) are also subscribed to the list, with their original timestamp. Without those columns, nobody's consent changes.
+
+| Flag | |
+|---|---|
+| `--to` (required) | Instance to write to |
+| `--list` (required) | ID of the list to add profiles to |
+| `--file` (required) | CSV with an `email` column |
+| `--limit` | Only the first N rows |
+| `--yes` | Skip the typed confirmation |
+| `--allow-write-to-source` | Allow writing to a `_ca` instance |
+
+```
+uv run migtool klaviyo lists add --to klaviyo_us --list AbC123 --file vip_members.csv
+uv run migtool klaviyo lists add --to klaviyo_sandbox --list Td8hfk --file vip_members.csv --limit 5 --yes
+uv run migtool klaviyo lists add --to klaviyo_ca --list XyZ789 --file members.csv --allow-write-to-source   # never needed for the migration
+```
+
+Klaviyo segments can't have members added directly. To mirror a segment, add its members to a list and build the segment on membership of that list.
+
+### `migtool klaviyo segments export`
+
+Writes `<run>.segments.csv` and `<run>.segment_members.csv` (same shape as `list_members.csv`). `segments.csv` has the ID, name, dates, member count, the event names each segment's rules use, and three yes/no columns:
+
+- `engagement`: Klaviyo email events (opened, clicked, received), and order events (Placed Order, Ordered Product and other Shopify order events).
+- `site_activity`: Viewed Product, Active on Site, Added to Cart, Checkout Started, from any integration.
+- `third_party`: any other integration (Eventbrite, Loop Returns, …) or custom API events.
+
+Rules on profile properties, consent, location, or list or segment membership, and Klaviyo subscription events, get no label.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to export from |
+
+```
+uv run migtool klaviyo segments export --instance klaviyo_ca
+```
+
+Segments themselves are moved with Klaviyo's **Clone** action in the UI.
+
+### `migtool klaviyo bis export`
+
+Reads "Subscribed to Back in Stock" events and writes:
+
+- `<run>.bis.csv`: STOQ's import template columns, ready to upload. There's one row per email and SKU (the latest signup), so it can go to STOQ as-is (see below).
+- `<run>.reference.csv`: the CA variant and product IDs, product and variant names and Klaviyo event ID for each row.
+- `<run>.excluded.csv`: every signup that was dropped, with the reason.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to export from (`klaviyo_ca`) |
+| `--since` | Only signups after this date or time, e.g. `2026-09-01` |
+
+```
+uv run migtool klaviyo bis export --instance klaviyo_ca
+uv run migtool klaviyo bis export --instance klaviyo_ca --since 2026-10-01
+```
+
+## STOQ: preparing and uploading the Back in Stock file
+
+The `bis.csv` columns and how they're filled:
+
+| Column | Filled with |
+|---|---|
+| `SKU` | The SKU from the Klaviyo event. SKUs are identical in both stores; CA variant IDs are not, and are only in `reference.csv`. |
+| `Email` | The profile's email |
+| `Phone` | **Blank on purpose** (see [Warnings](#warnings)) |
+| `Name` | First and last name |
+| `Market` | **Blank: fill by hand.** Must match a market name or ID in the US Shopify admin. |
+| `Quantity` | Blank (STOQ defaults it to 1) |
+| `GDPR confirmed` | **Blank: fill by hand if needed**, `true` or `false` (blank means false) |
+| `Accepts marketing` | `true` if the profile is currently subscribed to email and not suppressed, otherwise `false` |
+| `Language` | The profile's locale as a language code (`en-CA` → `en`) |
+| `Date` | The signup date, `dd/mm/yyyy` in UTC |
+
+Before uploading:
+
+1. Open `bis.csv` and review it. Keep the header row unchanged, so STOQ maps the columns automatically.
+1. Compare its emails with the Klaviyo profile exports and remove rows for people who are unsubscribed or never subscribed. STOQ's Klaviyo integration may subscribe everyone you upload (see `docs/API_NOTES.md`).
+2. Fill `Market` (and `GDPR confirmed`, if used). STOQ watches the CA inventory location for CA subscribers and the US location for US and international ones, so the market decides which stock the alert waits for.
+3. Save as **CSV** (not Excel).
+
+To upload: in the US store's Shopify admin, go to **STOQ → Back in stock alerts → Settings → Integrations → Import data**, click **Upload CSV**, check the column mapping (and that dates are read day-first), and start the import. STOQ emails a status report when it finishes, and **View imports** shows past imports. Importing sends no alerts: customers are only notified when the product restocks. Re-uploading is safe, because STOQ skips a customer already waiting on the same variant. It rejects test or disposable addresses (`example.com`, `mailinator.com`, …).
+
+Check the result in **Reports → Back in Stock → Current waitlist**.
+
+## Migration run order
+
+The full order, with the reasons, is in `docs/BUILD_PLAN.md`. In short:
+
+1. **Profiles.** Create the LOF Canada Newsletter list in `klaviyo_us`. Export profiles from `klaviyo_ca` and `klaviyo_us` and dedupe them outside the tool (most recent consent wins; phone numbers unique against US; remove obviously overlapping Shopify properties). Then import the profiles unique to CA:
+   ```
+   uv run migtool klaviyo profiles import --to klaviyo_us --file ca_unique.csv --list-id <LOF Canada Newsletter ID>
+   ```
+2. **Suppressions.** Export from `klaviyo_ca` and edit the file to choose which to apply. Pilot one address with `--limit 1`, then run `suppressions check` on it until it shows `suppressed` (hours, in the sandbox). Then import the rest and check them the same way. If the pilot never applies, import with `--as-unsubscribe` and suppress in the Klaviyo UI.
+3. **Lists and segments.** Export both from `klaviyo_ca`. Attach chosen sets of profiles to US lists with `lists add` or through the Klaviyo UI. Clone segments in the UI.
+4. **Back in Stock.** `bis export` from `klaviyo_ca`, prepare the file (above), including removing unsubscribed and never-subscribed people, and upload it in the US store's STOQ admin.
+5. **Catch-up run.** Do this immediately before sign-ups are turned off on the CA Klaviyo site (next section).
+6. **Delete local data** (below).
+
+## Catch-up run
+
+Repeat steps 1–4 for anything that changed since the main run, with `--since` set a little before the main run started. Every write is safe to repeat, so overlap does no harm.
+
+```
+uv run migtool klaviyo profiles export     --instance klaviyo_ca --since 2026-10-01T00:00:00Z
+uv run migtool klaviyo suppressions export --instance klaviyo_ca --since 2026-10-01T00:00:00Z
+uv run migtool klaviyo lists export        --instance klaviyo_ca --since 2026-10-01T00:00:00Z
+uv run migtool klaviyo bis export          --instance klaviyo_ca --since 2026-10-01
+```
+
+- **The suppressions export is required.** Unsubscribes don't change a profile's update time, so only the suppressions export catches them.
+- Dedupe the delta files the same way as the main run, then import them with the same commands.
+- STOQ skips signups it already has, so the Back in Stock delta can be uploaded as-is.
+
+## Deleting local data
+
+The exports hold customer personal data. As soon as the migration is finished:
+
+```
+rm -rf exports/ state/
+```
+
+## Troubleshooting
+
+- **`KLAVIYO_…_API_KEY is not set`**: add it to `.env` in the repository root, and run commands from there.
+- **`401 Incorrect authentication credentials`**: the key is wrong or revoked. Create a new private key in Klaviyo (Settings → API keys).
+- **`403 … missing required scopes`**: the key lacks a scope listed in [Instances and keys](#instances-and-keys).
+- **An export stopped part-way**: run it again with `--resume` and the same options. Starting it without `--resume` abandons the unfinished one.
+- **Suppressions don't show up**: wait (hours), then run `suppressions check`. Don't go by the Klaviyo job status.
