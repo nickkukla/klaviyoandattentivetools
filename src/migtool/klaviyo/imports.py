@@ -8,6 +8,7 @@ repeat.
 from __future__ import annotations
 
 import csv
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,14 +16,9 @@ from typing import Any
 
 from migtool.klaviyo.writes import (
     CONSENT_COLUMNS,
-    IMPORT_BATCH,
     MIGRATED_FROM,
-    SUBSCRIBE_BATCH,
-    SUPPRESS_BATCH,
-    UNSUBSCRIBE_BATCH,
     Job,
     Writer,
-    batches,
     ca_properties,
     profile_attributes,
 )
@@ -35,7 +31,8 @@ IMPORT_WAIT = 60 * 60  # seconds to wait for import jobs
 
 def read_rows(path: Path, *, limit: int | None = None) -> tuple[list[str], list[dict[str, str]]]:
     csv.field_size_limit(1 << 30)
-    with open(path, newline="", encoding="utf-8") as f:
+    # utf-8-sig: Excel's "CSV UTF-8" starts the file with a byte-order mark.
+    with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or "email" not in reader.fieldnames:
             raise ValueError(f"{path} has no 'email' column.")
@@ -90,7 +87,8 @@ class Importer:
 
     `steps` counts what each step sent. The run log's `written` count is the
     command's main step only (`main_step`), so the summary answers "how many
-    rows did this command apply"."""
+    rows did this command apply". Every row that fails, is refused, or ends
+    with an unknown outcome is logged in the errors file."""
 
     def __init__(
         self, writer: Writer, log: RunLog, *, echo: Callable[[str], None],
@@ -109,28 +107,45 @@ class Importer:
         if step == self.main_step:
             self.log.written(n)
 
-    def _run_jobs(self, jobs: list[Job], stage: str, timeout: float) -> list[Job]:
-        pending = self.w.wait(jobs, timeout=timeout, progress=self.echo)
-        self.unfinished += pending
-        for job in pending:
-            self.echo(f"  {stage} job {job.id} still {job.status or 'processing'} after waiting")
-        return [j for j in jobs if j not in pending]
+    def _refused(self, rejected: list[tuple[str, str]], stage: str) -> None:
+        for who, reason in rejected:
+            self.log.error(who, f"refused by Klaviyo: {reason}", stage=stage)
 
-    def import_profiles(self, profiles: list[dict[str, Any]], *, list_id: str | None, stage: str) -> None:
-        """Bulk import, wait, and record per-record errors."""
+    def attributes(self, rows: list[dict[str, str]], extra) -> tuple[list[dict], list[dict[str, str]]]:
+        """Profile payloads for `rows`; rows with an unreadable cell are logged
+        and dropped. Returns (payloads, rows kept)."""
+        payloads, kept = [], []
+        for row in rows:
+            try:
+                payloads.append(profile_attributes(row, extra(row)))
+                kept.append(row)
+            except ValueError as exc:
+                self.log.error(row["email"], f"not sent: {exc}", stage="read")
+        return payloads, kept
+
+    def import_profiles(self, profiles: list[dict[str, Any]], *, list_id: str | None, stage: str) -> set[str]:
+        """Bulk import and wait. Returns the emails whose import is confirmed;
+        failed, refused and unknown ones are logged."""
         if not profiles:
-            return
-        jobs = []
-        for chunk in batches(profiles, IMPORT_BATCH):
-            job = self.w.import_profiles(chunk, list_id=list_id)
+            return set()
+        jobs, rejected = self.w.import_profiles(profiles, list_id=list_id)
+        self._refused(rejected, stage)
+        for job in jobs:
             self.save_job(job)
-            jobs.append(job)
         self.echo(f"{stage}: {len(profiles):,} profiles in {len(jobs)} job(s)")
-        for job in self._run_jobs(jobs, stage, IMPORT_WAIT):
-            errors = self.w.import_errors(job)
-            for who, message in errors:
+        pending = self.w.wait(jobs, timeout=IMPORT_WAIT, progress=self.echo)
+        self.unfinished += pending
+        ok: set[str] = set()
+        for job in jobs:
+            done, failed, unknown = self.w.import_result(job)
+            ok |= done
+            for who, message in failed:
                 self.log.error(who, message, stage=stage)
-            self._count(stage, max(0, job.size - len(errors)))
+            for who in sorted(unknown):
+                self.log.error(who, f"outcome unknown: job {job.id} is {job.status or 'processing'}; "
+                               "check the profile in Klaviyo", stage=stage)
+        self._count(stage, len(ok))
+        return ok
 
     def subscribe(self, rows: list[dict[str, str]], *, list_id: str) -> None:
         """Historical-import subscribe with each row's original consent timestamp."""
@@ -141,18 +156,21 @@ class Importer:
             else:
                 self.log.error(row["email"], "SUBSCRIBED without consent_timestamp; not subscribed",
                                stage="subscribe")
-        for chunk in batches(ready, SUBSCRIBE_BATCH):
-            self.w.subscribe(chunk, list_id=list_id)
-        self._count("subscribe", len(ready))
-        if ready:
-            self.echo(f"subscribe: {len(ready):,} profiles (historical import, original timestamps)")
+        if not ready:
+            return
+        rejected = self.w.subscribe(ready, list_id=list_id)
+        self._refused(rejected, "subscribe")
+        self._count("subscribe", len(ready) - len(rejected))
+        self.echo(f"subscribe: {len(ready) - len(rejected):,} profiles (historical import, original timestamps)")
 
-    def unsubscribe(self, emails: list[str]) -> None:
-        for chunk in batches(emails, UNSUBSCRIBE_BATCH):
-            self.w.unsubscribe(chunk)
-        self._count("unsubscribe", len(emails))
-        if emails:
-            self.echo(f"unsubscribe: {len(emails):,} profiles")
+    def unsubscribe(self, emails: list[str], *, step: str = "unsubscribe") -> None:
+        if not emails:
+            return
+        rejected = self.w.unsubscribe(emails)
+        self._refused(rejected, step)
+        self._count(step, len(emails) - len(rejected))
+        self.echo(f"{step}: {len(emails) - len(rejected):,} profiles"
+                  + (" (as unsubscribe)" if step == "suppress" else ""))
 
     def suppress(self, emails: list[str], *, as_unsubscribe: bool = False) -> None:
         """Submit suppression jobs, or with `as_unsubscribe` unsubscribe instead
@@ -164,33 +182,57 @@ class Importer:
         if not emails:
             return
         if as_unsubscribe:
-            for chunk in batches(emails, UNSUBSCRIBE_BATCH):
-                self.w.unsubscribe(chunk)
-            self._count("suppress", len(emails))
-            self.echo(f"suppress (as unsubscribe): {len(emails):,} profiles")
+            self.unsubscribe(emails, step="suppress")
             return
-        jobs = 0
-        for chunk in batches(emails, SUPPRESS_BATCH):
-            self.save_job(self.w.suppress(chunk))
-            jobs += 1
-        self._count("suppress", len(emails))
+        jobs, rejected = self.w.suppress(emails)
+        self._refused(rejected, "suppress")
+        for job in jobs:
+            self.save_job(job)
+        sent = len(emails) - len(rejected)
+        self._count("suppress", sent)
         self.echo(
-            f"suppress: {len(emails):,} profiles submitted in {jobs} job(s). Klaviyo can take hours to "
+            f"suppress: {sent:,} profiles submitted in {len(jobs)} job(s). Klaviyo can take hours to "
             "apply them, and the job status isn't reliable; run `klaviyo suppressions check` later."
         )
 
+    def skip_unconfirmed(self, rows: list[dict[str, str]], ok: set[str], step: str) -> list[dict[str, str]]:
+        """Rows whose profile write is confirmed. The others were already logged;
+        their consent isn't touched, so a missing profile is never created bare."""
+        kept = [r for r in rows if r["email"] in ok]
+        if len(kept) < len(rows):
+            self.steps[f"{step}_held_back"] = len(rows) - len(kept)
+            self.echo(f"{step}: {len(rows) - len(kept):,} rows held back because their profile write "
+                      "wasn't confirmed (see the errors file)")
+        return kept
+
+
+def suppression_reasons(row: dict[str, str]) -> list[str]:
+    """Every suppression reason a row carries: all of them from the `suppressions`
+    JSON column when present, otherwise the single `suppression_reason`."""
+    text = row.get("suppressions", "")
+    if text:
+        try:
+            items = json.loads(text)
+            return [str(i.get("reason", "")).upper() for i in items if isinstance(i, dict) and i.get("reason")]
+        except ValueError:
+            pass
+    reason = row.get("suppression_reason", "").upper()
+    return [reason] if reason else []
+
 
 def plan_profiles_import(rows: list[dict[str, str]]) -> dict[str, list]:
-    """Which consent step each row needs after the bulk import."""
+    """Which consent step each row needs after the bulk import. Any suppression
+    other than an unsubscribe (hard bounce, spam complaint, …) is suppressed,
+    even when a newer unsubscribe is the latest reason."""
     plan: dict[str, list] = {"subscribe": [], "unsubscribe": [], "suppress": []}
     for row in rows:
         consent = row.get("consent", "").upper()
-        reason = row.get("suppression_reason", "").upper()
-        if consent == "SUBSCRIBED" and not reason:
+        reasons = suppression_reasons(row)
+        if consent == "SUBSCRIBED" and not reasons:
             plan["subscribe"].append(row)
-        elif consent == "UNSUBSCRIBED" or reason == "UNSUBSCRIBE":
+        elif consent == "UNSUBSCRIBED" or "UNSUBSCRIBE" in reasons:
             plan["unsubscribe"].append(row["email"])
-        if reason and reason != "UNSUBSCRIBE":
+        if any(r != "UNSUBSCRIBE" for r in reasons):
             plan["suppress"].append(row["email"])
     return plan
 
@@ -199,11 +241,11 @@ def profiles_import(
     imp: Importer, rows: list[dict[str, str]], *, list_id: str, run_id: str, as_unsubscribe: bool = False
 ) -> None:
     """Import CA profiles: fields and `ca_*` properties onto every profile, all of
-    them into `list_id`, then consent from the file. Never-subscribed rows get
-    no consent change."""
-    profiles = [profile_attributes(r, ca_properties(r, run_id)) for r in rows]
-    imp.import_profiles(profiles, list_id=list_id, stage="import")
-    plan = plan_profiles_import(rows)
+    them into `list_id`, then consent from the file, for confirmed imports only.
+    Never-subscribed rows get no consent change."""
+    profiles, rows = imp.attributes(rows, lambda r: ca_properties(r, run_id))
+    ok = imp.import_profiles(profiles, list_id=list_id, stage="import")
+    plan = plan_profiles_import(imp.skip_unconfirmed(rows, ok, "consent"))
     imp.subscribe(plan["subscribe"], list_id=list_id)
     imp.unsubscribe(plan["unsubscribe"])
     imp.suppress(plan["suppress"], as_unsubscribe=as_unsubscribe)
@@ -217,15 +259,15 @@ def suppressions_import(
     imp: Importer, rows: list[dict[str, str]], *, run_id: str, as_unsubscribe: bool = False
 ) -> int:
     """Suppress every email. Emails with no profile get one first, tagged as
-    migrated, then suppressed. Returns the number of profiles created."""
+    migrated, then suppressed. Suppression still goes ahead for an email whose
+    profile couldn't be created (Klaviyo creates it untagged): blocking email
+    matters more than the tag. Returns the number of profiles created."""
     existing = imp.w.existing_emails(r["email"] for r in rows)
     missing = [r for r in rows if r["email"] not in existing]
-    imp.import_profiles(
-        [profile_attributes(r, {"ca_external_id": r.get("external_id"), **_tag(run_id)}) for r in missing],
-        list_id=None, stage="create",
-    )
+    payloads, _ = imp.attributes(missing, lambda r: {"ca_external_id": r.get("external_id"), **_tag(run_id)})
+    created = imp.import_profiles(payloads, list_id=None, stage="create")
     imp.suppress([r["email"] for r in rows], as_unsubscribe=as_unsubscribe)
-    return len(missing)
+    return len(created)
 
 
 def lists_add(
@@ -233,16 +275,15 @@ def lists_add(
 ) -> int:
     """Add every row to `list_id`. Existing profiles are only added (no field or
     consent change); missing ones are created from the file's fields and tagged.
-    With consent columns, SUBSCRIBED rows are also subscribed with their
-    original timestamp. Returns the number of profiles created."""
+    With consent columns, SUBSCRIBED rows whose add is confirmed are also
+    subscribed with their original timestamp. Returns the number created."""
     existing = imp.w.existing_emails(r["email"] for r in rows)
     missing = [r for r in rows if r["email"] not in existing]
     present = [r for r in rows if r["email"] in existing]
-    imp.import_profiles(
-        [profile_attributes(r, {"ca_external_id": r.get("external_id"), **_tag(run_id)}) for r in missing],
-        list_id=list_id, stage="add",
-    )
-    imp.import_profiles([{"email": r["email"]} for r in present], list_id=list_id, stage="add")
+    payloads, _ = imp.attributes(missing, lambda r: {"ca_external_id": r.get("external_id"), **_tag(run_id)})
+    created = imp.import_profiles(payloads, list_id=list_id, stage="add")
+    added = imp.import_profiles([{"email": r["email"]} for r in present], list_id=list_id, stage="add")
     if CONSENT_COLUMNS <= set(columns):
-        imp.subscribe(plan_profiles_import(rows)["subscribe"], list_id=list_id)
-    return len(missing)
+        confirmed = imp.skip_unconfirmed(rows, created | added, "subscribe")
+        imp.subscribe(plan_profiles_import(confirmed)["subscribe"], list_id=list_id)
+    return len(created)

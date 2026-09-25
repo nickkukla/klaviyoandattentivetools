@@ -192,34 +192,66 @@ def _read_rows(path: Path) -> Iterable[dict[str, Any]]:
             yield from csv.DictReader(f)
 
 
+def column_type(values: set[type]) -> str:
+    """How a column of JSON values is written: `text` when every value is a
+    string, `number`, `bool`, else `json` (lists, objects and mixed types)."""
+    if values <= {str}:
+        return "text"
+    if values <= {int, float}:
+        return "number"
+    if values == {bool}:
+        return "bool"
+    return "json"
+
+
+def typed_cell(value: Any, kind: str) -> str:
+    if value is None:
+        return ""
+    if kind == "json":
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return cell(value)
+
+
 def finalize_csv(
-    src: Path, dest: Path, first_columns: Iterable[str], *, unique_by: list[str] | None = None
+    src: Path, dest: Path, first_columns: Iterable[str], *,
+    unique_by: list[str] | None = None, typed_prefix: str | None = None,
 ) -> tuple[int, int]:
-    """Write the rows in `src` (JSONL or CSV) to CSV at `dest`, which may be `src`.
+    """Write the rows in `src` (JSONL or CSV) to CSV at `dest`. `src` is left
+    in place for the caller to delete once the run is recorded.
 
     Columns are `first_columns`, then every other key seen, sorted. With
     `unique_by`, only the last row for each key is kept: paging over data that
     changes during an export can return a record twice, and the later copy is
-    the fresher one. Returns (rows written, duplicates dropped).
+    the fresher one.
+
+    With `typed_prefix` (JSONL sources), columns under that prefix whose values
+    aren't all strings get a `#number`, `#bool` or `#json` suffix, and `#json`
+    cells are always JSON, so the importer can restore each type exactly
+    instead of guessing from the text. Returns (rows written, duplicates dropped).
     """
     first = list(first_columns)
     seen = set(first)
     extra: set[str] = set()
+    types: dict[str, set[type]] = {}
     for row in _read_rows(src):
         extra.update(k for k in row if k not in seen)
+        if typed_prefix:
+            for k, v in row.items():
+                if k.startswith(typed_prefix) and v is not None:
+                    types.setdefault(k, set()).add(type(v))
+    kinds = {k: column_type(t) for k, t in types.items()}
+    header = {k: (f"{k}#{kinds[k]}" if kinds.get(k, "text") != "text" else k) for k in first + sorted(extra)}
     keep = _last_occurrences(_read_rows(src), unique_by) if unique_by else None
     tmp = dest.with_name(dest.name + ".tmp")
-    writer = CsvWriter(tmp, first + sorted(extra))
+    writer = CsvWriter(tmp, list(header.values()))
     dropped = 0
     for i, row in enumerate(_read_rows(src)):
         if keep is not None and i not in keep:
             dropped += 1
             continue
-        writer.write(row)
+        writer.write({header[k]: (typed_cell(v, kinds[k]) if k in kinds else v) for k, v in row.items()})
     writer.close()
     os.replace(tmp, dest)
-    if src != dest:
-        src.unlink()
     return writer.count, dropped
 
 
@@ -239,8 +271,9 @@ class ResumableExport:
     the CSV, with `fieldnames` first and any other keys after them, sorted.
     Use it when rows carry columns that can't be listed up front.
 
-    With `unique_by`, `finish` keeps only the last row for each key (see
-    `finalize_csv`).
+    With `unique_by`, `finish` keeps only the last row for each key, and with
+    `typed_prefix`, columns under it carry their type (see `finalize_csv`).
+    Both need `staged=True`.
     """
 
     def __init__(
@@ -252,6 +285,7 @@ class ResumableExport:
         resume: bool = False,
         staged: bool = False,
         unique_by: list[str] | None = None,
+        typed_prefix: str | None = None,
         params: Mapping[str, Any] | None = None,
         store: StateStore | None = None,
         base: Path = EXPORTS_DIR,
@@ -262,6 +296,9 @@ class ResumableExport:
         self.object = obj
         self.params = dict(params or {})
         self.unique_by = unique_by
+        self.typed_prefix = typed_prefix
+        if (unique_by or typed_prefix) and not staged:
+            raise ValueError("unique_by and typed_prefix need staged=True")
         self.store = store or StateStore()
         saved = self.store.load_checkpoint(instance, obj)
 
@@ -325,13 +362,17 @@ class ResumableExport:
         )
 
     def finish(self, counts: Mapping[str, int] | None = None) -> Path:
-        """Close the file, record the run in the manifest and drop the checkpoint."""
+        """Close the file, record the run in the manifest and drop the checkpoint.
+
+        The staging file is deleted last, so an interruption at any point leaves
+        either a resumable checkpoint with its staging file, or a finished run."""
         self.writer.close()
         path = self.run.path(".csv")
         dropped = 0
-        if self.staged or self.unique_by:
+        if self.staged:
             self.rows, dropped = finalize_csv(
-                self.writer.path, path, self.fieldnames, unique_by=self.unique_by
+                self.writer.path, path, self.fieldnames,
+                unique_by=self.unique_by, typed_prefix=self.typed_prefix,
             )
         counts = {"rows": self.rows, **(counts or {})}
         if dropped:
@@ -343,4 +384,6 @@ class ResumableExport:
             extra={"params": self.params} if self.params else None,
         )
         self.store.clear_checkpoint(self.instance, self.object)
+        if self.staged:
+            self.writer.path.unlink(missing_ok=True)
         return manifest

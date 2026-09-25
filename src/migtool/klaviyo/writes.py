@@ -17,10 +17,15 @@ from migtool.http import ApiError
 from migtool.klaviyo.client import KlaviyoClient
 
 IMPORT_BATCH = 1000  # profiles per bulk import job (limit 10,000 and 5 MB)
+IMPORT_MAX_BYTES = 4_500_000  # stay under Klaviyo's 5 MB request limit
 SUBSCRIBE_BATCH = 1000  # limit 1,000
 UNSUBSCRIBE_BATCH = 100
 SUPPRESS_BATCH = 100  # limit 100
 LOOKUP_BATCH = 100  # emails per `any(email,[…])` lookup
+# Statuses meaning "this batch was refused as invalid". Klaviyo validates a
+# bulk request as a whole, so one bad row rejects the batch; it is split to
+# find the bad rows. Anything else (auth, 5xx after retries) stops the run.
+REJECTED_STATUSES = {400, 409, 413, 422}
 
 # Fields copied onto the destination profile. The source `id`, `external_id`
 # and `anonymous_id` are never sent.
@@ -31,23 +36,31 @@ MIGRATED_FROM = "ca"
 CUSTOM_SOURCE = "migtool CA migration"
 
 
-def parse_value(text: str) -> Any:
-    """Turn an exported cell back into a value: JSON arrays and objects, booleans,
-    and numbers whose text is their canonical form (so `01234` stays a string)."""
-    if text in ("true", "false"):
-        return text == "true"
-    if text[:1] in "[{":
-        try:
-            return json.loads(text)
-        except ValueError:
-            return text
-    for kind in (int, float):
-        try:
-            number = kind(text)
-        except ValueError:
-            continue
-        if str(number) == text:
-            return number
+PROPERTY_TYPES = ("number", "bool", "json")
+
+
+def property_column(column: str) -> tuple[str, str]:
+    """`properties.orders#number` → (`orders`, `number`). Columns without a
+    `#type` suffix are text."""
+    name = column.removeprefix("properties.")
+    key, sep, kind = name.rpartition("#")
+    if sep and kind in PROPERTY_TYPES:
+        return key, kind
+    return name, "text"
+
+
+def typed_value(text: str, kind: str) -> Any:
+    """A property cell as the type its column says. Text is never guessed at,
+    so `"123"` in a text column stays a string."""
+    if kind == "number":
+        number = float(text)
+        return int(number) if number.is_integer() and not any(c in text for c in ".eE") else number
+    if kind == "bool":
+        if text.lower() not in ("true", "false"):
+            raise ValueError(f"'{text}' is not true or false")
+        return text.lower() == "true"
+    if kind == "json":
+        return json.loads(text)
     return text
 
 
@@ -61,12 +74,16 @@ def profile_attributes(row: dict[str, str], extra_properties: dict[str, Any]) ->
     }
     if location:
         attrs["location"] = location
-    props = {
-        k.removeprefix("properties."): parse_value(v)
-        for k, v in row.items()
+    props: dict[str, Any] = {}
+    for column, text in row.items():
         # `$…` keys are Klaviyo-internal (e.g. `$consent`) and must not be written.
-        if k.startswith("properties.") and v and not k.startswith("properties.$")
-    }
+        if not column.startswith("properties.") or not text or column.startswith("properties.$"):
+            continue
+        key, kind = property_column(column)
+        try:
+            props[key] = typed_value(text, kind)
+        except ValueError as exc:
+            raise ValueError(f"{column}: {exc}") from exc
     props.update({k: v for k, v in extra_properties.items() if v not in (None, "")})
     if props:
         attrs["properties"] = props
@@ -91,12 +108,37 @@ def batches(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
         yield items[i:i + size]
 
 
+def byte_batches(items: Sequence[Any], *, count: int, max_bytes: int) -> Iterator[list[Any]]:
+    """Batches of at most `count` items and about `max_bytes` of JSON."""
+    batch: list[Any] = []
+    total = 0
+    for item in items:
+        size = len(json.dumps(item, ensure_ascii=False).encode()) + 40  # + JSON:API wrapper
+        if batch and (len(batch) >= count or total + size > max_bytes):
+            yield batch
+            batch, total = [], 0
+        batch.append(item)
+        total += size
+    if batch:
+        yield batch
+
+
+def api_error_detail(exc: ApiError) -> str:
+    """The first error detail from a Klaviyo error body, or the raw text."""
+    try:
+        err = json.loads(exc.detail)["errors"][0]
+        return f"{exc.status} {err.get('title', '')}: {err.get('detail', '')}".strip(": ")
+    except (ValueError, KeyError, IndexError, TypeError):
+        return f"{exc.status}: {exc.detail[:200]}"
+
+
 @dataclass
 class Job:
     kind: str  # API collection, e.g. "profile-bulk-import-jobs"
     id: str
     size: int
     attributes: dict[str, Any] = field(default_factory=dict)
+    emails: list[str] = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -123,7 +165,46 @@ class Writer:
         self._clock = clock
         self.poll_seconds = poll_seconds
 
-    def import_profiles(self, profiles: Sequence[dict[str, Any]], *, list_id: str | None) -> Job:
+    def isolate(
+        self, items: list[Any], send: Callable[[list[Any]], Any], who: Callable[[Any], str]
+    ) -> tuple[list[Any], list[tuple[str, str]]]:
+        """Send `items` with `send`. If Klaviyo refuses the batch as invalid,
+        split it in half and retry each half, down to single rows. Returns
+        (results of the accepted sends, (identifier, reason) for refused rows)."""
+        try:
+            return [send(items)], []
+        except ApiError as exc:
+            if exc.status not in REJECTED_STATUSES:
+                raise
+            if len(items) == 1:
+                return [], [(who(items[0]), api_error_detail(exc))]
+        mid = len(items) // 2
+        left, bad_left = self.isolate(items[:mid], send, who)
+        right, bad_right = self.isolate(items[mid:], send, who)
+        return left + right, bad_left + bad_right
+
+    def import_profiles(
+        self, profiles: Sequence[dict[str, Any]], *, list_id: str | None
+    ) -> tuple[list[Job], list[tuple[str, str]]]:
+        """Submit bulk import jobs, batched by count and size. Returns the jobs
+        and the rows Klaviyo refused (including any single profile too big to send)."""
+        jobs: list[Job] = []
+        rejected: list[tuple[str, str]] = []
+        fits = []
+        for p in profiles:
+            if len(json.dumps(p, ensure_ascii=False).encode()) > IMPORT_MAX_BYTES:
+                rejected.append((p.get("email", ""), "profile is larger than Klaviyo's request limit"))
+            else:
+                fits.append(p)
+        for chunk in byte_batches(fits, count=IMPORT_BATCH, max_bytes=IMPORT_MAX_BYTES):
+            done, bad = self.isolate(
+                chunk, lambda c: self._import_job(c, list_id), lambda p: p.get("email", "")
+            )
+            jobs += done
+            rejected += bad
+        return jobs, rejected
+
+    def _import_job(self, profiles: Sequence[dict[str, Any]], list_id: str | None) -> Job:
         body: dict[str, Any] = {"data": {
             "type": "profile-bulk-import-job",
             "attributes": {"profiles": {"data": [{"type": "profile", "attributes": p} for p in profiles]}},
@@ -131,10 +212,42 @@ class Writer:
         if list_id:
             body["data"]["relationships"] = {"lists": {"data": [{"type": "list", "id": list_id}]}}
         data = self.client.post("/profile-bulk-import-jobs/", body, tier="M")["data"]
-        return Job("profile-bulk-import-jobs", data["id"], len(profiles), data["attributes"])
+        return Job("profile-bulk-import-jobs", data["id"], len(profiles), data["attributes"],
+                   [p.get("email", "") for p in profiles])
 
-    def subscribe(self, rows: Sequence[tuple[str, str]], *, list_id: str) -> None:
-        """Historical-import subscribe: (email, consented_at) pairs. No job to track."""
+    def import_result(self, job: Job) -> tuple[set[str], list[tuple[str, str]], set[str]]:
+        """(succeeded emails, (email, reason) failures, emails with unknown outcome)
+        for a finished import job. Counts come from the job itself; anything that
+        can't be attributed is unknown, never assumed successful."""
+        emails = {e for e in job.emails if e}
+        if job.status != "complete":
+            return set(), [], emails
+        if not (job.attributes.get("failed_count") or 0):
+            return emails, [], set()
+        try:
+            failures = []
+            for page in self.client.paginate(f"/{job.kind}/{job.id}/import-errors/"):
+                for err in page["data"]:
+                    a = err["attributes"]
+                    email = ((a.get("original_payload") or {}).get("email") or "").lower()
+                    failures.append((email, f"{a.get('title', '')}: {a.get('detail', '')}".strip(": ")))
+        except ApiError:
+            return set(), [], emails
+        failed = {e for e, _ in failures if e}
+        if len(failed) < (job.attributes.get("failed_count") or 0):
+            # Some failures can't be tied to an email: the rest are unknown.
+            return set(), [f for f in failures if f[0]], emails - failed
+        return emails - failed, failures, set()
+
+    def subscribe(self, rows: Sequence[tuple[str, str]], *, list_id: str) -> list[tuple[str, str]]:
+        """Historical-import subscribe: (email, consented_at) pairs, no job to
+        track. Returns refused rows."""
+        rejected: list[tuple[str, str]] = []
+        for chunk in batches(list(rows), SUBSCRIBE_BATCH):
+            rejected += self.isolate(list(chunk), lambda c: self._subscribe(c, list_id), lambda r: r[0])[1]
+        return rejected
+
+    def _subscribe(self, rows: Sequence[tuple[str, str]], list_id: str) -> None:
         self.client.post("/profile-subscription-bulk-create-jobs/", {"data": {
             "type": "profile-subscription-bulk-create-job",
             "attributes": {
@@ -149,8 +262,14 @@ class Writer:
             "relationships": {"list": {"data": {"type": "list", "id": list_id}}},
         }}, tier="L")
 
-    def unsubscribe(self, emails: Sequence[str]) -> None:
-        """Unsubscribe from email marketing. No job to track."""
+    def unsubscribe(self, emails: Sequence[str]) -> list[tuple[str, str]]:
+        """Unsubscribe from email marketing, no job to track. Returns refused rows."""
+        rejected: list[tuple[str, str]] = []
+        for chunk in batches(list(emails), UNSUBSCRIBE_BATCH):
+            rejected += self.isolate(list(chunk), self._unsubscribe, lambda e: e)[1]
+        return rejected
+
+    def _unsubscribe(self, emails: Sequence[str]) -> None:
         self.client.post("/profile-subscription-bulk-delete-jobs/", {"data": {
             "type": "profile-subscription-bulk-delete-job",
             "attributes": {"profiles": {"data": [
@@ -160,14 +279,24 @@ class Writer:
             ]}},
         }}, tier="L")
 
-    def suppress(self, emails: Sequence[str]) -> Job:
+    def suppress(self, emails: Sequence[str]) -> tuple[list[Job], list[tuple[str, str]]]:
+        """Submit suppression jobs. Returns the jobs and refused rows."""
+        jobs: list[Job] = []
+        rejected: list[tuple[str, str]] = []
+        for chunk in batches(list(emails), SUPPRESS_BATCH):
+            done, bad = self.isolate(list(chunk), self._suppress, lambda e: e)
+            jobs += done
+            rejected += bad
+        return jobs, rejected
+
+    def _suppress(self, emails: Sequence[str]) -> Job:
         data = self.client.post("/profile-suppression-bulk-create-jobs/", {"data": {
             "type": "profile-suppression-bulk-create-job",
             "attributes": {"profiles": {"data": [
                 {"type": "profile", "attributes": {"email": e}} for e in emails
             ]}},
         }}, tier="L")["data"]
-        return Job("profile-suppression-bulk-create-jobs", data["id"], len(emails), data["attributes"])
+        return Job("profile-suppression-bulk-create-jobs", data["id"], len(emails), data["attributes"], list(emails))
 
     def existing_emails(self, emails: Iterable[str]) -> set[str]:
         """Which of `emails` already have a profile (compared lowercased)."""
@@ -201,16 +330,3 @@ class Writer:
                 last_report = (len(pending), now)
             self._sleep(self.poll_seconds)
         return pending
-
-    def import_errors(self, job: Job) -> list[tuple[str, str]]:
-        """(identifier, message) for each failed record of a bulk import job."""
-        out = []
-        try:
-            for page in self.client.paginate(f"/{job.kind}/{job.id}/import-errors/"):
-                for err in page["data"]:
-                    a = err["attributes"]
-                    who = (a.get("original_payload") or {}).get("email") or ""
-                    out.append((who, f"{a.get('title', '')}: {a.get('detail', '')}".strip(": ")))
-        except ApiError as exc:
-            out.append(("", f"could not read errors for job {job.id}: {exc}"))
-        return out
