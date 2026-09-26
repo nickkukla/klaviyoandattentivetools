@@ -40,3 +40,11 @@ def all_groups(client: KlaviyoClient, kind: str, fields: str) -> list[dict[str, 
     for page in client.paginate(f"/{kind}s/", tier="L", params={f"fields[{kind}]": fields}):
         out.extend(page["data"])
     return out
+
+
+def lists_named(client: KlaviyoClient, name: str) -> list[str]:
+    """IDs of the lists called exactly `name`."""
+    ids: list[str] = []
+    for page in client.paginate("/lists/", tier="L", params={"fields[list]": "name", "filter": f'equals(name,"{name}")'}):
+        ids.extend(g["id"] for g in page["data"] if g["attributes"]["name"] == name)
+    return ids

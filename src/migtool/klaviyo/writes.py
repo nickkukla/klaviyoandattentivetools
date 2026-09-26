@@ -387,6 +387,11 @@ class Writer:
         }}, tier="L")["data"]
         return Job("profile-suppression-bulk-create-jobs", data["id"], len(emails), data["attributes"], list(emails))
 
+    def create_list(self, name: str) -> str:
+        """Create an empty list and return its ID."""
+        return self.client.post("/lists/", {"data": {"type": "list", "attributes": {"name": name}}},
+                                tier="M")["data"]["id"]
+
     def existing_emails(self, emails: Iterable[str]) -> set[str]:
         """Which of `emails` already have a profile (compared lowercased)."""
         found: set[str] = set()

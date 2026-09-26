@@ -474,6 +474,77 @@ def lists_add(
                retries_settled=retries_settled)
 
 
+
+@lists_app.command("copy")
+def lists_copy(
+    from_: str = typer.Option(..., "--from", help="Klaviyo instance to read the list from (read-only)."),
+    source_list: str = typer.Option(..., "--list", help="ID of the list to copy."),
+    to: str = TO,
+    to_list: str | None = typer.Option(None, "--to-list", help="ID of an existing list to add the members to."),
+    create: bool = typer.Option(False, "--create", help="Create the destination list instead."),
+    name: str | None = typer.Option(
+        None, "--name", help="Name of the list --create makes (default: the source list's name)."
+    ),
+    limit: int | None = LIMIT,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
+) -> None:
+    """Copy one list's members into a list on another instance, creating it if asked.
+
+    Members are matched by email and only added to the list: no field, property
+    or consent changes. Members with no email are skipped. An email with no
+    profile at the destination is created, with the migration tags."""
+    if (to_list is None) != create:
+        raise typer.BadParameter("give exactly one of --to-list or --create.", param_hint="--to-list")
+    if name and not create:
+        raise typer.BadParameter("--name only applies with --create.", param_hint="--name")
+    # Read the source list's members (read-only) into an email-only file.
+    source = new_run(from_, "lists-copy")
+    members_path = source.path(".members.csv")
+    with _client(from_) as client:
+        try:
+            group = client.get(f"/lists/{source_list}/", tier="S", params={"fields[list]": "name"})["data"]
+        except ApiError as exc:
+            raise ConfigError(f"List {source_list} wasn't found on {from_} ({exc.status}).") from exc
+        source_name = group["attributes"]["name"]
+        writer = CsvWriter(members_path, ["email"])
+        no_email = 0
+        for row in groups.members(client, "list", group):
+            if row["email"]:
+                writer.write({"email": row["email"]})
+            else:
+                no_email += 1
+        writer.close()
+    write_manifest(source, files={members_path.name: writer.count},
+                   counts={"members": writer.count + no_email, "no_email": no_email},
+                   extra={"list_id": source_list, "list_name": source_name})
+    typer.echo(f"Source list:     {source_name} ({source_list}) on {from_}: {writer.count + no_email:,} members, "
+               f"{no_email:,} without an email (skipped)")
+    with _client(to) as client:
+        if to_list:
+            dest_name = _list_name(client, to_list)
+            typer.echo(f"Add to:          {dest_name} ({to_list})")
+        else:
+            dest_name = name or source_name
+            if groups.lists_named(client, dest_name):
+                raise ConfigError(f"{to} already has a list named '{dest_name}'. Use --to-list with its ID, "
+                                  "or --name for a different name.")
+            typer.echo(f"Create list:     {dest_name} (after you confirm)")
+    extra = {"source_instance": from_, "source_list": source_list, "source_members_file": str(members_path),
+             "list_id": to_list, "list_name": dest_name}
+
+    def body(imp, rows, columns, run):
+        list_id = to_list
+        if not list_id:
+            list_id = imp.w.create_list(dest_name)
+            extra["list_id"] = list_id
+            typer.echo(f"Created list {dest_name} ({list_id})")
+        return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
+
+    _write_run(to, "lists-copy", "add", members_path, limit, yes, allow_write_to_source, body, extra,
+               retries_settled=retries_settled)
+
 TYPES_FROM = typer.Option(
     None, "--types-from", exists=True, dir_okay=False,
     help="The CA `profiles export` CSV, whose header gives each custom property's type (required for role new).",
