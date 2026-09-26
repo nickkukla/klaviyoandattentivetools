@@ -53,7 +53,7 @@ Run the tests with `uv run pytest`. They use recorded responses and never call a
 
 ## How writes are protected
 
-Every write command (`profiles import`, `suppressions import`, `lists add`, `lists copy`):
+Every write command (`profiles import`, `suppressions import`, `lists add`, `lists copy`, `segments copy`):
 
 1. names its target with `--to <instance>`;
 2. prints the account name and ID, the instance and the number of records, and asks you to type the instance name to confirm (`--yes` skips this, for scripted runs);
@@ -372,7 +372,27 @@ uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_u
 uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --to-list XyZ789
 ```
 
-Klaviyo segments can't have members added directly. To mirror a segment, add its members to a list and build the segment on membership of that list.
+Klaviyo segments can't have members added directly. To mirror a segment, add its members to a list and build the segment on membership of that list, or copy it as a static list with `segments copy`.
+
+### `migtool klaviyo segments copy`
+
+Copies a segment's **current** members into a static list on another instance, for segments whose rules won't work at the destination. It works exactly like `lists copy`, but reads `--segment` instead of `--list`, and a list it creates is named after the segment plus ` (CA segment)` by default.
+
+The list is a snapshot: it doesn't gain or lose members as the source segment changes. Copy close to when the list is needed, or copy again into the same list with `--to-list` to add later members (nobody is removed).
+
+| Flag | |
+|---|---|
+| `--from` (required) | Instance to read the segment from |
+| `--segment` (required) | ID of the segment to copy |
+| `--to` (required) | Instance to write to |
+| `--to-list`, `--create`, `--name` | As for `lists copy` |
+| `--suffix` | Added to the segment's name when there's no `--name` (default ` (CA segment)`) |
+| `--limit`, `--yes`, `--allow-write-to-source`, `--retries-settled` | As for `lists add` |
+
+```
+uv run migtool klaviyo segments copy --from klaviyo_ca --segment AbC123 --to klaviyo_us --create
+uv run migtool klaviyo segments copy --from klaviyo_ca --segment AbC123 --to klaviyo_us --to-list XyZ789
+```
 
 ### `migtool klaviyo segments export`
 

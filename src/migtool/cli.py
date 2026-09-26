@@ -514,46 +514,36 @@ def lists_add(
 
 
 
-@lists_app.command("copy")
-def lists_copy(
-    from_: str = typer.Option(..., "--from", help="Klaviyo instance to read the list from (read-only)."),
-    source_list: str = typer.Option(..., "--list", help="ID of the list to copy."),
-    to: str = TO,
-    to_list: str | None = typer.Option(None, "--to-list", help="ID of an existing list to add the members to."),
-    create: bool = typer.Option(False, "--create", help="Create the destination list instead."),
-    name: str | None = typer.Option(
-        None, "--name", help="Name of the list --create makes (default: the source list's name plus --suffix)."
-    ),
-    suffix: str = typer.Option(" (CA)", "--suffix", help="Added to the source list's name when --name isn't given."),
-    limit: int | None = LIMIT,
-    yes: bool = YES,
-    allow_write_to_source: bool = ALLOW_SOURCE,
-    retries_settled: bool = RETRIES_SETTLED,
-) -> None:
-    """Copy one list's members into a list on another instance, creating it if asked.
+TO_LIST = typer.Option(None, "--to-list", help="ID of an existing list to add the members to.")
+CREATE = typer.Option(False, "--create", help="Create the destination list instead.")
+NAME = typer.Option(None, "--name", help="Name of the list --create makes, used as is (default: the source's name plus --suffix).")
 
-    Members are matched by email, or by phone number when they have no email,
-    and only added to the list: no field, property or consent changes. A member
-    with no profile at the destination is created, with the migration tags."""
+
+def _copy_group(
+    kind: str, from_: str, source_id: str, to: str, to_list: str | None, create: bool, name: str | None,
+    suffix: str, limit: int | None, yes: bool, allow_write_to_source: bool, retries_settled: bool,
+) -> None:
+    """Shared body of `lists copy` and `segments copy`: snapshot one list's or
+    segment's members (read-only), then add them to a destination list."""
     if (to_list is None) != create:
         raise typer.BadParameter("give exactly one of --to-list or --create.", param_hint="--to-list")
     if name and not create:
         raise typer.BadParameter("--name only applies with --create.", param_hint="--name")
-    # Read the source list's members (read-only) into an email-only file.
-    source = new_run(from_, "lists-copy")
+    label = kind.capitalize()
+    source = new_run(from_, f"{kind}s-copy")
     members_path = source.path(".members.csv")
     with _client(from_) as client:
         try:
-            group = client.get(f"/lists/{source_list}/", tier="S", params={"fields[list]": "name"})["data"]
+            group = client.get(f"/{kind}s/{source_id}/", tier="S", params={f"fields[{kind}]": "name"})["data"]
         except ApiError as exc:
-            raise ConfigError(f"List {source_list} wasn't found on {from_} ({exc.status}).") from exc
+            raise ConfigError(f"{label} {source_id} wasn't found on {from_} ({exc.status}).") from exc
         source_name = group["attributes"]["name"]
         # The phone only for phone-only members: it's their identifier. For the
         # others, sending it could change the destination profile's number.
         writer = CsvWriter(members_path, ["email", "phone_number"])
         phone_only = neither = 0
         params = {"fields[profile]": "email,phone_number", "page[size]": "100"}
-        for page in client.paginate(f"/lists/{source_list}/profiles/", tier="L", params=params):
+        for page in client.paginate(f"/{kind}s/{source_id}/profiles/", tier="L", params=params):
             for p in page["data"]:
                 email, phone = p["attributes"].get("email"), p["attributes"].get("phone_number")
                 if email:
@@ -566,8 +556,8 @@ def lists_copy(
         writer.close()
     write_manifest(source, files={members_path.name: writer.count},
                    counts={"members": writer.count + neither, "phone_only": phone_only, "no_identifier": neither},
-                   extra={"list_id": source_list, "list_name": source_name})
-    typer.echo(f"Source list:     {source_name} ({source_list}) on {from_}: {writer.count + neither:,} members "
+                   extra={f"{kind}_id": source_id, f"{kind}_name": source_name})
+    typer.echo(f"Source {kind + ':':10}{source_name} ({source_id}) on {from_}: {writer.count + neither:,} members "
                f"({phone_only:,} phone-only), {neither:,} with no email or phone (skipped)")
     with _client(to) as client:
         if to_list:
@@ -579,7 +569,7 @@ def lists_copy(
                 raise ConfigError(f"{to} already has a list named '{dest_name}'. Use --to-list with its ID, "
                                   "or --name for a different name.")
             typer.echo(f"Create list:     {dest_name} (after you confirm)")
-    extra = {"source_instance": from_, "source_list": source_list, "source_members_file": str(members_path),
+    extra = {"source_instance": from_, f"source_{kind}": source_id, "source_members_file": str(members_path),
              "list_id": to_list, "list_name": dest_name}
 
     def body(imp, rows, columns, run):
@@ -590,8 +580,56 @@ def lists_copy(
             typer.echo(f"Created list {dest_name} ({list_id})")
         return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
 
-    _write_run(to, "lists-copy", "add", members_path, limit, yes, allow_write_to_source, body, extra,
+    _write_run(to, f"{kind}s-copy", "add", members_path, limit, yes, allow_write_to_source, body, extra,
                retries_settled=retries_settled, phones=True)
+
+
+@lists_app.command("copy")
+def lists_copy(
+    from_: str = typer.Option(..., "--from", help="Klaviyo instance to read the list from (read-only)."),
+    source_list: str = typer.Option(..., "--list", help="ID of the list to copy."),
+    to: str = TO,
+    to_list: str | None = TO_LIST,
+    create: bool = CREATE,
+    name: str | None = NAME,
+    suffix: str = typer.Option(" (CA)", "--suffix", help="Added to the source list's name when --name isn't given."),
+    limit: int | None = LIMIT,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
+) -> None:
+    """Copy one list's members into a list on another instance, creating it if asked.
+
+    Members are matched by email, or by phone number when they have no email,
+    and only added to the list: no field, property or consent changes. A member
+    with no profile at the destination is created, with the migration tags."""
+    _copy_group("list", from_, source_list, to, to_list, create, name, suffix, limit, yes,
+                allow_write_to_source, retries_settled)
+
+
+@segments_app.command("copy")
+def segments_copy(
+    from_: str = typer.Option(..., "--from", help="Klaviyo instance to read the segment from (read-only)."),
+    source_segment: str = typer.Option(..., "--segment", help="ID of the segment to copy."),
+    to: str = TO,
+    to_list: str | None = TO_LIST,
+    create: bool = CREATE,
+    name: str | None = NAME,
+    suffix: str = typer.Option(
+        " (CA segment)", "--suffix", help="Added to the segment's name when --name isn't given."
+    ),
+    limit: int | None = LIMIT,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
+) -> None:
+    """Copy a segment's current members into a static list on another instance.
+
+    A snapshot: the list doesn't follow the segment afterwards. Members are
+    matched and added as `lists copy` does."""
+    _copy_group("segment", from_, source_segment, to, to_list, create, name, suffix, limit, yes,
+                allow_write_to_source, retries_settled)
+
 
 TYPES_FROM = typer.Option(
     None, "--types-from", exists=True, dir_okay=False,

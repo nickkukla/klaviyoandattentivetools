@@ -140,3 +140,30 @@ def test_copy_name_and_suffix_options(copy_env):
     assert json.loads(create.calls.last.request.content)["data"]["attributes"]["name"] == "VIP - from CA"
     assert run("--create", "--name", "Exactly this").exit_code == 0
     assert json.loads(create.calls.last.request.content)["data"]["attributes"]["name"] == "Exactly this"
+
+
+@respx.mock
+def test_segment_copy_snapshots_members_into_a_new_list(tmp_path, monkeypatch, klaviyo_account):
+    klaviyo_account("T2aEdf")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    respx.get(f"{API}/segments/S1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "S1", "type": "segment", "attributes": {"name": "Repeat buyers"}}}))
+    respx.get(f"{API}/segments/S1/profiles/").mock(return_value=httpx.Response(200, json=page([
+        {"id": "p1", "attributes": {"email": "a@example.com", "phone_number": "+14165550100"}},
+        {"id": "p2", "attributes": {"email": None, "phone_number": "+14165550101"}}])))
+    respx.get(f"{API}/lists/").mock(return_value=httpx.Response(200, json=page([])))
+    create = respx.post(f"{API}/lists/").mock(return_value=httpx.Response(201, json={"data": {"id": "NEW"}}))
+    calls = []
+    monkeypatch.setattr(imports, "lists_add", lambda imp, rows, columns, **kw: calls.append((rows, kw["list_id"])) or 0)
+    result = CliRunner().invoke(app, ["klaviyo", "segments", "copy", "--from", "klaviyo_sandbox", "--segment", "S1",
+                                      "--to", "klaviyo_sandbox", "--create", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "Source segment:  Repeat buyers (S1)" in result.output
+    assert json.loads(create.calls.last.request.content)["data"]["attributes"]["name"] == "Repeat buyers (CA segment)"
+    # A member with an email is sent by email only; the phone-only one by phone.
+    assert calls == [([{"email": "a@example.com", "phone_number": ""},
+                       {"email": "", "phone_number": "+14165550101"}], "NEW")]
+    [manifest] = (tmp_path / "exports/klaviyo_sandbox/segments-copy").glob("manifest.json")
+    last = json.loads(manifest.read_text())["runs"][-1]
+    assert last["source_segment"] == "S1" and last["list_id"] == "NEW"
