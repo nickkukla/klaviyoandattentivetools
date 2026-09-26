@@ -347,7 +347,7 @@ uv run migtool klaviyo lists add --to klaviyo_ca --list XyZ789 --file members.cs
 
 ### `migtool klaviyo lists copy`
 
-Copies one list's members into a list on another instance, in one step. It reads the source list (read-only), writes its members' emails to `exports/<from>/lists-copy/<run>.members.csv`, then adds them exactly as `lists add` does, to an existing list (`--to-list`) or to one it creates (`--create`, named like the source list unless `--name` is given).
+Copies one list's members into a list on another instance, in one step. It reads the source list (read-only), writes its members' emails to `exports/<from>/lists-copy/<run>.members.csv`, then adds them exactly as `lists add` does, to an existing list (`--to-list`) or to one it creates (`--create`, named like the source list plus ` (CA)`, unless `--suffix` or `--name` is given).
 
 - Members are added by email only, so existing profiles get no field, property or consent change. Nobody is subscribed.
 - Members with no email (phone-only) are skipped and counted.
@@ -362,12 +362,13 @@ Copies one list's members into a list on another instance, in one step. It reads
 | `--to` (required) | Instance to write to |
 | `--to-list` | ID of an existing destination list |
 | `--create` | Create the destination list instead (give exactly one of `--to-list` and `--create`) |
-| `--name` | Name for the list `--create` makes |
+| `--name` | Name for the list `--create` makes, used as is |
+| `--suffix` | Added to the source list's name when there's no `--name` (default ` (CA)`) |
 | `--limit`, `--yes`, `--allow-write-to-source`, `--retries-settled` | As for `lists add` |
 
 ```
 uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --create
-uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --create --name "VIP (from CA)"
+uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --create --name "VIP Canada"
 uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --to-list XyZ789
 ```
 

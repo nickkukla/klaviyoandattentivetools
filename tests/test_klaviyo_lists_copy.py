@@ -52,8 +52,8 @@ def test_copy_creates_the_list_and_adds_members_by_email_only(copy_env):
     result = run("--create")
     assert result.exit_code == 0, result.output
     assert "2 members, 1 without an email (skipped)" in result.output
-    assert parse_qs(urlparse(str(named.calls.last.request.url)).query)["filter"] == ['equals(name,"VIP")']
-    assert json.loads(create.calls.last.request.content)["data"]["attributes"] == {"name": "VIP"}
+    assert parse_qs(urlparse(str(named.calls.last.request.url)).query)["filter"] == ['equals(name,"VIP (CA)")']
+    assert json.loads(create.calls.last.request.content)["data"]["attributes"] == {"name": "VIP (CA)"}
     # Only the email goes to lists_add, so nothing else is written to the profile.
     assert calls == [{"rows": [{"email": "a@example.com"}], "columns": ["email"], "list_id": "NEW"}]
     [manifest] = (tmp_path / "exports/klaviyo_sandbox/lists-copy").glob("manifest.json")
@@ -80,11 +80,11 @@ def test_copy_into_an_existing_list_creates_nothing(copy_env):
 def test_copy_refuses_to_create_a_list_whose_name_is_taken(copy_env):
     _, calls = copy_env
     respx.get(f"{API}/lists/").mock(return_value=httpx.Response(200, json=page([
-        {"id": "X1", "attributes": {"name": "VIP"}}])))
+        {"id": "X1", "attributes": {"name": "VIP (CA)"}}])))
     create = respx.post(f"{API}/lists/")
     result = run("--create")
     assert result.exit_code != 0
-    assert "already has a list named 'VIP'" in str(result.exception)
+    assert "already has a list named 'VIP (CA)'" in str(result.exception)
     assert not create.called and not calls
 
 
@@ -108,7 +108,7 @@ def test_copy_end_to_end_recovers_a_lost_create_response(tmp_path, monkeypatch, 
         {"id": "p1", "attributes": {"email": "a@example.com", "joined_group_at": None}}])))
     named = respx.get(f"{API}/lists/").mock(side_effect=[
         httpx.Response(200, json=page([])),
-        httpx.Response(200, json=page([{"id": "NEW", "attributes": {"name": 'VIP "Canada"'}}])),
+        httpx.Response(200, json=page([{"id": "NEW", "attributes": {"name": 'VIP "Canada" (CA)'}}])),
     ])
     create = respx.post(f"{API}/lists/").mock(return_value=httpx.Response(504))
     respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json=page([
@@ -120,9 +120,19 @@ def test_copy_end_to_end_recovers_a_lost_create_response(tmp_path, monkeypatch, 
     result = run("--create")
     assert result.exit_code == 0, result.output
     assert create.call_count == 1  # not retried
-    assert parse_qs(urlparse(str(named.calls[0].request.url)).query)["filter"] == ['equals(name,"VIP \\"Canada\\"")']
+    assert parse_qs(urlparse(str(named.calls[0].request.url)).query)["filter"] == ['equals(name,"VIP \\"Canada\\" (CA)")']
     body = json.loads(job.calls.last.request.content)["data"]
     assert body["relationships"]["lists"]["data"] == [{"type": "list", "id": "NEW"}]
     assert [p["attributes"] for p in body["attributes"]["profiles"]["data"]] == [{"email": "a@example.com"}]
     # The uncertain create is recorded, so the next write waits for confirmation.
     assert len(json.loads((tmp_path / "state/klaviyo_sandbox/ambiguous_writes.json").read_text())) == 1
+
+
+@respx.mock
+def test_copy_name_and_suffix_options(copy_env):
+    respx.get(f"{API}/lists/").mock(return_value=httpx.Response(200, json=page([])))
+    create = respx.post(f"{API}/lists/").mock(return_value=httpx.Response(201, json={"data": {"id": "NEW"}}))
+    assert run("--create", "--suffix", " - from CA").exit_code == 0
+    assert json.loads(create.calls.last.request.content)["data"]["attributes"]["name"] == "VIP - from CA"
+    assert run("--create", "--name", "Exactly this").exit_code == 0
+    assert json.loads(create.calls.last.request.content)["data"]["attributes"]["name"] == "Exactly this"
