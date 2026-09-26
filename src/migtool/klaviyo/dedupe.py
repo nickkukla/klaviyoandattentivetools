@@ -20,6 +20,7 @@ Each role fixes what an import may do (see ROLES).
 from __future__ import annotations
 
 import csv
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -252,3 +253,107 @@ def run(imp: Importer, p: Plan, *, join_list: str | None, subscribe_list: str | 
     if subscribe:
         imp.subscribe(subscribe, list_id=subscribe_list)
     imp.unsubscribe(unsubscribe)
+
+
+# --- Checking an import (read-only) -----------------------------------------------
+
+CHECK_COLUMNS = ["identity", "problems"]
+
+
+def list_members(client, list_id: str) -> set[str]:
+    """Identities (email, or phone for phone-only profiles) on a list."""
+    found: set[str] = set()
+    params = {"fields[profile]": "email,phone_number", "page[size]": "100"}
+    for page in client.paginate(f"/lists/{list_id}/profiles/", tier="L", params=params):
+        for p in page["data"]:
+            found.add(identity(p["attributes"]))
+    return found
+
+
+def fetch_profiles(client, emails: list[str], phones: list[str]) -> dict[str, dict[str, Any]]:
+    """Identity → profile attributes (with subscriptions and properties)."""
+    out: dict[str, dict[str, Any]] = {}
+    for field_name, values in (("email", sorted(set(emails))), ("phone_number", sorted(set(phones)))):
+        for i in range(0, len(values), 100):
+            listed = ",".join(json.dumps(v) for v in values[i:i + 100])
+            params = {"filter": f"any({field_name},[{listed}])", "additional-fields[profile]": "subscriptions",
+                      "fields[profile]": "email,phone_number,subscriptions,properties", "page[size]": "100"}
+            for page in client.paginate("/profiles/", tier="L", params=params):
+                for p in page["data"]:
+                    out[identity(p["attributes"])] = p["attributes"]
+    return out
+
+
+def _marketing(attrs: dict[str, Any]) -> dict[str, Any]:
+    return ((attrs.get("subscriptions") or {}).get("email") or {}).get("marketing") or {}
+
+
+def problems(
+    role: Role, row: dict[str, str], attrs: dict[str, Any] | None,
+    join: set[str] | None, subscribe: set[str] | None,
+) -> list[str]:
+    """What's wrong with one imported row, per its role's rules (empty if nothing)."""
+    who = identity(row)
+    if attrs is None:
+        return ["no profile"]
+    found: list[str] = []
+    props = attrs.get("properties") or {}
+    tagged = props.get("migrated_from") == MIGRATED_FROM
+    if row.get(HOLD):
+        want = parse_bool(row[HOLD])
+        if props.get(HOLD) is not want:
+            found.append(f"migration_hold is {props.get(HOLD)!r}, expected {want}")
+    if role.tags and role.name != "suppress" and not tagged:
+        found.append("missing migrated_from=ca tag")
+    if role.name == "suppress":
+        reasons = [s.get("reason") for s in _marketing(attrs).get("suppression") or []]
+        if not any(r and r != "UNSUBSCRIBE" for r in reasons):
+            found.append(f"not suppressed (suppressions: {reasons or 'none'})")
+        if join is not None and not tagged and who not in join:
+            found.append("existing US profile not on the join list")
+    elif role.join_list and join is not None and who not in join:
+        found.append("not on the join list")
+    if role.consent:
+        instruction = consent_instruction(row)
+        consent = _marketing(attrs).get("consent")
+        if instruction == "SUBSCRIBED":
+            if consent != "SUBSCRIBED":
+                found.append(f"consent is {consent}, expected SUBSCRIBED")
+            if subscribe is not None and who not in subscribe:
+                found.append("not on the subscribe list")
+        elif instruction == "UNSUBSCRIBED" and consent != "UNSUBSCRIBED":
+            found.append(f"consent is {consent}, expected UNSUBSCRIBED")
+    return found
+
+
+def check(
+    client, role: Role, rows: list[dict[str, str]], *, join_list: str | None, subscribe_list: str | None,
+    progress: Callable[[str], None] = lambda _: None,
+) -> tuple[dict[str, int], list[dict[str, str]], list[tuple[str, str]]]:
+    """Check every usable row against its role's rules. Returns (counts, mismatch
+    rows for the CSV, skipped rows). Read-only."""
+    kept, skipped = usable(rows)
+    progress(f"reading {len(kept):,} profiles")
+    profiles = fetch_profiles(client, [r["email"] for r in kept if r["email"]],
+                             [r["phone_number"] for r in kept if not r["email"]])
+    join = subscribe = None
+    if join_list:
+        progress(f"reading members of list {join_list}")
+        join = list_members(client, join_list)
+    if subscribe_list:
+        progress(f"reading members of list {subscribe_list}")
+        subscribe = list_members(client, subscribe_list)
+    counts = {"checked": 0, "ok": 0, "mismatched": 0}
+    mismatches: list[dict[str, str]] = []
+    for row in kept:
+        counts["checked"] += 1
+        try:
+            found = problems(role, row, profiles.get(identity(row)), join, subscribe)
+        except ValueError as exc:
+            found = [f"unreadable row: {exc}"]
+        if found:
+            counts["mismatched"] += 1
+            mismatches.append({"identity": identity(row), "problems": "; ".join(found)})
+        else:
+            counts["ok"] += 1
+    return counts, mismatches, skipped

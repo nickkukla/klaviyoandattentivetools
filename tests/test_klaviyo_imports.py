@@ -530,7 +530,8 @@ def test_import_to_source_instance_is_refused_without_flag(tmp_path, monkeypatch
 
 
 @respx.mock
-def test_suppressions_check_reports_states(tmp_path, monkeypatch):
+def test_suppressions_check_reports_states(tmp_path, monkeypatch, klaviyo_account):
+    klaviyo_account('T2aEdf')
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
 
@@ -590,3 +591,36 @@ def test_other_subscribe_refusals_stay_errors(tmp_path):
     imp = imports.Importer(writer(), log, echo=lambda _: None, save_job=lambda j: None, main_step="import")
     imp.subscribe([{"email": "u@example.com", "consent_timestamp": "2020-01-01T00:00:00Z"}], list_id="NEWS")
     assert log.counts["failed"] == 1 and imports_.call_count == 0
+
+
+@pytest.mark.parametrize("text,message", [
+    ("[{'reason': 'HARD_BOUNCE'}", "not valid JSON"),
+    ('{"reason": "HARD_BOUNCE"}', "expected a list"),
+    ('[{"timestamp": "2024-01-01"}]', "expected a list"),
+    ('["HARD_BOUNCE"]', "expected a list"),
+])
+def test_malformed_suppressions_stop_the_row(tmp_path, text, message):
+    row = {"email": "a@example.com", "consent": "SUBSCRIBED", "consent_timestamp": "2022-01-01T00:00:00Z",
+           "suppression_reason": "", "suppressions": text}
+    with pytest.raises(ValueError, match=message):
+        imports.suppression_reasons(row)
+    w = FakeWriter()
+    imp, log = importer(tmp_path, w, "import")
+    imports.profiles_import(imp, [row], list_id="L1", run_id="R")
+    assert log.counts["failed"] == 1
+    assert w.calls == []  # not imported, not subscribed
+
+
+def test_empty_suppressions_list_means_no_suppression():
+    assert imports.suppression_reasons({"suppressions": "[]", "suppression_reason": ""}) == []
+
+
+def test_read_rows_trims_identifiers_but_keeps_text_verbatim(tmp_path):
+    f = tmp_path / "in.csv"
+    f.write_text('email,consent,properties.code,first_name,properties.blank\n'
+                 '"  A@Example.com ", SUBSCRIBED ,"  ABC  ", Ann ,"   "\n')
+    _, [row] = imports.read_rows(f)
+    assert row["email"] == "A@Example.com" and row["consent"] == "SUBSCRIBED"
+    assert row["properties.code"] == "  ABC  " and row["first_name"] == " Ann " and row["properties.blank"] == "   "
+    attrs = profile_attributes(row, {})
+    assert attrs["properties"]["code"] == "  ABC  "

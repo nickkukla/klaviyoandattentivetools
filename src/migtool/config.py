@@ -40,6 +40,7 @@ class Instance:
     name: str
     service: str  # "klaviyo"
     env_var: str
+    account_id: str  # the Klaviyo account this instance's key must belong to
 
     @property
     def is_source(self) -> bool:
@@ -50,9 +51,9 @@ class Instance:
 INSTANCES: dict[str, Instance] = {
     i.name: i
     for i in (
-        Instance("klaviyo_ca", "klaviyo", "KLAVIYO_CA_API_KEY"),
-        Instance("klaviyo_us", "klaviyo", "KLAVIYO_US_API_KEY"),
-        Instance("klaviyo_sandbox", "klaviyo", "KLAVIYO_SANDBOX_API_KEY"),
+        Instance("klaviyo_ca", "klaviyo", "KLAVIYO_CA_API_KEY", "Ka6Lvr"),
+        Instance("klaviyo_us", "klaviyo", "KLAVIYO_US_API_KEY", "KF4XLe"),
+        Instance("klaviyo_sandbox", "klaviyo", "KLAVIYO_SANDBOX_API_KEY", "T2aEdf"),
     )
 }
 
@@ -83,3 +84,14 @@ def credential(inst: Instance, environ: Mapping[str, str] | None = None) -> Secr
             f"{inst.env_var} is not set (needed for instance '{inst.name}'). Add it to .env."
         )
     return Secret(value)
+
+
+def check_account(inst: Instance, account_id: str) -> None:
+    """Stop unless the key's account is the one this instance must use, so a
+    key in the wrong `.env` variable (say, the CA key under the US name) can
+    never be read from or written to as the wrong account."""
+    if account_id != inst.account_id:
+        raise ConfigError(
+            f"{inst.env_var} belongs to Klaviyo account {account_id}, but '{inst.name}' must be "
+            f"account {inst.account_id}. Check which key is in which .env variable."
+        )

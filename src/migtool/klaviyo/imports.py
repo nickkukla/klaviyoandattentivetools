@@ -27,6 +27,14 @@ from migtool.output import CsvWriter, Run
 from migtool.runlog import RunLog
 
 SKIPPED_COLUMNS = ["email", "reason"]
+# Identifier and control columns, trimmed when read. Every other value (names,
+# addresses, custom properties) is kept exactly as written.
+TRIMMED = {
+    "email", "phone_number", "id", "external_id", "profile_id",
+    "consent", "consent_timestamp", "suppression_reason", "suppression_timestamp", "suppressions",
+    "reason", "timestamp", "Email Marketing Consent", "Email Marketing Consent Timestamp",
+    "ca_consent_timestamp", "ca_suppression_reason", "ca_suppression_timestamp", "migration_hold",
+}
 IMPORT_WAIT = 60 * 60  # seconds to wait for import jobs
 # Klaviyo's reason when a historical subscribe is dated after the profile's
 # existing (earlier) subscription: the profile is already subscribed.
@@ -42,7 +50,7 @@ def read_rows(path: Path, *, limit: int | None = None) -> tuple[list[str], list[
             raise ValueError(f"{path} has no 'email' column.")
         rows = []
         for row in reader:
-            rows.append({k: (v or "").strip() for k, v in row.items() if k is not None})
+            rows.append({k: (v or "").strip() if k in TRIMMED else (v or "") for k, v in row.items() if k is not None})
             if limit is not None and len(rows) >= limit:
                 break
     return list(reader.fieldnames), rows
@@ -124,6 +132,7 @@ class Importer:
         payloads, kept = [], []
         for row in rows:
             try:
+                suppression_reasons(row)  # unreadable suppression data stops the row
                 payloads.append(profile_attributes(row, extra(row)))
                 kept.append(row)
             except ValueError as exc:
@@ -236,15 +245,23 @@ class Importer:
 
 def suppression_reasons(row: dict[str, str]) -> list[str]:
     """Every suppression reason a row carries: all of them from the `suppressions`
-    JSON column when present, otherwise the single `suppression_reason`."""
-    text = row.get("suppressions", "")
+    JSON column when present, otherwise the single `suppression_reason`.
+
+    Raises ValueError if `suppressions` isn't a JSON list of objects that each
+    have a `reason`: unreadable suppression data must stop the row, never be
+    read as "no suppression" (which could let it be subscribed)."""
+    text = row.get("suppressions", "").strip()
     if text:
         try:
             items = json.loads(text)
-            return [str(i.get("reason", "")).upper() for i in items if isinstance(i, dict) and i.get("reason")]
-        except ValueError:
-            pass
-    reason = row.get("suppression_reason", "").upper()
+        except ValueError as exc:
+            raise ValueError(f"suppressions: not valid JSON ({exc})") from exc
+        if not isinstance(items, list) or not all(
+            isinstance(i, dict) and isinstance(i.get("reason"), str) and i["reason"].strip() for i in items
+        ):
+            raise ValueError("suppressions: expected a list of objects each with a reason")
+        return [i["reason"].strip().upper() for i in items]
+    reason = row.get("suppression_reason", "").strip().upper()
     return [reason] if reason else []
 
 

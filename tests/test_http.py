@@ -103,3 +103,31 @@ def test_client_uses_limiter_on_every_attempt(clock):
     make_client(clock, limiter=limiter).get("/x")
     # 1s backoff, then the limiter waits the rest of its 10s window.
     assert clock.sleeps == [1, pytest.approx(9)]
+
+
+@respx.mock
+def test_write_retried_after_lost_response_warns(clock):
+    warnings = []
+    route = respx.post(f"{BASE}/jobs").mock(side_effect=[httpx.ReadTimeout("lost"), httpx.Response(202, json={})])
+    c = HttpClient(BASE, sleep=clock.sleep, warn=warnings.append)
+    assert c.post("/jobs").status_code == 202
+    assert route.call_count == 2
+    assert len(warnings) == 1 and "may be sent twice" in warnings[0] and "ReadTimeout" in warnings[0]
+
+
+@respx.mock
+def test_no_warning_when_connection_never_opened_or_for_reads(clock):
+    warnings = []
+    respx.post(f"{BASE}/jobs").mock(side_effect=[httpx.ConnectError("refused"), httpx.Response(202, json={})])
+    respx.get(f"{BASE}/x").mock(side_effect=[httpx.ReadTimeout("lost"), httpx.Response(200, json={})])
+    c = HttpClient(BASE, sleep=clock.sleep, warn=warnings.append)
+    c.post("/jobs"); c.get("/x")
+    assert warnings == []
+
+
+@respx.mock
+def test_write_retried_after_server_error_warns(clock):
+    warnings = []
+    respx.post(f"{BASE}/jobs").mock(side_effect=[httpx.Response(502), httpx.Response(202, json={})])
+    HttpClient(BASE, sleep=clock.sleep, warn=warnings.append).post("/jobs")
+    assert len(warnings) == 1 and "got 502" in warnings[0]

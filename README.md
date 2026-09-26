@@ -21,6 +21,7 @@ Read these before running anything that writes.
 - **`Phone` is left blank in the STOQ file on purpose.** SMS is out of scope, and a phone number could make STOQ send SMS alerts to people who signed up by email only.
 - **Exports hold personal data.** Delete them as soon as the migration is finished, except the kept snapshot in `exports/og_exports/` (see [Deleting local data](#deleting-local-data)).
 - **Nothing is written to `klaviyo_ca`** unless you pass `--allow-write-to-source`. The migration never needs it.
+- **Each instance is tied to its Klaviyo account** (`klaviyo_ca` = `Ka6Lvr`, `klaviyo_us` = `KF4XLe`, `klaviyo_sandbox` = `T2aEdf`). Every command checks the key's account first and stops if it doesn't match, so a key in the wrong `.env` variable can't be used as the wrong account.
 
 ## Setup
 
@@ -65,6 +66,7 @@ When a write goes wrong partway:
 - **Bad rows:** Klaviyo refuses a whole batch if one row is invalid (a malformed email, say), and says which row. The tool drops that row, resends the rest, and lists refused rows with Klaviyo's reason in the errors file. A profile over Klaviyo's 100 KB per-profile limit is refused before sending.
 - **Bad settings:** an error about the request itself rather than a row (for example a `--list-id` that doesn't exist) stops the run straight away, recorded as `aborted`. Fix the option and re-run.
 - **Unknown outcomes:** counts come from Klaviyo's own job results. A profile whose result can't be confirmed (job still running, failed, or its error list unreadable) is counted as failed with "outcome unknown", never as written.
+- **Retried writes:** if a write fails in a way that means Klaviyo may already have received it (a lost response, a server error), it's retried with a warning that it may be sent twice. That's harmless, because every write is safe to repeat.
 - **Aborted runs:** if the run stops (a revoked key, an outage after retries, Ctrl-C), it still writes the manifest (status `aborted`), the errors and skipped files and the summary, and exits non-zero. Jobs already submitted are listed in `state/` and may still be applied.
 
 ## Output files
@@ -216,6 +218,24 @@ uv run migtool klaviyo dedupe import --to klaviyo_ca --role hold --file fix.csv 
 ```
 
 Before sending anything, it works out and shows the plan: rows to send (existing and new), rows skipped or unreadable, lists by name, and subscribe and unsubscribe counts.
+
+### `migtool klaviyo dedupe check`
+
+Read-only. Checks that each row of a dedupe file landed as its role intends: the profile exists and has the right `migration_hold`, migration tags, list membership and consent (for `suppress`, that it's suppressed). Rows that don't match go to `<run>.mismatches.csv` with the reason, and the command exits non-zero. Run it after each import, with the same role and lists.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Instance to check |
+| `--file` (required) | The dedupe CSV that was imported |
+| `--role` (required) | The role it was imported with |
+| `--join-list` | The list the profiles should be on |
+| `--subscribe-list` | The list `Subscribe` rows should be on |
+| `--limit` | Only the first N rows (e.g. after a pilot) |
+
+```
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role new --file dedupe/exports/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role hold --file dedupe/exports/05_release_hold.csv --limit 100
+```
 
 ### `migtool klaviyo suppressions export`
 
