@@ -477,6 +477,19 @@ def test_lists_add_matches_phone_only_rows_by_phone(tmp_path):
     assert log.counts["written"] == 2
 
 
+def test_lists_add_existing_only_skips_rather_than_creates(tmp_path):
+    w = FakeWriter(existing={"old@example.com"})
+    imp, log = importer(tmp_path, w, "add")
+    rows = [{"email": "old@example.com", "phone_number": ""}, {"email": "new@example.com", "phone_number": ""},
+            {"email": "", "phone_number": "+14165550100"}]
+    assert imports.lists_add(imp, rows, ["email", "phone_number"], list_id="L1", run_id="R", existing_only=True) == 0
+    [add] = w.calls
+    assert add[:3] == ("import", ["old@example.com"], "L1")
+    assert imp.skipped == [("new@example.com", "no profile at the destination (--existing-only)"),
+                           ("+14165550100", "no profile at the destination (--existing-only)")]
+    assert log.counts["skipped"] == 2 and log.counts["written"] == 1
+
+
 def test_created_profiles_are_tagged_with_the_copy_source():
     from migtool.cli import _provenance
     assert _provenance("klaviyo_ca") == "ca" and _provenance("klaviyo_sandbox") == "sandbox"

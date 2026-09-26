@@ -32,8 +32,9 @@ def copy_env(tmp_path, monkeypatch, klaviyo_account):
     ])))
     calls = []
 
-    def fake_lists_add(imp, rows, columns, *, list_id, run_id, source):
-        calls.append({"rows": rows, "columns": columns, "list_id": list_id, "source": source})
+    def fake_lists_add(imp, rows, columns, *, list_id, run_id, source, existing_only):
+        calls.append({"rows": rows, "columns": columns, "list_id": list_id, "source": source,
+                      "existing_only": existing_only})
         return 0
 
     monkeypatch.setattr(imports, "lists_add", fake_lists_add)
@@ -58,7 +59,8 @@ def test_copy_creates_the_list_and_adds_members_by_email_only(copy_env):
     # Only the identifier goes to lists_add, so nothing else is written to the profile.
     assert calls == [{"rows": [{"email": "a@example.com", "phone_number": ""},
                                {"email": "", "phone_number": "+14165550100"}],
-                      "columns": ["email", "phone_number"], "list_id": "NEW", "source": "sandbox"}]
+                      "columns": ["email", "phone_number"], "list_id": "NEW", "source": "sandbox",
+                      "existing_only": False}]
     [manifest] = (tmp_path / "exports/klaviyo_sandbox/lists-copy").glob("manifest.json")
     last = json.loads(manifest.read_text())["runs"][-1]
     assert last["list_id"] == "NEW" and last["source_list"] == "L1"
@@ -211,3 +213,35 @@ def test_segment_copy_end_to_end(job_status, tmp_path, monkeypatch, klaviyo_acco
         assert result.exit_code != 0
         assert (f"To finish this copy from the same snapshot: uv run migtool klaviyo lists add --to klaviyo_sandbox "
                 f"--list NEW --file {snapshot.relative_to(tmp_path)}") in result.output
+
+
+@respx.mock
+def test_segment_copy_existing_only_end_to_end(tmp_path, monkeypatch, klaviyo_account):
+    """The real writer: a member with no destination profile is listed in the
+    skipped file, not created, and the run still succeeds."""
+    klaviyo_account("T2aEdf")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    respx.get(f"{API}/segments/S1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "S1", "attributes": {"name": "Repeat buyers"}}}))
+    respx.get(f"{API}/segments/S1/profiles/").mock(return_value=httpx.Response(200, json=page([
+        {"id": "p1", "attributes": {"email": "a@example.com", "phone_number": None}},
+        {"id": "p2", "attributes": {"email": "new@example.com", "phone_number": None}}])))
+    respx.get(f"{API}/lists/").mock(return_value=httpx.Response(200, json=page([])))
+    respx.post(f"{API}/lists/").mock(return_value=httpx.Response(201, json={"data": {"id": "NEW"}}))
+    respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json=page([
+        {"id": "u1", "attributes": {"email": "a@example.com", "phone_number": None}}])))
+    job = respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(202, json={"data": {
+        "id": "J1", "attributes": {"status": "queued"}}}))
+    respx.get(f"{API}/profile-bulk-import-jobs/J1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "J1", "attributes": {"status": "complete", "completed_count": 1, "failed_count": 0}}}))
+    result = CliRunner().invoke(app, ["klaviyo", "segments", "copy", "--from", "klaviyo_sandbox", "--segment", "S1",
+                                      "--to", "klaviyo_sandbox", "--create", "--existing-only", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert job.call_count == 1
+    assert [p["attributes"] for p in json.loads(job.calls.last.request.content)["data"]["attributes"]["profiles"]["data"]] == [
+        {"email": "a@example.com"}]
+    [skipped] = (tmp_path / "exports/klaviyo_sandbox/segments-copy").glob("*.skipped.csv")
+    assert list(csv.DictReader(skipped.open())) == [
+        {"email": "new@example.com", "reason": "no profile at the destination (--existing-only)"}]
+    assert "written 1, skipped 1, failed 0" in result.output

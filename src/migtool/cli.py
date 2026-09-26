@@ -402,8 +402,9 @@ def _write_run(
                       "be applied; re-running the file is safe.", stage="aborted")
         for job in imp.unfinished:
             typer.echo(f"Job {job.id} ({job.kind}) was still {job.status or 'processing'} when the run ended.")
-    skipped_path = imports.write_skipped(run, batch.skipped)
-    files = {skipped_path.name: len(batch.skipped)} if skipped_path else {}
+    skipped = batch.skipped + imp.skipped
+    skipped_path = imports.write_skipped(run, skipped)
+    files = {skipped_path.name: len(skipped)} if skipped_path else {}
     if aborted:
         status = "aborted"
     else:
@@ -505,12 +506,16 @@ def lists_add(
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
     retries_settled: bool = RETRIES_SETTLED,
+    existing_only: bool = typer.Option(
+        False, "--existing-only", help="Only add profiles that already exist at the destination; skip the rest."
+    ),
 ) -> None:
     """Add every profile in the file to one list, by email or (phone-only rows) phone number; writes
     consent only if the file has consent columns."""
 
     def body(imp, rows, columns, run):
-        return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
+        return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id,
+                                             existing_only=existing_only)}
 
     _write_run(to, "lists-add", "add", file, limit, yes, allow_write_to_source, body, {"list_id": list_id},
                retries_settled=retries_settled, phones=True)
@@ -519,6 +524,9 @@ def lists_add(
 
 TO_LIST = typer.Option(None, "--to-list", help="ID of an existing list to add the members to.")
 CREATE = typer.Option(False, "--create", help="Create the destination list instead.")
+EXISTING_ONLY = typer.Option(
+    False, "--existing-only", help="Only add profiles that already exist at the destination; skip the rest."
+)
 NAME = typer.Option(None, "--name", help="Name of the list --create makes, used as is (default: the source's name plus --suffix).")
 
 
@@ -530,6 +538,7 @@ def _provenance(instance: str) -> str:
 def _copy_group(
     kind: str, from_: str, source_id: str, to: str, to_list: str | None, create: bool, name: str | None,
     suffix: str, limit: int | None, yes: bool, allow_write_to_source: bool, retries_settled: bool,
+    existing_only: bool = False,
 ) -> None:
     """Shared body of `lists copy` and `segments copy`: snapshot one list's or
     segment's members (read-only), then add them to a destination list."""
@@ -587,7 +596,7 @@ def _copy_group(
             extra["list_id"] = list_id
             typer.echo(f"Created list {dest_name} ({list_id})")
         return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id,
-                                             source=_provenance(from_))}
+                                             source=_provenance(from_), existing_only=existing_only)}
 
     try:
         _write_run(to, f"{kind}s-copy", "add", members_path, limit, yes, allow_write_to_source, body, extra,
@@ -597,7 +606,8 @@ def _copy_group(
         # source since. Finish this one from its saved file instead.
         if extra["list_id"]:
             typer.echo(f"To finish this copy from the same snapshot: uv run migtool klaviyo lists add --to {to} "
-                       f"--list {extra['list_id']} --file {members_path}")
+                       f"--list {extra['list_id']} --file {members_path}"
+                       + (" --existing-only" if existing_only else ""))
         raise
 
 
@@ -614,6 +624,7 @@ def lists_copy(
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
     retries_settled: bool = RETRIES_SETTLED,
+    existing_only: bool = EXISTING_ONLY,
 ) -> None:
     """Copy one list's members into a list on another instance, creating it if asked.
 
@@ -621,7 +632,7 @@ def lists_copy(
     and only added to the list: no field, property or consent changes. A member
     with no profile at the destination is created, with the migration tags."""
     _copy_group("list", from_, source_list, to, to_list, create, name, suffix, limit, yes,
-                allow_write_to_source, retries_settled)
+                allow_write_to_source, retries_settled, existing_only)
 
 
 @segments_app.command("copy")
@@ -639,13 +650,14 @@ def segments_copy(
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
     retries_settled: bool = RETRIES_SETTLED,
+    existing_only: bool = EXISTING_ONLY,
 ) -> None:
     """Copy a segment's current members into a static list on another instance.
 
     A snapshot: the list doesn't follow the segment afterwards. Members are
     matched and added as `lists copy` does."""
     _copy_group("segment", from_, source_segment, to, to_list, create, name, suffix, limit, yes,
-                allow_write_to_source, retries_settled)
+                allow_write_to_source, retries_settled, existing_only)
 
 
 TYPES_FROM = typer.Option(
