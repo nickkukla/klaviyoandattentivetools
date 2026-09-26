@@ -9,7 +9,7 @@ from pathlib import Path
 
 import typer
 
-from migtool.config import INSTANCES, ConfigError, credential, get_instance, load_env
+from migtool.config import INSTANCES, ConfigError, check_account, credential, get_instance, load_env
 from migtool.http import ApiError
 from migtool.klaviyo import bis, dedupe, groups, imports, profiles, segments, suppressions
 from migtool.klaviyo.client import KlaviyoClient
@@ -86,6 +86,7 @@ def klaviyo_whoami(
     with KlaviyoClient(credential(inst)) as client:
         acct = client.account()
     typer.echo(f"{inst.name}: account {acct['id']} ({acct['name']})")
+    check_account(inst, acct["id"])
 
 
 def _since(value: str | None) -> datetime | None:
@@ -97,8 +98,20 @@ def _since(value: str | None) -> datetime | None:
         raise typer.BadParameter(f"'{value}' is not an ISO 8601 time.", param_hint="--since") from exc
 
 
+def _connect(inst) -> tuple[KlaviyoClient, dict]:
+    """A client for `inst`, after checking its key belongs to the expected account."""
+    client = KlaviyoClient(credential(inst))
+    try:
+        account = client.account()
+        check_account(inst, account["id"])
+    except BaseException:
+        client.close()
+        raise
+    return client, account
+
+
 def _client(instance: str) -> KlaviyoClient:
-    return KlaviyoClient(credential(get_instance(instance, "klaviyo")))
+    return _connect(get_instance(instance, "klaviyo"))[0]
 
 
 def _progress(label: str):
@@ -281,14 +294,14 @@ def _write_run(
     batch = imports.usable(raw)
     run = new_run(inst.name, obj)
     store = StateStore()
-    with KlaviyoClient(credential(inst)) as client:
-        account = client.account()
+    client, account = _connect(inst)
+    with client:
         typer.echo(f"File:            {file} ({len(raw):,} rows, {len(batch.skipped):,} skipped)")
         confirm_write(
             inst, account=f"{account['name']} ({account['id']})", record_count=len(batch.rows),
             yes=yes, allow_write_to_source=allow_write_to_source,
         )
-        log = RunLog(run)
+        log = RunLog(run, written_label="submitted" if main_step == "suppress" else "written")
         log.read(len(raw))
         log.skipped(len(batch.skipped))
 
@@ -463,8 +476,8 @@ def dedupe_import(
     types = dedupe.type_map(types_from) if types_from else {}
     run = new_run(inst.name, f"dedupe-{role}")
     store = StateStore()
-    with KlaviyoClient(credential(inst)) as client:
-        account = client.account()
+    client, account = _connect(inst)
+    with client:
         w = Writer(client)
         p = dedupe.plan(r, raw, types, run.run_id, lambda e, ph: w.existing_emails(e) | w.existing_phones(ph),
                         migrated=w.migrated_emails)
@@ -491,7 +504,8 @@ def dedupe_import(
             inst, account=f"{account['name']} ({account['id']})", record_count=len(p.rows),
             yes=yes, allow_write_to_source=allow_write_to_source,
         )
-        log = RunLog(run)
+        main_step = {"hold": "update", "kept": "update", "suppress": "suppress"}.get(role, "import")
+        log = RunLog(run, written_label="submitted" if main_step == "suppress" else "written")
         log.read(len(raw))
         log.skipped(len(p.skipped))
         for who, reason in p.unreadable:
@@ -500,7 +514,6 @@ def dedupe_import(
         def save_job(job: Job) -> None:
             store.add_job(inst.name, {"id": job.id, "kind": job.kind, "run_id": run.run_id, "size": job.size})
 
-        main_step = {"hold": "update", "kept": "update", "suppress": "suppress"}.get(role, "import")
         imp = imports.Importer(w, log, echo=typer.echo, save_job=save_job, main_step=main_step)
         aborted: str | None = None
         try:
@@ -526,6 +539,54 @@ def dedupe_import(
     code = log.finish()
     if code:
         raise typer.Exit(code)
+
+
+@dedupe_app.command("check")
+def dedupe_check(
+    instance: str = typer.Option(..., "--instance", help="Klaviyo instance to check."),
+    file: Path = FILE,
+    role: str = typer.Option(..., "--role", help="The role the file was imported with."),
+    join_list: str | None = typer.Option(None, "--join-list", help="List the profiles should be on (as imported)."),
+    subscribe_list: str | None = typer.Option(
+        None, "--subscribe-list", help="List Subscribe rows should be on (as imported)."
+    ),
+    limit: int | None = LIMIT,
+) -> None:
+    """Check (read-only) that each row of a dedupe file landed as its role intends.
+
+    Confirms the profile exists and has the right migration_hold, tags, list
+    membership and consent (or suppression, for role suppress). Rows that
+    don't match go to <run>.mismatches.csv with the reason."""
+    if role not in dedupe.ROLES:
+        raise typer.BadParameter(f"'{role}' isn't one of {', '.join(dedupe.ROLES)}.", param_hint="--role")
+    inst = get_instance(instance, "klaviyo")
+    try:
+        _, raw = imports.read_rows(file, limit=limit)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    client, _ = _connect(inst)
+    with client:
+        counts, mismatches, skipped = dedupe.check(
+            client, dedupe.ROLES[role], raw, join_list=join_list, subscribe_list=subscribe_list,
+            progress=lambda m: typer.echo(f"  {m}"),
+        )
+    run = new_run(inst.name, f"dedupe-check-{role}")
+    files = {}
+    if mismatches:
+        path = run.path(".mismatches.csv")
+        w = CsvWriter(path, dedupe.CHECK_COLUMNS)
+        for m in mismatches:
+            w.write(m)
+        w.close()
+        files[path.name] = w.count
+    write_manifest(run, files=files, counts={**counts, "skipped": len(skipped)},
+                   extra={"source_file": str(file), "role": role, "join_list": join_list,
+                          "subscribe_list": subscribe_list})
+    typer.echo(f"checked {counts['checked']:,}: ok {counts['ok']:,}, mismatched {counts['mismatched']:,}"
+               f" (skipped {len(skipped):,} rows the import also skips)")
+    if mismatches:
+        typer.echo(f"Mismatches: {run.path('.mismatches.csv')}")
+        raise typer.Exit(1)
 
 
 def main() -> None:

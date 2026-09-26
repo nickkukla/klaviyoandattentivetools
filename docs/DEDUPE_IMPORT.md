@@ -66,9 +66,28 @@ uv run migtool klaviyo dedupe import --to klaviyo_us --role hold      --file $D/
 
 Pilot first: run 03a and 03b with `--limit 5` and inspect those profiles in Klaviyo before running the rest.
 
+**Check every import.** After each file, run `klaviyo dedupe check` with the same role and lists. It reads each row's profile back and confirms it landed as intended: `migration_hold`, tags, list membership, and consent or suppression. For 02, give suppressions time to apply (minutes to hours) before checking. For example:
+
+```
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role new  --file $D/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role kept --file $D/04b_kept_unsubscribed.csv --join-list Sc9zHg
+```
+
+A clean check ends `mismatched 0`. Otherwise `<run>.mismatches.csv` lists each row that's off and why. An import's own summary counts what Klaviyo *accepted*. The check confirms what actually *landed*.
+
 Each run first works out a plan and shows it before asking for confirmation: rows to send, how many already exist and how many are new, rows skipped or unreadable, the lists by name, and the subscribe and unsubscribe counts. Update-only roles (`hold`, `kept`) skip any row with no existing profile, rather than create a stub, and list it in `<run>.skipped.csv`. For 05, run it last: the profiles 03 and 01b create only exist once those imports are done.
 
 Suppressions from 02 apply in the background, in two to four hours in the sandbox. Confirm them with `klaviyo suppressions check`.
+
+## If an import is interrupted
+
+**Re-run the same file with the same command.** There's no separate resume: every role is safe to repeat, and the dev-account pilot re-ran all ten files with 0 failures and the same end state.
+
+- `hold`, `hold-new`: setting the same properties again changes nothing.
+- `suppress`: suppressing a suppressed email changes nothing. Profiles a first run created are recognised by their `migrated_from=ca` tag, so they're handled as CA profiles again and never added to the Updated US Profiles list.
+- `new`, `kept`: re-importing the same fields is a no-op. A repeated historical subscribe on someone already subscribed is either accepted (same or earlier date) or, if dated later, handled as "already subscribed" (list-only add). Repeating an unsubscribe leaves them unsubscribed.
+
+Each run gets a new `migration_run_id`, so a profile shows the most recent run that touched it. Then run `dedupe check` to confirm the whole file landed.
 
 ## The catch-up run
 

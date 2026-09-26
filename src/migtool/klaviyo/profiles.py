@@ -105,13 +105,15 @@ def export(
     params = profile_params(since=since, predictive=predictive, in_group=bool(segment_id))
     tier = PREDICTIVE_TIER if predictive else TIER
     skipped = 0
+    if exp.fetched:  # resumed after the last page: nothing left to fetch
+        return skipped
     for page, nxt in client.pages(path, tier=tier, start=exp.cursor, params=params):
         for profile in page["data"]:
             if segment_id and since and not _updated_after(profile, since):
                 skipped += 1
                 continue
             exp.write(flatten(profile))
-        exp.checkpoint(nxt)
+        exp.checkpoint(nxt, fetched=nxt is None)
         progress(exp.rows)
         if nxt is None:
             break

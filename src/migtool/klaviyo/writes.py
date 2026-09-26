@@ -79,9 +79,9 @@ def typed_value(text: str, kind: str) -> Any:
     if kind == "number":
         return finite_number(text)
     if kind == "bool":
-        if text.lower() not in ("true", "false"):
+        if text.strip().lower() not in ("true", "false"):
             raise ValueError(f"'{text}' is not true or false")
-        return text.lower() == "true"
+        return text.strip().lower() == "true"
     if kind == "json":
         value = json.loads(text, parse_constant=_no_constant)
         json.dumps(value, allow_nan=False)  # refuses 1e999 → inf anywhere inside

@@ -8,6 +8,7 @@ errors.
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -131,6 +132,7 @@ class HttpClient:
         timeout: float = 60.0,
         sleep: Sleep = time.sleep,
         transport: httpx.BaseTransport | None = None,
+        warn: Callable[[str], None] = lambda msg: print(msg, file=sys.stderr),
     ) -> None:
         self._client = httpx.Client(
             base_url=base_url, headers=headers, timeout=timeout, transport=transport
@@ -140,6 +142,17 @@ class HttpClient:
         self._backoff_base = backoff_base
         self._backoff_max = backoff_max
         self._sleep = sleep
+        self._warn = warn
+
+    def _warn_retrying_write(self, method: str, url: str, why: str) -> None:
+        # The first attempt may have reached Klaviyo before failing. Sending it
+        # again is harmless (every write here is safe to repeat), but it should
+        # never happen silently.
+        if method != "GET":
+            self._warn(
+                f"Warning: {method} {url} {why}; retrying. Klaviyo may have accepted the first attempt, "
+                "so this write may be sent twice. That's harmless, as writes are safe to repeat."
+            )
 
     def backoff(self, attempt: int) -> float:
         """Wait before retry number `attempt` (1-based) when the service gives no Retry-After."""
@@ -164,9 +177,15 @@ class HttpClient:
             except httpx.TransportError as exc:
                 if last:
                     raise ApiError(method, url, None, f"{type(exc).__name__}: {exc}") from exc
+                # A connection that never opened didn't send anything; any
+                # other failure may have happened after the request arrived.
+                if not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                    self._warn_retrying_write(method, url, f"failed with {type(exc).__name__}")
                 self._sleep(self.backoff(attempt))
                 continue
             if _is_retryable(response.status_code) and not last:
+                if response.status_code >= 500:
+                    self._warn_retrying_write(method, url, f"got {response.status_code}")
                 wait = retry_after_seconds(response)
                 self._sleep(self.backoff(attempt) if wait is None else wait)
                 continue

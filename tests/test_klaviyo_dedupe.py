@@ -260,3 +260,54 @@ def test_migrated_emails_reads_the_tag():
         {"attributes": {"email": "Created@example.com", "properties": {"migrated_from": "ca"}}},
         {"attributes": {"email": "us@example.com", "properties": {"other": 1}}}]}))
     assert Writer(KlaviyoClient(Secret("pk_x"))).migrated_emails(["created@example.com", "us@example.com"]) == {"created@example.com"}
+
+
+# --- Checking an import ------------------------------------------------------------
+
+def prof(consent="NEVER_SUBSCRIBED", suppression=(), **props):
+    return {"subscriptions": {"email": {"marketing": {"consent": consent, "suppression": list(suppression)}}},
+            "properties": props}
+
+
+@pytest.mark.parametrize("role,row,attrs,join,sub,expected", [
+    ("hold", {"email": "a@x.com", "migration_hold": "true"}, prof(migration_hold=True), None, None, []),
+    ("hold", {"email": "a@x.com", "migration_hold": "false"}, prof(migration_hold=True), None, None,
+     ["migration_hold is True, expected False"]),
+    ("hold", {"email": "a@x.com", "migration_hold": "true"}, None, None, None, ["no profile"]),
+    ("new", {"email": "a@x.com", "Email Marketing Consent": "Subscribe"},
+     prof("SUBSCRIBED", migrated_from="ca"), {"a@x.com"}, {"a@x.com"}, []),
+    ("new", {"email": "a@x.com", "Email Marketing Consent": "Subscribe"},
+     prof("NEVER_SUBSCRIBED"), set(), set(),
+     ["missing migrated_from=ca tag", "not on the join list", "consent is NEVER_SUBSCRIBED, expected SUBSCRIBED",
+      "not on the subscribe list"]),
+    ("kept", {"email": "a@x.com", "Email Marketing Consent": "Unsubscribed"},
+     prof("SUBSCRIBED", migrated_from="ca"), {"a@x.com"}, None, ["consent is SUBSCRIBED, expected UNSUBSCRIBED"]),
+    ("suppress", {"email": "a@x.com"}, prof(suppression=[{"reason": "HARD_BOUNCE"}]), {"a@x.com"}, None, []),
+    ("suppress", {"email": "a@x.com"}, prof(suppression=[{"reason": "UNSUBSCRIBE"}]), set(), None,
+     ["not suppressed (suppressions: ['UNSUBSCRIBE'])", "existing US profile not on the join list"]),
+    ("suppress", {"email": "a@x.com"}, prof(suppression=[{"reason": "SPAM_COMPLAINT"}], migrated_from="ca"), set(), None, []),
+])
+def test_problems(role, row, attrs, join, sub, expected):
+    assert dedupe.problems(dedupe.ROLES[role], row, attrs, join, sub) == expected
+
+
+@respx.mock
+def test_check_command_writes_mismatches_and_fails(tmp_path, monkeypatch, klaviyo_account):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    klaviyo_account("T2aEdf")
+
+    def profiles(request):
+        data = []
+        if "ok@example.com" in request.url.params.get("filter", ""):
+            data.append({"attributes": {"email": "ok@example.com", "phone_number": None, **prof(migration_hold=False)}})
+        return httpx.Response(200, json={"data": data, "links": {"next": None}})
+    respx.get(f"{API}/profiles/").mock(side_effect=profiles)
+    f = tmp_path / "05.csv"
+    f.write_text("email,phone_number,migration_hold\nok@example.com,,false\nmissing@example.com,,false\n")
+    result = CliRunner().invoke(app, ["klaviyo", "dedupe", "check", "--instance", "klaviyo_sandbox", "--role", "hold",
+                                      "--file", str(f)])
+    assert result.exit_code == 1
+    assert "ok 1, mismatched 1" in result.output
+    [m] = (tmp_path / "exports/klaviyo_sandbox/dedupe-check-hold").glob("*.mismatches.csv")
+    assert "missing@example.com,no profile" in m.read_text()

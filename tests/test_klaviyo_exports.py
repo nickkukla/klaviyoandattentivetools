@@ -55,7 +55,7 @@ def test_flatten_profile():
     assert row["consent"] == "SUBSCRIBED"
     assert row["consent_timestamp"] == "2024-01-15T12:00:00Z"
     assert row["updated"] == "2026-09-01T00:00:00Z"
-    assert (row["suppression_reason"], row["suppression_timestamp"]) == ("UNSUBSCRIBE", "2025-05-16T13:08:49Z")
+    assert (row["suppression_reason"], row["suppression_timestamp"]) == ("UNSUBSCRIBE", "2025-05-16T13:08:49.750000Z")
 
 
 @pytest.mark.parametrize("name,integration,expected", [
@@ -155,7 +155,8 @@ def test_ambiguous_segment_name_lists_ids():
 
 
 @respx.mock
-def test_suppressions_export_one_row_per_suppression_since(tmp_path, monkeypatch):
+def test_suppressions_export_one_row_per_suppression_since(tmp_path, monkeypatch, klaviyo_account):
+    klaviyo_account('T2aEdf')
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
     route = respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json=page([
@@ -175,7 +176,8 @@ def test_suppressions_export_one_row_per_suppression_since(tmp_path, monkeypatch
 
 
 @respx.mock
-def test_lists_export_writes_both_files(tmp_path, monkeypatch):
+def test_lists_export_writes_both_files(tmp_path, monkeypatch, klaviyo_account):
+    klaviyo_account('T2aEdf')
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
     respx.get(f"{API}/lists/").mock(return_value=httpx.Response(200, json=page([
@@ -205,3 +207,27 @@ def test_bad_since_is_rejected(tmp_path, monkeypatch):
                                       "klaviyo_sandbox", "--since", "yesterday"])
     assert result.exit_code != 0
     assert "ISO 8601" in result.output
+
+
+def test_export_timestamps_keep_fractions_of_a_second():
+    from migtool.output import iso_or_none
+    assert iso_or_none("2026-09-24T19:02:55.100000+00:00") == "2026-09-24T19:02:55.100000Z"
+    assert iso_or_none("2026-09-24T19:02:55.900000+00:00") == "2026-09-24T19:02:55.900000Z"
+    assert iso_or_none("2026-09-24T19:02:55+00:00") == "2026-09-24T19:02:55Z"
+    assert iso_or_none("2026-09-24T15:02:55.5-04:00") == "2026-09-24T19:02:55.500000Z"
+    assert iso_or_none("") is None
+
+
+@respx.mock
+def test_resume_after_last_page_does_not_refetch(tmp_path):
+    route = respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json=page([profile("p1", "a@example.com")])))
+    client = KlaviyoClient(Secret("pk_x"))
+    exp = make_export(tmp_path)
+    profiles.export(client, exp)  # fetches the only page, then "crashes" before finish()
+    assert route.call_count == 1
+    exp = make_export(tmp_path, resume=True)
+    assert exp.fetched and exp.cursor is None
+    profiles.export(client, exp)
+    assert route.call_count == 1  # not fetched again
+    exp.finish()
+    assert [r["id"] for r in read_csv(exp.run.path(".csv"))] == ["p1"]

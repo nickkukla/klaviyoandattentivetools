@@ -34,6 +34,8 @@ def export(
         "fields[profile]": "email,subscriptions",
         "page[size]": "100",
     }
+    if exp.fetched:  # resumed after the last page: nothing left to fetch
+        return
     for page, nxt in client.pages("/profiles/", tier=TIER, start=exp.cursor, params=params):
         for profile in page["data"]:
             attrs = profile["attributes"]
@@ -45,7 +47,7 @@ def export(
                     {"email": attrs.get("email"), "profile_id": profile["id"],
                      "reason": item.get("reason"), "timestamp": iso_or_none(ts)}
                 )
-        exp.checkpoint(nxt)
+        exp.checkpoint(nxt, fetched=nxt is None)
         progress(exp.rows)
         if nxt is None:
             break

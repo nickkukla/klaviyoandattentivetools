@@ -41,8 +41,15 @@ def parse_iso(value: str) -> datetime:
 
 
 def iso_or_none(value: str | None) -> str | None:
-    """An API timestamp in this tool's format (`...Z`), or None when blank."""
-    return iso(parse_iso(value)) if value else None
+    """An API timestamp in this tool's format (UTC, `...Z`), or None when blank.
+    Fractions of a second are kept when the API sends them: they can decide
+    which of two consent changes is more recent."""
+    if not value:
+        return None
+    dt = parse_iso(value)
+    if dt.microsecond:
+        return dt.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return iso(dt)
 
 
 def file_stamp(dt: datetime) -> str:
@@ -332,6 +339,7 @@ class ResumableExport:
             self.staged = saved.get("staged", False)
             self.writer = self._open_writer(truncate_to=saved["offset"])
             self.cursor: Any = saved["cursor"]
+            self.fetched: bool = saved.get("fetched", False)
             self.rows = saved["rows"]
             echo(f"Resuming {obj} export {self.run.run_id} at row {self.rows:,}.")
         else:
@@ -345,6 +353,7 @@ class ResumableExport:
             self.staged = staged
             self.writer = self._open_writer()
             self.cursor = None
+            self.fetched = False
             self.rows = 0
             self.checkpoint(None)
 
@@ -357,8 +366,12 @@ class ResumableExport:
         self.writer.write(row)
         self.rows += 1
 
-    def checkpoint(self, cursor: Any) -> None:
+    def checkpoint(self, cursor: Any, *, fetched: bool = False) -> None:
+        """Save progress. `fetched=True` marks the last page as done, so a
+        resume goes straight to finishing instead of fetching from the start
+        (a `cursor` of None alone can't tell "not started" from "done")."""
         self.cursor = cursor
+        self.fetched = fetched
         self.store.save_checkpoint(
             self.instance,
             self.object,
@@ -371,6 +384,7 @@ class ResumableExport:
                 "staged": self.staged,
                 "offset": self.writer.flush(),
                 "cursor": cursor,
+                "fetched": fetched,
                 "rows": self.rows,
             },
         )

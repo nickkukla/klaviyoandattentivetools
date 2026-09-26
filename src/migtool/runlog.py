@@ -17,10 +17,15 @@ class RunLog:
     """Counts read / written / skipped / failed; per-record errors go to
     `<run>.errors.csv` and the run carries on."""
 
-    def __init__(self, run: Run, *, echo: Callable[[str], None] = typer.echo) -> None:
+    def __init__(
+        self, run: Run, *, echo: Callable[[str], None] = typer.echo, written_label: str = "written"
+    ) -> None:
         self.run = run
         self.echo = echo
         self.counts = {"read": 0, "written": 0, "skipped": 0, "failed": 0}
+        # "submitted" for suppressions: Klaviyo applies them later, so the
+        # count is what was sent, not what's confirmed (see suppressions check).
+        self.written_label = written_label
         self.errors_path = run.path(".errors.csv")
         self._errors: TextIO | None = None
         self._writer = None
@@ -51,7 +56,7 @@ class RunLog:
         return 1 if self.counts["failed"] else 0
 
     def summary(self) -> str:
-        return ", ".join(f"{k} {v:,}" for k, v in self.counts.items())
+        return ", ".join(f"{self.written_label if k == 'written' else k} {v:,}" for k, v in self.counts.items())
 
     def finish(self) -> int:
         """Close the error file, print the summary and return the exit code."""

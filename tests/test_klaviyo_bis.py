@@ -64,7 +64,8 @@ def test_build_keeps_latest_per_email_and_sku_and_explains_the_rest():
 
 
 @respx.mock
-def test_bis_export_command(tmp_path, monkeypatch):
+def test_bis_export_command(tmp_path, monkeypatch, klaviyo_account):
+    klaviyo_account('Ka6Lvr')
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KLAVIYO_CA_API_KEY", "pk_x")
     respx.get(f"{API}/metrics/").mock(return_value=httpx.Response(200, json={"links": {"next": None}, "data": [
