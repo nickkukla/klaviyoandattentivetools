@@ -323,7 +323,7 @@ uv run migtool klaviyo lists export --instance klaviyo_ca --since 2026-10-01T00:
 
 ### `migtool klaviyo lists add`
 
-Adds every profile in the file to one list, by the `email` column. The file can be just emails (for example `list_members.csv` filtered by hand) or the full profile layout.
+Adds every profile in the file to one list, by the `email` column, or by `phone_number` for a row with no email (a phone-only profile; the number must be in `+international` form). The file can be just emails and phone numbers (for example `list_members.csv` filtered by hand) or the full profile layout.
 
 - Existing profiles are only added to the list. Their fields and consent don't change.
 - Missing profiles are created from the file's fields, following the same rules as `profiles import`, and tagged `migrated_from=ca` and `migration_run_id`.
@@ -333,7 +333,7 @@ Adds every profile in the file to one list, by the `email` column. The file can 
 |---|---|
 | `--to` (required) | Instance to write to |
 | `--list` (required) | ID of the list to add profiles to |
-| `--file` (required) | CSV with an `email` column |
+| `--file` (required) | CSV with an `email` column, and optionally `phone_number` for phone-only rows |
 | `--limit` | Only the first N rows |
 | `--yes` | Skip the typed confirmation |
 | `--allow-write-to-source` | Allow writing to a `_ca` instance |
@@ -347,10 +347,10 @@ uv run migtool klaviyo lists add --to klaviyo_ca --list XyZ789 --file members.cs
 
 ### `migtool klaviyo lists copy`
 
-Copies one list's members into a list on another instance, in one step. It reads the source list (read-only), writes its members' emails to `exports/<from>/lists-copy/<run>.members.csv`, then adds them exactly as `lists add` does, to an existing list (`--to-list`) or to one it creates (`--create`, named like the source list plus ` (CA)`, unless `--suffix` or `--name` is given).
+Copies one list's members into a list on another instance, in one step. It reads the source list (read-only), writes its members' emails (and phone numbers, for phone-only members) to `exports/<from>/lists-copy/<run>.members.csv`, then adds them exactly as `lists add` does, to an existing list (`--to-list`) or to one it creates (`--create`, named like the source list plus ` (CA)`, unless `--suffix` or `--name` is given).
 
-- Members are added by email only, so existing profiles get no field, property or consent change. Nobody is subscribed.
-- Members with no email (phone-only) are skipped and counted.
+- Members are matched by email, or by phone number when they have no email, and only that identifier is sent, so existing profiles get no field, property or consent change. Nobody is subscribed (by email or SMS).
+- Members with neither an email nor a phone number are skipped and counted.
 - An email with no profile at the destination is created, with the migration tags.
 - `--create` refuses a name the destination already uses, and creates the list only after you confirm.
 - Adding people to a list starts any flow triggered by "Added to List" for it. Check before copying into an existing list.
