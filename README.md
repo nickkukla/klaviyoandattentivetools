@@ -66,7 +66,7 @@ When a write goes wrong partway:
 - **Bad rows:** Klaviyo refuses a whole batch if one row is invalid (a malformed email, say), and says which row. The tool drops that row, resends the rest, and lists refused rows with Klaviyo's reason in the errors file. A profile over Klaviyo's 100 KB per-profile limit is refused before sending.
 - **Bad settings:** an error about the request itself rather than a row (for example a `--list-id` that doesn't exist) stops the run straight away, recorded as `aborted`. Fix the option and re-run.
 - **Unknown outcomes:** counts come from Klaviyo's own job results. A profile whose result can't be confirmed (job still running, failed, or its error list unreadable) is counted as failed with "outcome unknown", never as written.
-- **Retried writes:** if a write fails in a way that means Klaviyo may already have received it (a lost response, a server error), it's retried with a warning that it may be sent twice. That's harmless, because every write is safe to repeat.
+- **Retried writes:** if a write fails in a way that means Klaviyo may already have received it (a lost response, a server error), it's retried with a warning and **recorded in `state/<instance>/ambiguous_writes.json`**. Repeating the same write is safe, but a delayed first copy could land after a *later, different* write (say, re-setting a hold after 05 released it). So **the next write command stops** until you've waited a few minutes and confirmed the earlier file with `dedupe check`; then re-run it with `--retries-settled`, which clears the record.
 - **Aborted runs:** if the run stops (a revoked key, an outage after retries, Ctrl-C), it still writes the manifest (status `aborted`), the errors and skipped files and the summary, and exits non-zero. Jobs already submitted are listed in `state/` and may still be applied.
 
 ## Output files
@@ -174,12 +174,14 @@ A row with a hard bounce or spam complaint in its `suppressions` history is supp
 | `--as-unsubscribe` | Unsubscribe instead of suppressing in step 4 (see `suppressions import`) |
 | `--yes` | Skip the typed confirmation |
 | `--allow-write-to-source` | Allow writing to a `_ca` instance |
+| `--retries-settled` | Continue after earlier writes were retried following a lost response (see [How writes are protected](#how-writes-are-protected)) |
 
 ```
 uv run migtool klaviyo profiles import --to klaviyo_sandbox --file trial.csv --list-id TQ9jRX --limit 10
 uv run migtool klaviyo profiles import --to klaviyo_us --file ca_unique_profiles.csv --list-id <LOF Canada Newsletter list ID>
 uv run migtool klaviyo profiles import --to klaviyo_us --file ca_unique_profiles.csv --list-id <ID> --as-unsubscribe
 uv run migtool klaviyo profiles import --to klaviyo_sandbox --file trial.csv --list-id TQ9jRX --yes   # no prompt
+uv run migtool klaviyo profiles import --to klaviyo_us --file ca_unique_profiles.csv --list-id <ID> --retries-settled
 # Writing back into the CA account is never needed for the migration, and is refused without this flag:
 uv run migtool klaviyo profiles import --to klaviyo_ca --file fix.csv --list-id <ID> --allow-write-to-source
 ```
@@ -194,7 +196,7 @@ Imports one of the dedupe files (Klaviyo UI-import layout) under the rules of it
 |---|---|---|
 | `hold` | 01, 05 | Updates existing profiles only. Sends `migration_hold` and nothing else. No list, no consent, no tags. |
 | `hold-new` | 01b | Creates or updates. `migration_hold` plus migration tags. No list, no consent. |
-| `suppress` | 02 | Existing profiles join `--join-list` and get `ca_suppression_*`. Missing ones are created (tagged). Then all are submitted for suppression. |
+| `suppress` | 02 | Rows that were US profiles before the migration (per `--us-snapshot`) join `--join-list` and get `ca_suppression_*`. The rest are CA-only: created or updated and tagged. Then all are submitted for suppression. |
 | `new` | 03a–03d | Creates or updates, joins `--join-list`, adds tags. Consent from `Email Marketing Consent`: `Subscribe` → historical subscribe to `--subscribe-list`; `Unsubscribed` → unsubscribe. |
 | `kept` | 04a, 04b | Updates existing profiles only, joins `--join-list`, adds tags. Consent as for `new`, using `ca_consent_timestamp`. |
 
@@ -206,14 +208,17 @@ Imports one of the dedupe files (Klaviyo UI-import layout) under the rules of it
 | `--join-list` | List the profiles join (required for `suppress`, `new`, `kept`; refused for the others) |
 | `--subscribe-list` | List `Subscribe` rows subscribe to (roles `new`, `kept`; required when the file has `Subscribe` rows) |
 | `--types-from` | A `profiles export` CSV whose header gives each custom property's type (required for `new`) |
+| `--us-snapshot` | The pre-migration US `profiles export` CSV; decides which 02 rows are existing US profiles (required for `suppress`) |
 | `--limit` | Only the first N rows, for a pilot |
 | `--yes` | Skip the typed confirmation |
 | `--allow-write-to-source` | Allow writing to a `_ca` instance |
+| `--retries-settled` | Continue after earlier writes were retried following a lost response (see [How writes are protected](#how-writes-are-protected)) |
 
 ```
 uv run migtool klaviyo dedupe import --to klaviyo_us --role hold --file dedupe/exports/01_hold_only.csv
 uv run migtool klaviyo dedupe import --to klaviyo_us --role new --file dedupe/exports/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u --types-from exports/mainrun/klaviyo_ca/profiles/20260925T151451Z.csv --limit 5
 uv run migtool klaviyo dedupe import --to klaviyo_sandbox --role kept --file trial_04a.csv --join-list Sc9zHg --subscribe-list XrGL9u --yes
+uv run migtool klaviyo dedupe import --to klaviyo_us --role suppress --file dedupe/exports/02_suppressions.csv --join-list Sc9zHg --us-snapshot exports/mainrun/klaviyo_us/profiles/20260925T153516Z.csv --retries-settled
 uv run migtool klaviyo dedupe import --to klaviyo_ca --role hold --file fix.csv --allow-write-to-source   # never needed for the migration
 ```
 
@@ -221,7 +226,16 @@ Before sending anything, it works out and shows the plan: rows to send (existing
 
 ### `migtool klaviyo dedupe check`
 
-Read-only. Checks that each row of a dedupe file landed as its role intends: the profile exists and has the right `migration_hold`, migration tags, list membership and consent (for `suppress`, that it's suppressed). Rows that don't match go to `<run>.mismatches.csv` with the reason, and the command exits non-zero. Run it after each import, with the same role and lists.
+Read-only. Checks that each row of a dedupe file landed as its role intends. For every row:
+
+- the profile exists (looked up by the row's email, or its phone for phone-only rows);
+- **every field and property the role sends** matches what's stored, with its type;
+- the migration tags (where the role adds them);
+- list membership, compared by profile ID;
+- consent: `Subscribe` rows are subscribed and **not suppressed**. For `new` (profiles the migration creates) the subscription date must match the file's. `kept` profiles are existing subscribers, and Klaviyo keeps their existing date, so it isn't checked. `Unsubscribed` rows are unsubscribed;
+- rows carrying a CA suppression (02, 03d) are suppressed.
+
+Rows that don't match go to `<run>.mismatches.csv` with the reasons, and the command exits non-zero. It takes **the same role and options as the import**, and requires them.
 
 | Flag | |
 |---|---|
@@ -229,11 +243,14 @@ Read-only. Checks that each row of a dedupe file landed as its role intends: the
 | `--file` (required) | The dedupe CSV that was imported |
 | `--role` (required) | The role it was imported with |
 | `--join-list` | The list the profiles should be on |
-| `--subscribe-list` | The list `Subscribe` rows should be on |
+| `--subscribe-list` | The list `Subscribe` rows should be on (required when the file has `Subscribe` rows) |
+| `--types-from` | The CA `profiles export` CSV giving property types (required for `new`) |
+| `--us-snapshot` | The pre-migration US `profiles export` CSV (required for `suppress`) |
 | `--limit` | Only the first N rows (e.g. after a pilot) |
 
 ```
-uv run migtool klaviyo dedupe check --instance klaviyo_us --role new --file dedupe/exports/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role new --file dedupe/exports/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u --types-from exports/mainrun/klaviyo_ca/profiles/20260925T151451Z.csv
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role suppress --file dedupe/exports/02_suppressions.csv --join-list Sc9zHg --us-snapshot exports/mainrun/klaviyo_us/profiles/20260925T153516Z.csv
 uv run migtool klaviyo dedupe check --instance klaviyo_us --role hold --file dedupe/exports/05_release_hold.csv --limit 100
 ```
 
@@ -265,12 +282,13 @@ Suppresses every email in the file (a `suppressions export` file, or any CSV wit
 | `--as-unsubscribe` | Unsubscribe instead of suppressing. It blocks marketing email immediately, but a later subscribe lifts it, and Klaviyo shows the reason as "Unsubscribed". Use it as a floor, then suppress in the Klaviyo UI. |
 | `--yes` | Skip the typed confirmation |
 | `--allow-write-to-source` | Allow writing to a `_ca` instance |
+| `--retries-settled` | Continue after earlier writes were retried following a lost response (see [How writes are protected](#how-writes-are-protected)) |
 
 ```
 uv run migtool klaviyo suppressions import --to klaviyo_us --file ca_suppressions.csv --limit 1
 uv run migtool klaviyo suppressions import --to klaviyo_us --file ca_suppressions.csv
 uv run migtool klaviyo suppressions import --to klaviyo_us --file ca_suppressions.csv --as-unsubscribe
-uv run migtool klaviyo suppressions import --to klaviyo_sandbox --file trial_suppressions.csv --yes
+uv run migtool klaviyo suppressions import --to klaviyo_sandbox --file trial_suppressions.csv --yes --retries-settled
 uv run migtool klaviyo suppressions import --to klaviyo_ca --file ca_fix.csv --allow-write-to-source   # never needed for the migration
 ```
 
@@ -317,10 +335,11 @@ Adds every profile in the file to one list, by the `email` column. The file can 
 | `--limit` | Only the first N rows |
 | `--yes` | Skip the typed confirmation |
 | `--allow-write-to-source` | Allow writing to a `_ca` instance |
+| `--retries-settled` | Continue after earlier writes were retried following a lost response (see [How writes are protected](#how-writes-are-protected)) |
 
 ```
 uv run migtool klaviyo lists add --to klaviyo_us --list AbC123 --file vip_members.csv
-uv run migtool klaviyo lists add --to klaviyo_sandbox --list Td8hfk --file vip_members.csv --limit 5 --yes
+uv run migtool klaviyo lists add --to klaviyo_sandbox --list Td8hfk --file vip_members.csv --limit 5 --yes --retries-settled
 uv run migtool klaviyo lists add --to klaviyo_ca --list XyZ789 --file members.csv --allow-write-to-source   # never needed for the migration
 ```
 

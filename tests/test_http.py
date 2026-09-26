@@ -112,7 +112,7 @@ def test_write_retried_after_lost_response_warns(clock):
     c = HttpClient(BASE, sleep=clock.sleep, warn=warnings.append)
     assert c.post("/jobs").status_code == 202
     assert route.call_count == 2
-    assert len(warnings) == 1 and "may be sent twice" in warnings[0] and "ReadTimeout" in warnings[0]
+    assert len(warnings) == 1 and "may be applied twice" in warnings[0] and "ReadTimeout" in warnings[0]
 
 
 @respx.mock

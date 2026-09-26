@@ -53,7 +53,8 @@ T=exports/mainrun/klaviyo_ca/profiles/20260925T151451Z.csv
 D=dedupe/exports
 uv run migtool klaviyo dedupe import --to klaviyo_us --role hold      --file $D/01_hold_only.csv
 uv run migtool klaviyo dedupe import --to klaviyo_us --role hold-new  --file $D/01b_hold_shopify_only.csv
-uv run migtool klaviyo dedupe import --to klaviyo_us --role suppress  --file $D/02_suppressions.csv --join-list Sc9zHg
+S=exports/mainrun/klaviyo_us/profiles/20260925T153516Z.csv   # the pre-migration US export
+uv run migtool klaviyo dedupe import --to klaviyo_us --role suppress  --file $D/02_suppressions.csv --join-list Sc9zHg --us-snapshot $S
 uv run migtool klaviyo dedupe import --to klaviyo_us --role new       --file $D/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u --types-from $T
 uv run migtool klaviyo dedupe import --to klaviyo_us --role new       --file $D/03b_new_unsubscribed.csv --join-list T7TTAp --types-from $T
 uv run migtool klaviyo dedupe import --to klaviyo_us --role new       --file $D/03c_new_never_subscribed.csv --join-list T7TTAp --types-from $T
@@ -69,11 +70,12 @@ Pilot first: run 03a and 03b with `--limit 5` and inspect those profiles in Klav
 **Check every import.** After each file, run `klaviyo dedupe check` with the same role and lists. It reads each row's profile back and confirms it landed as intended: `migration_hold`, tags, list membership, and consent or suppression. For 02, give suppressions time to apply (minutes to hours) before checking. For example:
 
 ```
-uv run migtool klaviyo dedupe check --instance klaviyo_us --role new  --file $D/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u
-uv run migtool klaviyo dedupe check --instance klaviyo_us --role kept --file $D/04b_kept_unsubscribed.csv --join-list Sc9zHg
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role new      --file $D/03a_new_subscribed.csv --join-list T7TTAp --subscribe-list XrGL9u --types-from $T
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role suppress --file $D/02_suppressions.csv --join-list Sc9zHg --us-snapshot $S
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role kept     --file $D/04b_kept_unsubscribed.csv --join-list Sc9zHg
 ```
 
-A clean check ends `mismatched 0`. Otherwise `<run>.mismatches.csv` lists each row that's off and why. An import's own summary counts what Klaviyo *accepted*. The check confirms what actually *landed*.
+The check takes the same role and options as the import and compares every field and property the import sent, plus tags, lists (by profile ID), consent (and, for `new`, the original subscription date) and suppression. 03d rows must be suppressed, so check 03d after 02's suppressions have applied. A clean check ends `mismatched 0`. Otherwise `<run>.mismatches.csv` lists each row that's off and why. An import's own summary counts what Klaviyo *accepted*. The check confirms what actually *landed*.
 
 Each run first works out a plan and shows it before asking for confirmation: rows to send, how many already exist and how many are new, rows skipped or unreadable, the lists by name, and the subscribe and unsubscribe counts. Update-only roles (`hold`, `kept`) skip any row with no existing profile, rather than create a stub, and list it in `<run>.skipped.csv`. For 05, run it last: the profiles 03 and 01b create only exist once those imports are done.
 
@@ -88,6 +90,19 @@ Suppressions from 02 apply in the background, in two to four hours in the sandbo
 - `new`, `kept`: re-importing the same fields is a no-op. A repeated historical subscribe on someone already subscribed is either accepted (same or earlier date) or, if dated later, handled as "already subscribed" (list-only add). Repeating an unsubscribe leaves them unsubscribed.
 
 Each run gets a new `migration_run_id`, so a profile shows the most recent run that touched it. Then run `dedupe check` to confirm the whole file landed.
+
+Two limits on "safe to repeat":
+- **02's split** between existing US profiles and CA-only profiles comes from the pre-migration US export (`--us-snapshot`), not from the live account. So a partly failed run, or a profile the suppression call itself created, can't change it on a re-run.
+- **A write retried after a lost response** may have a first copy that Klaviyo applies later. The tool records it and stops the next import until you confirm, with `dedupe check`, that the earlier file has settled (`--retries-settled`). That matters most before 05 (the hold release).
+
+## Timestamp precision and the main-run dedupe
+
+The main-run exports rounded consent times to whole seconds, and ties go to US. With full precision (read back for the 171 overlapping profiles whose CA and US times shared a second):
+- 98: US's change was later (US correctly won); 2 were exact ties (US by rule).
+- 69: CA's change was later, but both sides are never subscribed and suppressed at the same time, so US wins by rule anyway and they're already suppressed (01 is right).
+- **2**: both unsubscribed, and CA's change was later by a fraction of a second, so under the rules **CA wins: they belong in 04b** rather than 01. Their consent doesn't change (already unsubscribed); the difference is `market=CA`, the tags and audit fields, and the Updated US Profiles list. Their emails are in `exports/mainrun/tie_flips_to_ca.json`.
+
+Exports now keep fractions of a second, so the catch-up dedupe won't have this issue.
 
 ## The catch-up run
 

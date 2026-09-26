@@ -145,13 +145,14 @@ class HttpClient:
         self._warn = warn
 
     def _warn_retrying_write(self, method: str, url: str, why: str) -> None:
-        # The first attempt may have reached Klaviyo before failing. Sending it
-        # again is harmless (every write here is safe to repeat), but it should
-        # never happen silently.
+        # The first attempt may have reached Klaviyo before failing. Repeating the
+        # same write is safe, but a delayed first copy could land after a later,
+        # different write (say, a hold release), so it's reported and, by the
+        # CLI, recorded until the user confirms things have settled.
         if method != "GET":
             self._warn(
                 f"Warning: {method} {url} {why}; retrying. Klaviyo may have accepted the first attempt, "
-                "so this write may be sent twice. That's harmless, as writes are safe to repeat."
+                "so this write may be applied twice, and the first copy may land after later steps."
             )
 
     def backoff(self, attempt: int) -> float:
