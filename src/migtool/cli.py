@@ -151,6 +151,9 @@ def _gate_unsettled(inst, retries_settled: bool) -> None:
 
 
 JOB_DONE = ("complete", "cancelled", "failed")
+# Klaviyo drops jobs after seven days: "not found" is recorded so it isn't
+# looked up again, and kept distinct from a confirmed status.
+JOB_SETTLED = (*JOB_DONE, "not found")
 
 
 def _gate_pending_jobs(client: KlaviyoClient, inst) -> None:
@@ -160,7 +163,7 @@ def _gate_pending_jobs(client: KlaviyoClient, inst) -> None:
     Saved jobs are looked up once and their final status recorded."""
     store = StateStore()
     open_jobs = [j for j in store.jobs(inst.name)
-                 if j.get("kind") == "profile-bulk-import-jobs" and j.get("status") not in JOB_DONE]
+                 if j.get("kind") == "profile-bulk-import-jobs" and j.get("status") not in JOB_SETTLED]
     if not open_jobs:
         return
     updates: dict[str, dict] = {}
@@ -519,6 +522,11 @@ CREATE = typer.Option(False, "--create", help="Create the destination list inste
 NAME = typer.Option(None, "--name", help="Name of the list --create makes, used as is (default: the source's name plus --suffix).")
 
 
+def _provenance(instance: str) -> str:
+    """The `migrated_from` tag for profiles a copy from `instance` creates."""
+    return "ca" if instance == "klaviyo_ca" else instance.removeprefix("klaviyo_")
+
+
 def _copy_group(
     kind: str, from_: str, source_id: str, to: str, to_list: str | None, create: bool, name: str | None,
     suffix: str, limit: int | None, yes: bool, allow_write_to_source: bool, retries_settled: bool,
@@ -578,10 +586,19 @@ def _copy_group(
             list_id = imp.w.create_list(dest_name)
             extra["list_id"] = list_id
             typer.echo(f"Created list {dest_name} ({list_id})")
-        return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
+        return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id,
+                                             source=_provenance(from_))}
 
-    _write_run(to, f"{kind}s-copy", "add", members_path, limit, yes, allow_write_to_source, body, extra,
-               retries_settled=retries_settled, phones=True)
+    try:
+        _write_run(to, f"{kind}s-copy", "add", members_path, limit, yes, allow_write_to_source, body, extra,
+                   retries_settled=retries_settled, phones=True)
+    except typer.Exit:
+        # Re-running would take a new snapshot and miss anyone who has left the
+        # source since. Finish this one from its saved file instead.
+        if extra["list_id"]:
+            typer.echo(f"To finish this copy from the same snapshot: uv run migtool klaviyo lists add --to {to} "
+                       f"--list {extra['list_id']} --file {members_path}")
+        raise
 
 
 @lists_app.command("copy")

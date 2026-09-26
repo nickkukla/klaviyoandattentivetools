@@ -32,8 +32,8 @@ def copy_env(tmp_path, monkeypatch, klaviyo_account):
     ])))
     calls = []
 
-    def fake_lists_add(imp, rows, columns, *, list_id, run_id):
-        calls.append({"rows": rows, "columns": columns, "list_id": list_id})
+    def fake_lists_add(imp, rows, columns, *, list_id, run_id, source):
+        calls.append({"rows": rows, "columns": columns, "list_id": list_id, "source": source})
         return 0
 
     monkeypatch.setattr(imports, "lists_add", fake_lists_add)
@@ -58,7 +58,7 @@ def test_copy_creates_the_list_and_adds_members_by_email_only(copy_env):
     # Only the identifier goes to lists_add, so nothing else is written to the profile.
     assert calls == [{"rows": [{"email": "a@example.com", "phone_number": ""},
                                {"email": "", "phone_number": "+14165550100"}],
-                      "columns": ["email", "phone_number"], "list_id": "NEW"}]
+                      "columns": ["email", "phone_number"], "list_id": "NEW", "source": "sandbox"}]
     [manifest] = (tmp_path / "exports/klaviyo_sandbox/lists-copy").glob("manifest.json")
     last = json.loads(manifest.read_text())["runs"][-1]
     assert last["list_id"] == "NEW" and last["source_list"] == "L1"
@@ -167,3 +167,47 @@ def test_segment_copy_snapshots_members_into_a_new_list(tmp_path, monkeypatch, k
     [manifest] = (tmp_path / "exports/klaviyo_sandbox/segments-copy").glob("manifest.json")
     last = json.loads(manifest.read_text())["runs"][-1]
     assert last["source_segment"] == "S1" and last["list_id"] == "NEW"
+
+
+@pytest.mark.parametrize("job_status", ["complete", "failed"])
+@respx.mock
+def test_segment_copy_end_to_end(job_status, tmp_path, monkeypatch, klaviyo_account):
+    """The real writer against mocked HTTP: a two-page segment with a phone-only
+    member. If the import fails, the run says how to finish from the snapshot."""
+    klaviyo_account("T2aEdf")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    respx.get(f"{API}/segments/S1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "S1", "attributes": {"name": "Repeat buyers"}}}))
+    pages = respx.get(f"{API}/segments/S1/profiles/").mock(side_effect=[
+        httpx.Response(200, json={
+            "data": [{"id": "p1", "attributes": {"email": "a@example.com", "phone_number": "+14165550100"}}],
+            "links": {"next": f"{API}/segments/S1/profiles/?page%5Bcursor%5D=2"}}),
+        httpx.Response(200, json=page([{"id": "p2", "attributes": {"email": None, "phone_number": "+14165550101"}}])),
+    ])
+    respx.get(f"{API}/lists/").mock(return_value=httpx.Response(200, json=page([])))
+    respx.post(f"{API}/lists/").mock(return_value=httpx.Response(201, json={"data": {"id": "NEW"}}))
+    respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json=page([
+        {"id": "u1", "attributes": {"email": "a@example.com", "phone_number": "+14165550100"}},
+        {"id": "u2", "attributes": {"email": None, "phone_number": "+14165550101"}}])))
+    job = respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(202, json={"data": {
+        "id": "J1", "attributes": {"status": "queued"}}}))
+    respx.get(f"{API}/profile-bulk-import-jobs/J1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "J1", "attributes": {"status": job_status, "completed_count": 2, "failed_count": 0}}}))
+    result = CliRunner().invoke(app, ["klaviyo", "segments", "copy", "--from", "klaviyo_sandbox", "--segment", "S1",
+                                      "--to", "klaviyo_sandbox", "--create", "--yes"])
+    assert "2 members (1 phone-only)" in result.output
+    assert "page%5Bcursor%5D=2" in str(pages.calls[1].request.url)
+    body = json.loads(job.calls.last.request.content)["data"]
+    assert body["relationships"]["lists"]["data"] == [{"type": "list", "id": "NEW"}]
+    # Only identifiers are sent: the email for p1 (not its phone), the phone for p2.
+    assert [p["attributes"] for p in body["attributes"]["profiles"]["data"]] == [
+        {"email": "a@example.com"}, {"phone_number": "+14165550101"}]
+    [snapshot] = (tmp_path / "exports/klaviyo_sandbox/segments-copy").glob("*.members.csv")
+    if job_status == "complete":
+        assert result.exit_code == 0, result.output
+        assert "To finish this copy" not in result.output
+    else:
+        assert result.exit_code != 0
+        assert (f"To finish this copy from the same snapshot: uv run migtool klaviyo lists add --to klaviyo_sandbox "
+                f"--list NEW --file {snapshot.relative_to(tmp_path)}") in result.output

@@ -67,7 +67,7 @@ When a write goes wrong partway:
 - **Bad settings:** an error about the request itself rather than a row (for example a `--list-id` that doesn't exist) stops the run straight away, recorded as `aborted`. Fix the option and re-run.
 - **Unknown outcomes:** counts come from Klaviyo's own job results. A profile whose result can't be confirmed (job still running, failed, or its error list unreadable) is counted as failed with "outcome unknown", never as written.
 - **Retried writes:** if a write fails in a way that means Klaviyo may already have received it (a lost response, a server error), it's retried with a warning and **recorded in `state/<instance>/ambiguous_writes.json`**, and so is one whose last attempt fails that way. Repeating the same write is safe, but a delayed first copy could land after a *later, different* write (say, re-setting a hold after 05 released it). So **the next write command stops** until you've waited a few minutes and confirmed the earlier file with `dedupe check`; then re-run it with `--retries-settled`, which clears the record.
-- **Unfinished jobs:** before writing, every write command looks up the profile import jobs earlier runs saved in `state/<instance>/jobs.json` and records their final status. If one is still processing (a run stopped with Ctrl-C, say, while its job ran on), the command stops until it finishes, because Klaviyo doesn't guarantee the order jobs apply in.
+- **Unfinished jobs:** before writing, every write command looks up the profile import jobs earlier runs saved in `state/<instance>/jobs.json` and records their final status (or "not found" once Klaviyo has dropped a job, after seven days), so each is looked up once. If one is still processing (a run stopped with Ctrl-C, say, while its job ran on), the command stops until it finishes, because Klaviyo doesn't guarantee the order jobs apply in.
 - **Creating a list** (`lists copy --create`) is never retried after a failure that may have reached Klaviyo, since a retry would make a second list. The tool looks the list up by name instead, and stops if it can't tell which one to use.
 - **Aborted runs:** if the run stops (a revoked key, an outage after retries, Ctrl-C), it still writes the manifest (status `aborted`), the errors and skipped files and the summary, and exits non-zero. Jobs already submitted are listed in `state/` and may still be applied.
 
@@ -351,7 +351,8 @@ Copies one list's members into a list on another instance, in one step. It reads
 
 - Members are matched by email, or by phone number when they have no email, and only that identifier is sent, so existing profiles get no field, property or consent change. Nobody is subscribed (by email or SMS).
 - Members with neither an email nor a phone number are skipped and counted.
-- An email with no profile at the destination is created, with the migration tags.
+- A member with no profile at the destination is created, tagged `migrated_from` with the source (`ca` for `klaviyo_ca`, otherwise the instance name, such as `sandbox`) and `migration_run_id`.
+- If a copy is interrupted, don't just re-run it: that reads the source again. Finish it from the saved snapshot with `lists add --to <instance> --list <new list ID> --file <the .members.csv>`; the run prints this command when it fails.
 - `--create` refuses a name the destination already uses, and creates the list only after you confirm.
 - Adding people to a list starts any flow triggered by "Added to List" for it. Check before copying into an existing list.
 
@@ -378,7 +379,7 @@ Klaviyo segments can't have members added directly. To mirror a segment, add its
 
 Copies a segment's **current** members into a static list on another instance, for segments whose rules won't work at the destination. It works exactly like `lists copy`, but reads `--segment` instead of `--list`, and a list it creates is named after the segment plus ` (CA segment)` by default.
 
-The list is a snapshot: it doesn't gain or lose members as the source segment changes. Copy close to when the list is needed, or copy again into the same list with `--to-list` to add later members (nobody is removed).
+The list is a snapshot: it doesn't gain or lose members as the source segment changes. Copy close to when the list is needed, or copy again into the same list with `--to-list` to add later members (nobody is removed). To finish an interrupted copy, use the saved snapshot as for `lists copy`, rather than re-running (a new snapshot would miss anyone who has left the segment since).
 
 | Flag | |
 |---|---|

@@ -477,6 +477,13 @@ def test_lists_add_matches_phone_only_rows_by_phone(tmp_path):
     assert log.counts["written"] == 2
 
 
+def test_created_profiles_are_tagged_with_the_copy_source():
+    from migtool.cli import _provenance
+    assert _provenance("klaviyo_ca") == "ca" and _provenance("klaviyo_sandbox") == "sandbox"
+    assert imports._tag("R", "sandbox") == {"migrated_from": "sandbox", "migration_run_id": "R"}
+    assert imports._tag("R")["migrated_from"] == "ca"
+
+
 def test_phone_only_rows_are_skipped_unless_asked_for():
     batch = imports.usable([{"email": "", "phone_number": "+14165550100"}])
     assert batch.rows == [] and batch.skipped == [("", "no email (phone +14165550100)")]
