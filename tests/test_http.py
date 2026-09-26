@@ -131,3 +131,42 @@ def test_write_retried_after_server_error_warns(clock):
     respx.post(f"{BASE}/jobs").mock(side_effect=[httpx.Response(502), httpx.Response(202, json={})])
     HttpClient(BASE, sleep=clock.sleep, warn=warnings.append).post("/jobs")
     assert len(warnings) == 1 and "got 502" in warnings[0]
+
+
+@respx.mock
+def test_last_attempt_lost_is_recorded(clock):
+    # Rate-limited until the last attempt, whose response is lost: the write
+    # may have landed, so it's reported even though nothing is retried.
+    warnings = []
+    respx.post(f"{BASE}/jobs").mock(side_effect=[httpx.Response(429)] * 5 + [httpx.ReadTimeout("lost")])
+    with pytest.raises(ApiError):
+        HttpClient(BASE, sleep=clock.sleep, warn=warnings.append).post("/jobs")
+    assert len(warnings) == 1 and "wasn't retried" in warnings[0] and "ReadTimeout" in warnings[0]
+
+
+@respx.mock
+def test_last_attempt_server_error_is_recorded_but_429_is_not(clock):
+    warnings = []
+    respx.post(f"{BASE}/a").mock(side_effect=[httpx.Response(429)] * 5 + [httpx.Response(503)])
+    respx.post(f"{BASE}/b").mock(return_value=httpx.Response(429))
+    c = HttpClient(BASE, sleep=clock.sleep, warn=warnings.append)
+    for path in ("/a", "/b"):
+        with pytest.raises(ApiError):
+            c.post(path)
+    assert len(warnings) == 1 and "got 503" in warnings[0]
+
+
+@respx.mock
+def test_writes_that_arent_safe_to_repeat_arent_retried_after_they_may_have_arrived(clock):
+    warnings = []
+    lost = respx.post(f"{BASE}/lost").mock(side_effect=[httpx.ReadTimeout("lost"), httpx.Response(201, json={})])
+    refused = respx.post(f"{BASE}/refused").mock(side_effect=[httpx.ConnectError("no"), httpx.Response(201, json={})])
+    limited = respx.post(f"{BASE}/limited").mock(side_effect=[httpx.Response(429), httpx.Response(201, json={})])
+    c = HttpClient(BASE, sleep=clock.sleep, warn=warnings.append)
+    with pytest.raises(ApiError):
+        c.post("/lost", retry_writes=False)
+    assert lost.call_count == 1 and len(warnings) == 1
+    # Nothing was sent (connection refused, rate limited): retrying is safe.
+    assert c.post("/refused", retry_writes=False).status_code == 201 and refused.call_count == 2
+    assert c.post("/limited", retry_writes=False).status_code == 201 and limited.call_count == 2
+    assert len(warnings) == 1

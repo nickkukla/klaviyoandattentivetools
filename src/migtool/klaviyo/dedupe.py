@@ -312,12 +312,19 @@ def _marketing(attrs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _same(expected: Any, actual: Any) -> bool:
-    """Equal, treating 3 and 3.0 as the same number (Klaviyo may return either)."""
+    """Equal, type for type, all the way down. The one allowance: 3 and 3.0 are
+    the same number when one side is a float (Klaviyo may return either)."""
     if isinstance(expected, bool) or isinstance(actual, bool):
         return expected is actual
+    if isinstance(expected, int) and isinstance(actual, int):
+        return expected == actual
     if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
         return abs(expected - actual) <= 1e-9 * max(1.0, abs(expected))
-    return expected == actual
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(_same(e, a) for e, a in zip(expected, actual))
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        return expected.keys() == actual.keys() and all(_same(expected[k], actual[k]) for k in expected)
+    return type(expected) is type(actual) and expected == actual
 
 
 def _field_problems(sent: dict[str, Any], attrs: dict[str, Any]) -> list[str]:
@@ -325,7 +332,9 @@ def _field_problems(sent: dict[str, Any], attrs: dict[str, Any]) -> list[str]:
     The migration tags are checked separately (run IDs differ between runs)."""
     found = []
     for key, value in sent.items():
-        if key in ("email", "phone_number", "properties", "location"):
+        # The lookup identifier matched by definition; a phone sent alongside an
+        # email is a field like any other (Klaviyo drops some invalid numbers).
+        if key in ("email", "properties", "location") or (key == "phone_number" and not sent.get("email")):
             continue
         if not _same(value, attrs.get(key)):
             found.append(f"{key} is {attrs.get(key)!r}, expected {value!r}")

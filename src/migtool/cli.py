@@ -150,6 +150,42 @@ def _gate_unsettled(inst, retries_settled: bool) -> None:
     store.clear_ambiguous_writes(inst.name)
 
 
+JOB_DONE = ("complete", "cancelled", "failed")
+
+
+def _gate_pending_jobs(client: KlaviyoClient, inst) -> None:
+    """Stop a write while a profile import job an earlier run submitted is
+    still processing (after Ctrl-C, a polling failure or a timeout): Klaviyo
+    doesn't guarantee order, so it could land after this write and undo it.
+    Saved jobs are looked up once and their final status recorded."""
+    store = StateStore()
+    open_jobs = [j for j in store.jobs(inst.name)
+                 if j.get("kind") == "profile-bulk-import-jobs" and j.get("status") not in JOB_DONE]
+    if not open_jobs:
+        return
+    updates: dict[str, dict] = {}
+    pending = []
+    for job in open_jobs:
+        try:
+            status = client.get(f"/{job['kind']}/{job['id']}/", tier="L")["data"]["attributes"]["status"]
+        except ApiError as exc:
+            if exc.status != 404:
+                raise
+            status = "not found"  # Klaviyo no longer has it: long finished.
+        if status in JOB_DONE or status == "not found":
+            updates[job["id"]] = {"status": status}
+        else:
+            pending.append((job, status))
+    if updates:
+        store.update_jobs(inst.name, updates)
+    if pending:
+        runs = sorted({j.get("run_id", "?") for j, _ in pending})
+        raise ConfigError(
+            f"{len(pending)} earlier profile import job(s) on {inst.name} are still processing "
+            f"(runs {', '.join(runs)}; state/{inst.name}/jobs.json). Wait for them to finish, then re-run."
+        )
+
+
 def _client(instance: str) -> KlaviyoClient:
     return _connect(get_instance(instance, "klaviyo"))[0]
 
@@ -337,6 +373,7 @@ def _write_run(
     store = StateStore()
     client, account = _connect(inst)
     with client:
+        _gate_pending_jobs(client, inst)
         typer.echo(f"File:            {file} ({len(raw):,} rows, {len(batch.skipped):,} skipped)")
         confirm_write(
             inst, account=f"{account['name']} ({account['id']})", record_count=len(batch.rows),
@@ -613,6 +650,7 @@ def dedupe_import(
     store = StateStore()
     client, account = _connect(inst)
     with client:
+        _gate_pending_jobs(client, inst)
         w = Writer(client)
         p = dedupe.plan(r, raw, types, run.run_id, lambda e, ph: w.existing_emails(e) | w.existing_phones(ph),
                         us_snapshot=snapshot)
