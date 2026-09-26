@@ -64,14 +64,24 @@ class Batch:
     skipped: list[tuple[str, str]]
 
 
-def usable(rows: list[dict[str, str]]) -> Batch:
-    """Drop rows without an email and repeated emails (the first row wins)."""
+def usable(rows: list[dict[str, str]], *, phones: bool = False) -> Batch:
+    """Drop rows without an email and repeated emails (the first row wins).
+    With `phones`, a row with no email but a +international phone number is
+    kept too, identified by that phone (for list membership)."""
     seen: set[str] = set()
     keep, skipped = [], []
     for row in rows:
-        email = row["email"].lower()
-        if not email:
-            skipped.append(("", f"no email (phone {row.get('phone_number') or 'none'})"))
+        email = (row.get("email") or "").lower()
+        phone = (row.get("phone_number") or "").strip()
+        if not email and phones and phone.startswith("+"):
+            if phone in seen:
+                skipped.append((phone, "duplicate phone number in file"))
+            else:
+                seen.add(phone)
+                row["email"], row["phone_number"] = "", phone
+                keep.append(row)
+        elif not email:
+            skipped.append(("", f"no email (phone {phone or 'none'})"))
         elif '"' in email or "@" not in email:
             skipped.append((row["email"], "not a valid email"))
         elif email in seen:
@@ -318,17 +328,23 @@ def suppressions_import(
 def lists_add(
     imp: Importer, rows: list[dict[str, str]], columns: list[str], *, list_id: str, run_id: str
 ) -> int:
-    """Add every row to `list_id`. Existing profiles are only added (no field or
-    consent change); missing ones are created from the file's fields and tagged.
-    With consent columns, SUBSCRIBED rows whose add is confirmed are also
-    subscribed with their original timestamp. Returns the number created."""
-    existing = imp.w.existing_emails(r["email"] for r in rows)
-    missing = [r for r in rows if r["email"] not in existing]
-    present = [r for r in rows if r["email"] in existing]
+    """Add every row to `list_id`, by email, or by phone for a phone-only row.
+    Existing profiles are only added (no field or consent change); missing ones
+    are created from the file's fields and tagged. With consent columns,
+    SUBSCRIBED rows with an email whose add is confirmed are also subscribed
+    with their original timestamp. Returns the number created."""
+    email_rows = [r for r in rows if r["email"]]
+    phone_rows = [r for r in rows if not r["email"]]
+    existing = imp.w.existing_emails(r["email"] for r in email_rows)
+    if phone_rows:
+        existing |= imp.w.existing_phones(r["phone_number"] for r in phone_rows)
+    missing = [r for r in rows if identity(r) not in existing]
+    present = [r for r in rows if identity(r) in existing]
     payloads, _ = imp.attributes(missing, lambda r: {"ca_external_id": r.get("external_id"), **_tag(run_id)})
     created = imp.import_profiles(payloads, list_id=list_id, stage="add")
-    added = imp.import_profiles([{"email": r["email"]} for r in present], list_id=list_id, stage="add")
+    added = imp.import_profiles([{"email": r["email"]} if r["email"] else {"phone_number": r["phone_number"]}
+                                 for r in present], list_id=list_id, stage="add")
     if CONSENT_COLUMNS <= set(columns):
-        confirmed = imp.skip_unconfirmed(rows, created | added, "subscribe")
+        confirmed = imp.skip_unconfirmed(email_rows, created | added, "subscribe")
         imp.subscribe(plan_profiles_import(confirmed)["subscribe"], list_id=list_id)
     return len(created)

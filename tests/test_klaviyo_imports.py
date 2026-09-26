@@ -12,6 +12,7 @@ from migtool.http import ApiError
 from migtool.klaviyo import imports
 from migtool.klaviyo.client import KlaviyoClient
 from migtool.klaviyo.writes import (
+    identity,
     Job,
     Writer,
     byte_batches,
@@ -402,8 +403,11 @@ class FakeWriter:
     def existing_emails(self, emails):
         return {e for e in emails if e in self.existing}
 
+    def existing_phones(self, phones):
+        return {p for p in phones if p in self.existing}
+
     def import_profiles(self, profiles, *, list_id, on_job, on_refused=None):
-        emails = [p["email"] for p in profiles]
+        emails = [identity(p) for p in profiles]
         self.calls.append(("import", emails, list_id, [sorted(p.get("properties", {})) for p in profiles]))
         on_job(Job("profile-bulk-import-jobs", f"j{len(self.calls)}", len(profiles), {"status": "complete"}, emails))
         return []
@@ -456,6 +460,26 @@ def test_lists_add_without_consent_columns_never_subscribes(tmp_path):
     imp, _ = importer(tmp_path, w, "add")
     imports.lists_add(imp, [{"email": "a@example.com", "consent": "SUBSCRIBED"}], ["email"], list_id="L1", run_id="R")
     assert [c[0] for c in w.calls] == ["import"]
+
+
+def test_lists_add_matches_phone_only_rows_by_phone(tmp_path):
+    w = FakeWriter(existing={"a@example.com", "+14165550100"})
+    imp, log = importer(tmp_path, w, "add")
+    batch = imports.usable([{"email": "A@example.com", "phone_number": ""},
+                            {"email": "", "phone_number": "+14165550100"},
+                            {"email": "", "phone_number": "+14165550100"},
+                            {"email": "", "phone_number": "4165550199"}], phones=True)
+    assert [r["email"] or r["phone_number"] for r in batch.rows] == ["a@example.com", "+14165550100"]
+    assert [reason for _, reason in batch.skipped] == ["duplicate phone number in file", "no email (phone 4165550199)"]
+    assert imports.lists_add(imp, batch.rows, ["email", "phone_number"], list_id="L1", run_id="R") == 0
+    [add] = w.calls
+    assert add[:3] == ("import", ["a@example.com", "+14165550100"], "L1") and add[3] == [[], []]
+    assert log.counts["written"] == 2
+
+
+def test_phone_only_rows_are_skipped_unless_asked_for():
+    batch = imports.usable([{"email": "", "phone_number": "+14165550100"}])
+    assert batch.rows == [] and batch.skipped == [("", "no email (phone +14165550100)")]
 
 
 @pytest.mark.parametrize("as_unsubscribe,expected", [(False, "suppress"), (True, "unsubscribe")])

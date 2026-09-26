@@ -27,7 +27,8 @@ def copy_env(tmp_path, monkeypatch, klaviyo_account):
         "id": "L1", "type": "list", "attributes": {"name": "VIP"}}}))
     respx.get(f"{API}/lists/L1/profiles/").mock(return_value=httpx.Response(200, json=page([
         {"id": "p1", "attributes": {"email": "a@example.com", "joined_group_at": "2026-09-02T00:00:00+00:00"}},
-        {"id": "p2", "attributes": {"email": None, "joined_group_at": "2026-09-02T00:00:00+00:00"}},
+        {"id": "p2", "attributes": {"email": None, "phone_number": None}},
+        {"id": "p3", "attributes": {"email": None, "phone_number": "+14165550100"}},
     ])))
     calls = []
 
@@ -51,16 +52,19 @@ def test_copy_creates_the_list_and_adds_members_by_email_only(copy_env):
     create = respx.post(f"{API}/lists/").mock(return_value=httpx.Response(201, json={"data": {"id": "NEW"}}))
     result = run("--create")
     assert result.exit_code == 0, result.output
-    assert "2 members, 1 without an email (skipped)" in result.output
+    assert "3 members (1 phone-only), 1 with no email or phone (skipped)" in result.output
     assert parse_qs(urlparse(str(named.calls.last.request.url)).query)["filter"] == ['equals(name,"VIP (CA)")']
     assert json.loads(create.calls.last.request.content)["data"]["attributes"] == {"name": "VIP (CA)"}
-    # Only the email goes to lists_add, so nothing else is written to the profile.
-    assert calls == [{"rows": [{"email": "a@example.com"}], "columns": ["email"], "list_id": "NEW"}]
+    # Only the identifier goes to lists_add, so nothing else is written to the profile.
+    assert calls == [{"rows": [{"email": "a@example.com", "phone_number": ""},
+                               {"email": "", "phone_number": "+14165550100"}],
+                      "columns": ["email", "phone_number"], "list_id": "NEW"}]
     [manifest] = (tmp_path / "exports/klaviyo_sandbox/lists-copy").glob("manifest.json")
     last = json.loads(manifest.read_text())["runs"][-1]
     assert last["list_id"] == "NEW" and last["source_list"] == "L1"
     [members] = (tmp_path / "exports/klaviyo_sandbox/lists-copy").glob("*.members.csv")
-    assert list(csv.DictReader(members.open())) == [{"email": "a@example.com"}]
+    assert list(csv.DictReader(members.open())) == [{"email": "a@example.com", "phone_number": ""},
+                                                    {"email": "", "phone_number": "+14165550100"}]
 
 
 @respx.mock

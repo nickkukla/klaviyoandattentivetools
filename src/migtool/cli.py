@@ -358,6 +358,7 @@ def bis_export(
 def _write_run(
     to: str, obj: str, main_step: str, file: Path, limit: int | None, yes: bool,
     allow_write_to_source: bool, body, extra_manifest: dict | None = None, retries_settled: bool = False,
+    phones: bool = False,
 ) -> None:
     """Shared frame for the write commands: read and check the file, confirm the
     target, run `body(importer, rows, columns, run)`, then write the skipped
@@ -368,7 +369,7 @@ def _write_run(
         columns, raw = imports.read_rows(file, limit=limit)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    batch = imports.usable(raw)
+    batch = imports.usable(raw, phones=phones)
     run = new_run(inst.name, obj)
     store = StateStore()
     client, account = _connect(inst)
@@ -502,13 +503,14 @@ def lists_add(
     allow_write_to_source: bool = ALLOW_SOURCE,
     retries_settled: bool = RETRIES_SETTLED,
 ) -> None:
-    """Add every profile in the file to one list; writes consent only if the file has consent columns."""
+    """Add every profile in the file to one list, by email or (phone-only rows) phone number; writes
+    consent only if the file has consent columns."""
 
     def body(imp, rows, columns, run):
         return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
 
     _write_run(to, "lists-add", "add", file, limit, yes, allow_write_to_source, body, {"list_id": list_id},
-               retries_settled=retries_settled)
+               retries_settled=retries_settled, phones=True)
 
 
 
@@ -530,9 +532,9 @@ def lists_copy(
 ) -> None:
     """Copy one list's members into a list on another instance, creating it if asked.
 
-    Members are matched by email and only added to the list: no field, property
-    or consent changes. Members with no email are skipped. An email with no
-    profile at the destination is created, with the migration tags."""
+    Members are matched by email, or by phone number when they have no email,
+    and only added to the list: no field, property or consent changes. A member
+    with no profile at the destination is created, with the migration tags."""
     if (to_list is None) != create:
         raise typer.BadParameter("give exactly one of --to-list or --create.", param_hint="--to-list")
     if name and not create:
@@ -546,19 +548,27 @@ def lists_copy(
         except ApiError as exc:
             raise ConfigError(f"List {source_list} wasn't found on {from_} ({exc.status}).") from exc
         source_name = group["attributes"]["name"]
-        writer = CsvWriter(members_path, ["email"])
-        no_email = 0
-        for row in groups.members(client, "list", group):
-            if row["email"]:
-                writer.write({"email": row["email"]})
-            else:
-                no_email += 1
+        # The phone only for phone-only members: it's their identifier. For the
+        # others, sending it could change the destination profile's number.
+        writer = CsvWriter(members_path, ["email", "phone_number"])
+        phone_only = neither = 0
+        params = {"fields[profile]": "email,phone_number", "page[size]": "100"}
+        for page in client.paginate(f"/lists/{source_list}/profiles/", tier="L", params=params):
+            for p in page["data"]:
+                email, phone = p["attributes"].get("email"), p["attributes"].get("phone_number")
+                if email:
+                    writer.write({"email": email, "phone_number": ""})
+                elif phone:
+                    writer.write({"email": "", "phone_number": phone})
+                    phone_only += 1
+                else:
+                    neither += 1
         writer.close()
     write_manifest(source, files={members_path.name: writer.count},
-                   counts={"members": writer.count + no_email, "no_email": no_email},
+                   counts={"members": writer.count + neither, "phone_only": phone_only, "no_identifier": neither},
                    extra={"list_id": source_list, "list_name": source_name})
-    typer.echo(f"Source list:     {source_name} ({source_list}) on {from_}: {writer.count + no_email:,} members, "
-               f"{no_email:,} without an email (skipped)")
+    typer.echo(f"Source list:     {source_name} ({source_list}) on {from_}: {writer.count + neither:,} members "
+               f"({phone_only:,} phone-only), {neither:,} with no email or phone (skipped)")
     with _client(to) as client:
         if to_list:
             dest_name = _list_name(client, to_list)
@@ -581,7 +591,7 @@ def lists_copy(
         return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
 
     _write_run(to, "lists-copy", "add", members_path, limit, yes, allow_write_to_source, body, extra,
-               retries_settled=retries_settled)
+               retries_settled=retries_settled, phones=True)
 
 TYPES_FROM = typer.Option(
     None, "--types-from", exists=True, dir_okay=False,
