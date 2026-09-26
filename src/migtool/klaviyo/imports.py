@@ -123,6 +123,12 @@ class Importer:
         self.main_step = main_step
         self.steps: dict[str, int] = {}
         self.unfinished: list[Job] = []
+        self.skipped: list[tuple[str, str]] = []
+
+    def skip(self, who: str, reason: str) -> None:
+        """A row deliberately not sent; it goes to the run's skipped file."""
+        self.skipped.append((who, reason))
+        self.log.skipped()
 
     def _count(self, step: str, n: int) -> None:
         self.steps[step] = self.steps.get(step, 0) + n
@@ -327,14 +333,15 @@ def suppressions_import(
 
 def lists_add(
     imp: Importer, rows: list[dict[str, str]], columns: list[str], *, list_id: str, run_id: str,
-    source: str = MIGRATED_FROM,
+    source: str = MIGRATED_FROM, existing_only: bool = False,
 ) -> int:
     """Add every row to `list_id`, by email, or by phone for a phone-only row.
     Existing profiles are only added (no field or consent change); missing ones
     are created from the file's fields and tagged. With consent columns,
     SUBSCRIBED rows with an email whose add is confirmed are also subscribed
     with their original timestamp. `source` is the `migrated_from` tag on
-    created profiles. Returns the number created."""
+    created profiles. With `existing_only`, rows with no profile are skipped
+    rather than created. Returns the number created."""
     email_rows = [r for r in rows if r["email"]]
     phone_rows = [r for r in rows if not r["email"]]
     existing = imp.w.existing_emails(r["email"] for r in email_rows)
@@ -342,6 +349,10 @@ def lists_add(
         existing |= imp.w.existing_phones(r["phone_number"] for r in phone_rows)
     missing = [r for r in rows if identity(r) not in existing]
     present = [r for r in rows if identity(r) in existing]
+    if existing_only:
+        for r in missing:
+            imp.skip(identity(r), "no profile at the destination (--existing-only)")
+        missing = []
     payloads, _ = imp.attributes(missing, lambda r: {"ca_external_id": r.get("external_id"), **_tag(run_id, source)})
     created = imp.import_profiles(payloads, list_id=list_id, stage="add")
     added = imp.import_profiles([{"email": r["email"]} if r["email"] else {"phone_number": r["phone_number"]}

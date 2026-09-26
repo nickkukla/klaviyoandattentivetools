@@ -334,6 +334,7 @@ Adds every profile in the file to one list, by the `email` column, or by `phone_
 | `--to` (required) | Instance to write to |
 | `--list` (required) | ID of the list to add profiles to |
 | `--file` (required) | CSV with an `email` column, and optionally `phone_number` for phone-only rows |
+| `--existing-only` | Only add profiles that already exist; skip (and list) the rest |
 | `--limit` | Only the first N rows |
 | `--yes` | Skip the typed confirmation |
 | `--allow-write-to-source` | Allow writing to a `_ca` instance |
@@ -353,6 +354,7 @@ Copies one list's members into a list on another instance, in one step. It reads
 - Members with neither an email nor a phone number are skipped and counted.
 - A member with no profile at the destination is created, tagged `migrated_from` with the source (`ca` for `klaviyo_ca`, otherwise the instance name, such as `sandbox`) and `migration_run_id`.
 - If a copy is interrupted, don't just re-run it: that reads the source again. Finish it from the saved snapshot with `lists add --to <instance> --list <new list ID> --file <the .members.csv>`; the run prints this command when it fails.
+- With `--existing-only`, a member with no profile at the destination is skipped instead of created, and listed in the run's `.skipped.csv`. Use it when new source profiles should come over through the import (with their consent) rather than as bare profiles; copy again with `--to-list` afterwards to add them.
 - `--create` refuses a name the destination already uses, and creates the list only after you confirm.
 - Adding people to a list starts any flow triggered by "Added to List" for it. Check before copying into an existing list.
 
@@ -364,6 +366,7 @@ Copies one list's members into a list on another instance, in one step. It reads
 | `--to-list` | ID of an existing destination list |
 | `--create` | Create the destination list instead (give exactly one of `--to-list` and `--create`) |
 | `--name` | Name for the list `--create` makes, used as is |
+| `--existing-only` | Skip members with no profile at the destination instead of creating them |
 | `--suffix` | Added to the source list's name when there's no `--name` (default ` (CA)`) |
 | `--limit`, `--yes`, `--allow-write-to-source`, `--retries-settled` | As for `lists add` |
 
@@ -386,7 +389,7 @@ The list is a snapshot: it doesn't gain or lose members as the source segment ch
 | `--from` (required) | Instance to read the segment from |
 | `--segment` (required) | ID of the segment to copy |
 | `--to` (required) | Instance to write to |
-| `--to-list`, `--create`, `--name` | As for `lists copy` |
+| `--to-list`, `--create`, `--name`, `--existing-only` | As for `lists copy` |
 | `--suffix` | Added to the segment's name when there's no `--name` (default ` (CA segment)`) |
 | `--limit`, `--yes`, `--allow-write-to-source`, `--retries-settled` | As for `lists add` |
 
