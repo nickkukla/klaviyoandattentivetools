@@ -59,3 +59,19 @@ class StateStore:
         else:
             raise KeyError(f"No saved job {job_id} for {instance}")
         write_json_atomic(self._jobs_path(instance), jobs)
+
+    # Writes retried after an ambiguous failure (a lost response or server
+    # error): Klaviyo may also apply the first attempt, possibly after later
+    # steps. Kept until the user confirms things have settled.
+    def _ambiguous_path(self, instance: str) -> Path:
+        return self.base / instance / "ambiguous_writes.json"
+
+    def ambiguous_writes(self, instance: str) -> list[dict[str, Any]]:
+        path = self._ambiguous_path(instance)
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+
+    def add_ambiguous_write(self, instance: str, entry: dict[str, Any]) -> None:
+        write_json_atomic(self._ambiguous_path(instance), [*self.ambiguous_writes(instance), entry])
+
+    def clear_ambiguous_writes(self, instance: str) -> None:
+        self._ambiguous_path(instance).unlink(missing_ok=True)

@@ -16,6 +16,7 @@ from migtool.klaviyo.client import KlaviyoClient
 from migtool.klaviyo.writes import Job, Writer
 from migtool.output import (
     CsvWriter,
+    utc_now,
     ResumableExport,
     ResumeError,
     iso,
@@ -99,8 +100,15 @@ def _since(value: str | None) -> datetime | None:
 
 
 def _connect(inst) -> tuple[KlaviyoClient, dict]:
-    """A client for `inst`, after checking its key belongs to the expected account."""
-    client = KlaviyoClient(credential(inst))
+    """A client for `inst`, after checking its key belongs to the expected account.
+    Writes retried after an ambiguous failure are recorded in state/."""
+    store = StateStore()
+
+    def warn(message: str) -> None:
+        typer.echo(message, err=True)
+        store.add_ambiguous_write(inst.name, {"time": iso(utc_now()), "message": message})
+
+    client = KlaviyoClient(credential(inst), warn=warn)
     try:
         account = client.account()
         check_account(inst, account["id"])
@@ -108,6 +116,38 @@ def _connect(inst) -> tuple[KlaviyoClient, dict]:
         client.close()
         raise
     return client, account
+
+
+RETRIES_SETTLED = typer.Option(
+    False, "--retries-settled",
+    help="Confirm that writes retried after a lost response (recorded in state/) have settled, then continue.",
+)
+
+
+def _warn_unsettled(inst) -> None:
+    entries = StateStore().ambiguous_writes(inst.name)
+    if entries:
+        typer.echo(f"Note: {len(entries)} write(s) to {inst.name} were retried after a lost response "
+                   f"(state/{inst.name}/ambiguous_writes.json); Klaviyo may still be applying a first copy.")
+
+
+def _gate_unsettled(inst, retries_settled: bool) -> None:
+    """Stop a write while earlier ambiguous retries are unconfirmed: a delayed
+    first copy could land after this write and undo it (say, re-set a hold
+    after 05 released it). `--retries-settled` confirms and clears them."""
+    store = StateStore()
+    entries = store.ambiguous_writes(inst.name)
+    if not entries:
+        return
+    if not retries_settled:
+        raise ConfigError(
+            f"{len(entries)} earlier write(s) to {inst.name} were retried after a lost response "
+            f"(state/{inst.name}/ambiguous_writes.json), so a first copy may still land. Wait a few minutes, "
+            "run `klaviyo dedupe check` on the affected file, then re-run this with --retries-settled."
+        )
+    for e in entries:
+        typer.echo(f"Settled: {e['time']} {e['message'][:120]}")
+    store.clear_ambiguous_writes(inst.name)
 
 
 def _client(instance: str) -> KlaviyoClient:
@@ -281,12 +321,13 @@ def bis_export(
 
 def _write_run(
     to: str, obj: str, main_step: str, file: Path, limit: int | None, yes: bool,
-    allow_write_to_source: bool, body, extra_manifest: dict | None = None,
+    allow_write_to_source: bool, body, extra_manifest: dict | None = None, retries_settled: bool = False,
 ) -> None:
     """Shared frame for the write commands: read and check the file, confirm the
     target, run `body(importer, rows, columns, run)`, then write the skipped
     file, manifest and summary. Exits non-zero if anything failed."""
     inst = get_instance(to, "klaviyo")
+    _gate_unsettled(inst, retries_settled)
     try:
         columns, raw = imports.read_rows(file, limit=limit)
     except ValueError as exc:
@@ -348,6 +389,7 @@ def profiles_import(
     as_unsubscribe: bool = AS_UNSUBSCRIBE,
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
 ) -> None:
     """Import profiles from a `profiles export` CSV, keeping consent and suppression."""
 
@@ -355,7 +397,7 @@ def profiles_import(
         imports.profiles_import(imp, rows, list_id=list_id, run_id=run.run_id, as_unsubscribe=as_unsubscribe)
 
     _write_run(to, "profiles-import", "import", file, limit, yes, allow_write_to_source, body,
-               {"list_id": list_id, "as_unsubscribe": as_unsubscribe})
+               {"list_id": list_id, "as_unsubscribe": as_unsubscribe}, retries_settled=retries_settled)
 
 
 @suppressions_app.command("import")
@@ -366,6 +408,7 @@ def suppressions_import(
     as_unsubscribe: bool = AS_UNSUBSCRIBE,
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
 ) -> None:
     """Suppress every email in the file, creating suppressed profiles where none exist."""
 
@@ -373,7 +416,7 @@ def suppressions_import(
         return {"created": imports.suppressions_import(imp, rows, run_id=run.run_id, as_unsubscribe=as_unsubscribe)}
 
     _write_run(to, "suppressions-import", "suppress", file, limit, yes, allow_write_to_source, body,
-               {"as_unsubscribe": as_unsubscribe})
+               {"as_unsubscribe": as_unsubscribe}, retries_settled=retries_settled)
 
 
 @suppressions_app.command("check")
@@ -420,13 +463,40 @@ def lists_add(
     limit: int | None = LIMIT,
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
 ) -> None:
     """Add every profile in the file to one list; writes consent only if the file has consent columns."""
 
     def body(imp, rows, columns, run):
         return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id)}
 
-    _write_run(to, "lists-add", "add", file, limit, yes, allow_write_to_source, body, {"list_id": list_id})
+    _write_run(to, "lists-add", "add", file, limit, yes, allow_write_to_source, body, {"list_id": list_id},
+               retries_settled=retries_settled)
+
+
+TYPES_FROM = typer.Option(
+    None, "--types-from", exists=True, dir_okay=False,
+    help="The CA `profiles export` CSV, whose header gives each custom property's type (required for role new).",
+)
+US_SNAPSHOT = typer.Option(
+    None, "--us-snapshot", exists=True, dir_okay=False,
+    help="The pre-migration US `profiles export` CSV: which 02 rows are existing US profiles (required for role suppress).",
+)
+
+
+def _check_role_options(r, join_list, subscribe_list, types_from, us_snapshot) -> None:
+    """The option rules shared by `dedupe import` and `dedupe check`."""
+    if r.join_list and not join_list:
+        raise typer.BadParameter(f"role {r.name} needs --join-list.", param_hint="--join-list")
+    if not r.join_list and join_list:
+        raise typer.BadParameter(f"role {r.name} doesn't join a list.", param_hint="--join-list")
+    if subscribe_list and not r.consent:
+        raise typer.BadParameter(f"role {r.name} doesn't subscribe anyone.", param_hint="--subscribe-list")
+    if r.name == "new" and not types_from:
+        raise typer.BadParameter("role new needs --types-from (the CA profile export).", param_hint="--types-from")
+    if r.name == "suppress" and not us_snapshot:
+        raise typer.BadParameter("role suppress needs --us-snapshot (the pre-migration US profile export).",
+                                 param_hint="--us-snapshot")
 
 
 def _list_name(client: KlaviyoClient, list_id: str) -> str:
@@ -448,39 +518,33 @@ def dedupe_import(
     subscribe_list: str | None = typer.Option(
         None, "--subscribe-list", help="List Subscribe rows subscribe to, as a historical import (roles new, kept)."
     ),
-    types_from: Path | None = typer.Option(
-        None, "--types-from", exists=True, dir_okay=False,
-        help="A `profiles export` CSV whose header gives each custom property's type (required for role new).",
-    ),
+    types_from: Path | None = TYPES_FROM,
+    us_snapshot: Path | None = US_SNAPSHOT,
     limit: int | None = LIMIT,
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
 ) -> None:
     """Import one dedupe file under the rules of its role (see docs/DEDUPE_IMPORT.md)."""
     if role not in dedupe.ROLES:
         raise typer.BadParameter(f"'{role}' isn't one of {', '.join(dedupe.ROLES)}.", param_hint="--role")
     r = dedupe.ROLES[role]
-    if r.join_list and not join_list:
-        raise typer.BadParameter(f"role {role} needs --join-list.", param_hint="--join-list")
-    if not r.join_list and join_list:
-        raise typer.BadParameter(f"role {role} doesn't join a list.", param_hint="--join-list")
-    if subscribe_list and not r.consent:
-        raise typer.BadParameter(f"role {role} doesn't subscribe anyone.", param_hint="--subscribe-list")
-    if role == "new" and not types_from:
-        raise typer.BadParameter("role new needs --types-from (the CA profile export).", param_hint="--types-from")
+    _check_role_options(r, join_list, subscribe_list, types_from, us_snapshot)
     inst = get_instance(to, "klaviyo")
+    _gate_unsettled(inst, retries_settled)
     try:
         columns, raw = imports.read_rows(file, limit=limit)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     types = dedupe.type_map(types_from) if types_from else {}
+    snapshot = dedupe.load_snapshot(us_snapshot) if us_snapshot else None
     run = new_run(inst.name, f"dedupe-{role}")
     store = StateStore()
     client, account = _connect(inst)
     with client:
         w = Writer(client)
         p = dedupe.plan(r, raw, types, run.run_id, lambda e, ph: w.existing_emails(e) | w.existing_phones(ph),
-                        migrated=w.migrated_emails)
+                        us_snapshot=snapshot)
         if r.consent and p.count("SUBSCRIBED") and not subscribe_list:
             raise typer.BadParameter(
                 f"{p.count('SUBSCRIBED'):,} rows say Subscribe; give --subscribe-list.", param_hint="--subscribe-list"
@@ -531,7 +595,8 @@ def dedupe_import(
         counts={**log.counts, "steps": imp.steps}, status=status,
         extra={"migration_run_id": run.run_id, "source_file": str(file), "account": account["id"], "role": role,
                "join_list": join_list, "subscribe_list": subscribe_list,
-               "types_from": str(types_from) if types_from else None},
+               "types_from": str(types_from) if types_from else None,
+               "us_snapshot": str(us_snapshot) if us_snapshot else None},
     )
     typer.echo(f"migration_run_id: {run.run_id}")
     if skipped_path:
@@ -550,25 +615,38 @@ def dedupe_check(
     subscribe_list: str | None = typer.Option(
         None, "--subscribe-list", help="List Subscribe rows should be on (as imported)."
     ),
+    types_from: Path | None = TYPES_FROM,
+    us_snapshot: Path | None = US_SNAPSHOT,
     limit: int | None = LIMIT,
 ) -> None:
     """Check (read-only) that each row of a dedupe file landed as its role intends.
 
-    Confirms the profile exists and has the right migration_hold, tags, list
-    membership and consent (or suppression, for role suppress). Rows that
-    don't match go to <run>.mismatches.csv with the reason."""
+    For every row: the profile exists; every field and property the role
+    writes matches (with its type); migration tags; list membership (by
+    profile ID); consent, and a subscribe date no later than the file's;
+    suppression where the row carries one, and none on subscribed rows. Rows
+    that don't match go to <run>.mismatches.csv. Takes the same options as the
+    import, and needs them."""
     if role not in dedupe.ROLES:
         raise typer.BadParameter(f"'{role}' isn't one of {', '.join(dedupe.ROLES)}.", param_hint="--role")
+    r = dedupe.ROLES[role]
+    _check_role_options(r, join_list, subscribe_list, types_from, us_snapshot)
     inst = get_instance(instance, "klaviyo")
     try:
         _, raw = imports.read_rows(file, limit=limit)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+    if r.consent and not subscribe_list and any(dedupe.consent_instruction(x) == "SUBSCRIBED" for x in raw
+                                                  if x.get(dedupe.CONSENT)):
+        raise typer.BadParameter("the file has Subscribe rows; give --subscribe-list.", param_hint="--subscribe-list")
+    types = dedupe.type_map(types_from) if types_from else {}
+    snapshot = dedupe.load_snapshot(us_snapshot) if us_snapshot else None
+    _warn_unsettled(inst)
     client, _ = _connect(inst)
     with client:
         counts, mismatches, skipped = dedupe.check(
-            client, dedupe.ROLES[role], raw, join_list=join_list, subscribe_list=subscribe_list,
-            progress=lambda m: typer.echo(f"  {m}"),
+            client, r, raw, types=types, us_snapshot=snapshot, join_list=join_list,
+            subscribe_list=subscribe_list, progress=lambda m: typer.echo(f"  {m}"),
         )
     run = new_run(inst.name, f"dedupe-check-{role}")
     files = {}

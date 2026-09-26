@@ -17,7 +17,8 @@ TYPES = {"Shopify Tags": "json", "Checked in": "bool", "Current Balance": "numbe
 def plan(role, rows, existing=(), types=TYPES):
     found = set(existing)
     return dedupe.plan(dedupe.ROLES[role], rows, types, "RUN1",
-                       lambda e, p: {x for x in e if x in found} | {x for x in p if x in found})
+                       lambda e, p: {x for x in e if x in found} | {x for x in p if x in found},
+                       us_snapshot=found if role == "suppress" else None)
 
 
 # --- Column translation --------------------------------------------------------
@@ -218,6 +219,7 @@ def test_kept_command_end_to_end(tmp_path, monkeypatch):
     (["--role", "hold", "--join-list", "X"], "doesn't join a list"),
     (["--role", "new"], "needs --join-list"),
     (["--role", "new", "--join-list", "X"], "needs --types-from"),
+    (["--role", "suppress", "--join-list", "X"], "needs --us-snapshot"),
     (["--role", "hold-new", "--subscribe-list", "X"], "doesn't subscribe"),
     (["--role", "nope"], "isn't one of"),
 ])
@@ -236,12 +238,18 @@ def test_type_map_reads_export_header(tmp_path):
     assert dedupe.type_map(f) == {"Shopify Tags": "json", "coupon": "text", "Checked in": "bool"}
 
 
-def test_suppress_rerun_treats_migration_created_profiles_as_ca():
+def test_suppress_split_comes_from_the_us_snapshot_not_live_state(tmp_path):
+    # created@ exists live (an earlier run, or the suppression call itself,
+    # created it, possibly untagged) but isn't in the pre-migration US export,
+    # so it stays CA-only: tagged, and never put on the Updated US list.
+    snap = tmp_path / "us.csv"
+    snap.write_text("id,email,phone_number\nU1,US@example.com,\nU2,,+14165550100\n")
+    snapshot = dedupe.load_snapshot(snap)
+    assert snapshot == {"us@example.com", "+14165550100"}
     rows = [{"email": "us@example.com", "ca_suppression_reason": "HARD_BOUNCE"},
             {"email": "created@example.com", "ca_suppression_reason": "SPAM_COMPLAINT"}]
     p = dedupe.plan(dedupe.ROLES["suppress"], rows, {}, "RUN2",
-                    lambda e, ph: {"us@example.com", "created@example.com"},
-                    migrated=lambda emails: {"created@example.com"} & set(emails))
+                    lambda e, ph: {"us@example.com", "created@example.com"}, us_snapshot=snapshot)
     assert p.existing == {"us@example.com"} and (p.updates, p.creates) == (1, 1)
     by = {a["email"]: a["properties"] for a in p.payloads}
     assert "migrated_from" not in by["us@example.com"] and by["created@example.com"]["migrated_from"] == "ca"
@@ -251,63 +259,185 @@ def test_suppress_rerun_treats_migration_created_profiles_as_ca():
                              ("import", ["created@example.com"], None, "create")]
 
 
-@respx.mock
-def test_migrated_emails_reads_the_tag():
-    from migtool.config import Secret
-    from migtool.klaviyo.client import KlaviyoClient
-    from migtool.klaviyo.writes import Writer
-    respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json={"links": {"next": None}, "data": [
-        {"attributes": {"email": "Created@example.com", "properties": {"migrated_from": "ca"}}},
-        {"attributes": {"email": "us@example.com", "properties": {"other": 1}}}]}))
-    assert Writer(KlaviyoClient(Secret("pk_x"))).migrated_emails(["created@example.com", "us@example.com"]) == {"created@example.com"}
+def test_suppress_without_snapshot_is_refused():
+    with pytest.raises(ValueError, match="snapshot"):
+        dedupe.plan(dedupe.ROLES["suppress"], [{"email": "a@example.com"}], {}, "R", lambda e, p: set())
+
 
 
 # --- Checking an import ------------------------------------------------------------
 
-def prof(consent="NEVER_SUBSCRIBED", suppression=(), **props):
-    return {"subscriptions": {"email": {"marketing": {"consent": consent, "suppression": list(suppression)}}},
-            "properties": props}
+def stored(consent="NEVER_SUBSCRIBED", suppression=(), ts=None, pid="P1", props=None, **fields):
+    """Profile attributes as fetch_profiles returns them."""
+    return {"_id": pid, **fields,
+            "subscriptions": {"email": {"marketing": {"consent": consent, "consent_timestamp": ts,
+                                                      "suppression": [{"reason": r} for r in suppression]}}},
+            "properties": props or {}}
 
 
-@pytest.mark.parametrize("role,row,attrs,join,sub,expected", [
-    ("hold", {"email": "a@x.com", "migration_hold": "true"}, prof(migration_hold=True), None, None, []),
-    ("hold", {"email": "a@x.com", "migration_hold": "false"}, prof(migration_hold=True), None, None,
-     ["migration_hold is True, expected False"]),
-    ("hold", {"email": "a@x.com", "migration_hold": "true"}, None, None, None, ["no profile"]),
-    ("new", {"email": "a@x.com", "Email Marketing Consent": "Subscribe"},
-     prof("SUBSCRIBED", migrated_from="ca"), {"a@x.com"}, {"a@x.com"}, []),
-    ("new", {"email": "a@x.com", "Email Marketing Consent": "Subscribe"},
-     prof("NEVER_SUBSCRIBED"), set(), set(),
-     ["missing migrated_from=ca tag", "not on the join list", "consent is NEVER_SUBSCRIBED, expected SUBSCRIBED",
-      "not on the subscribe list"]),
-    ("kept", {"email": "a@x.com", "Email Marketing Consent": "Unsubscribed"},
-     prof("SUBSCRIBED", migrated_from="ca"), {"a@x.com"}, None, ["consent is SUBSCRIBED, expected UNSUBSCRIBED"]),
-    ("suppress", {"email": "a@x.com"}, prof(suppression=[{"reason": "HARD_BOUNCE"}]), {"a@x.com"}, None, []),
-    ("suppress", {"email": "a@x.com"}, prof(suppression=[{"reason": "UNSUBSCRIBE"}]), set(), None,
-     ["not suppressed (suppressions: ['UNSUBSCRIBE'])", "existing US profile not on the join list"]),
-    ("suppress", {"email": "a@x.com"}, prof(suppression=[{"reason": "SPAM_COMPLAINT"}], migrated_from="ca"), set(), None, []),
-])
-def test_problems(role, row, attrs, join, sub, expected):
-    assert dedupe.problems(dedupe.ROLES[role], row, attrs, join, sub) == expected
+def problems(role, row, attrs, *, join=None, subscribe=None, us_profile=False, types=TYPES):
+    return dedupe.problems(dedupe.ROLES[role], row, attrs, types=types, us_profile=us_profile,
+                           join=join, subscribe=subscribe)
+
+
+def test_hold_checks_the_hold_value_only():
+    assert problems("hold", {"email": "a@x.com", "migration_hold": "true"}, stored(props={"migration_hold": True})) == []
+    assert problems("hold", {"email": "a@x.com", "migration_hold": "false"}, stored(props={"migration_hold": True})) == [
+        "property migration_hold is True, expected False"]
+    assert problems("hold", {"email": "a@x.com", "migration_hold": "true"}, None) == ["no profile"]
+
+
+def test_new_subscribed_row_that_landed():
+    row = {"email": "a@x.com", "Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2022-05-05T05:00:00Z",
+           "first_name": "Ann", "market": "CA", "Shopify Tags": '["vip"]', "migration_hold": "true"}
+    attrs = stored("SUBSCRIBED", ts="2022-05-05T05:00:00+00:00", first_name="Ann",
+                   props={"market": "CA", "Shopify Tags": ["vip"], "migration_hold": True, "migrated_from": "ca"})
+    assert problems("new", row, attrs, join={"P1"}, subscribe={"P1"}) == []
+
+
+def test_new_subscribed_row_that_did_not_land():
+    row = {"email": "a@x.com", "Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2022-05-05T05:00:00Z",
+           "market": "CA"}
+    attrs = stored("NEVER_SUBSCRIBED", props={"market": "US"})
+    assert problems("new", row, attrs, join=set(), subscribe=set()) == [
+        "property market is 'US', expected 'CA'", "missing migrated_from=ca tag", "not on the join list",
+        "consent is NEVER_SUBSCRIBED, expected SUBSCRIBED", "not on the subscribe list",
+        "consent_timestamp is None, expected 2022-05-05T05:00:00Z"]
+
+
+def test_subscribed_but_still_suppressed_is_flagged():
+    row = {"email": "a@x.com", "Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2022-05-05T05:00:00Z"}
+    attrs = stored("SUBSCRIBED", suppression=["USER_SUPPRESSED"], ts="2022-05-05T05:00:00Z", props={"migrated_from": "ca"})
+    assert problems("new", row, attrs, join={"P1"}, subscribe={"P1"}) == [
+        "subscribed but still suppressed (USER_SUPPRESSED): won't receive email"]
+
+
+def test_subscribe_date_rules():
+    new_row = {"email": "a@x.com", "Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2022-05-05T05:00:00Z"}
+    ok = stored("SUBSCRIBED", ts="2022-05-05T05:00:00+00:00", props={"migrated_from": "ca"})
+    off = stored("SUBSCRIBED", ts="2026-01-01T00:00:00+00:00", props={"migrated_from": "ca"})
+    base = dict(join={"P1"}, subscribe={"P1"})
+    assert problems("new", new_row, ok, **base) == []
+    assert problems("new", new_row, off, **base) == [
+        "consent_timestamp is 2026-01-01T00:00:00+00:00, expected 2022-05-05T05:00:00Z"]
+    # kept: an existing subscriber keeps its own date, earlier or later.
+    kept_row = {"email": "a@x.com", "Email Marketing Consent": "Subscribe", "ca_consent_timestamp": "2024-08-09T12:22:29Z"}
+    props = {"migrated_from": "ca", "ca_consent_timestamp": "2024-08-09T12:22:29Z"}
+    for ts in ("2020-02-21T05:29:23Z", "2025-01-01T00:00:00Z"):
+        assert problems("kept", kept_row, stored("SUBSCRIBED", ts=ts, props=props), **base) == []
+
+
+def test_03d_row_must_be_suppressed():
+    row = {"email": "a@x.com", "ca_consent": "SUBSCRIBED", "ca_suppression_reason": "SPAM_COMPLAINT", "migration_hold": "true"}
+    props = {"ca_consent": "SUBSCRIBED", "ca_suppression_reason": "SPAM_COMPLAINT", "migration_hold": True, "migrated_from": "ca"}
+    assert problems("new", row, stored(props=props), join={"P1"}) == ["not suppressed (expected SPAM_COMPLAINT)"]
+    assert problems("new", row, stored(suppression=["USER_SUPPRESSED"], props=props), join={"P1"}) == []
+    # An unsubscribe alone doesn't count as the expected suppression.
+    assert problems("new", row, stored(suppression=["UNSUBSCRIBE"], props=props), join={"P1"}) == [
+        "not suppressed (expected SPAM_COMPLAINT)"]
+
+
+def test_kept_row_missing_market_and_audit_values_is_flagged():
+    row = {"email": "a@x.com", "Email Marketing Consent": "Unsubscribed", "market": "CA", "migration_hold": "true",
+           "ca_consent": "UNSUBSCRIBED", "ca_consent_method_detail": "Footer"}
+    attrs = stored("UNSUBSCRIBED", props={"migration_hold": True, "migrated_from": "ca"})
+    assert problems("kept", row, attrs, join={"P1"}) == [
+        "property market is None, expected 'CA'", "property ca_consent is None, expected 'UNSUBSCRIBED'",
+        "property ca_consent_source is None, expected 'Footer'"]
+
+
+def test_suppress_rules_depend_on_the_us_snapshot():
+    row = {"email": "a@x.com", "ca_suppression_reason": "HARD_BOUNCE"}
+    us = stored(suppression=["HARD_BOUNCE"], props={"ca_suppression_reason": "HARD_BOUNCE"})
+    assert problems("suppress", row, us, join={"P1"}, us_profile=True) == []
+    assert problems("suppress", row, us, join=set(), us_profile=True) == ["not on the join list"]
+    ca_only = stored(suppression=["HARD_BOUNCE"], props={"ca_suppression_reason": "HARD_BOUNCE"})
+    assert problems("suppress", row, ca_only, join=set(), us_profile=False) == ["missing migrated_from=ca tag"]
+
+
+def test_number_types_compare_by_value():
+    assert dedupe._same(3, 3.0) and not dedupe._same(True, 1) and dedupe._same(["a"], ["a"])
+
+
+def check_cli(tmp_path, args, klaviyo_account, profiles_data, list_ids=()):
+    klaviyo_account("T2aEdf")
+
+    def profiles(request):
+        flt = request.url.params.get("filter", "")
+        data = [p for p in profiles_data if any(f'"{v}"' in flt for v in (p["attributes"].get("email"), p["attributes"].get("phone_number")) if v)]
+        return httpx.Response(200, json={"data": data, "links": {"next": None}})
+    respx.get(f"{API}/profiles/").mock(side_effect=profiles)
+    respx.get(url__regex=rf"{API}/lists/\w+/profiles/").mock(return_value=httpx.Response(200, json={
+        "data": [{"id": i, "attributes": {"email": None}} for i in list_ids], "links": {"next": None}}))
+    return CliRunner().invoke(app, ["klaviyo", "dedupe", "check", "--instance", "klaviyo_sandbox", *args])
+
+
+@respx.mock
+def test_check_finds_phone_only_rows_whose_profile_also_has_an_email(tmp_path, monkeypatch, klaviyo_account):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    f = tmp_path / "01.csv"
+    f.write_text("email,phone_number,migration_hold\n,+14165550100,true\n")
+    data = [{"id": "P9", "attributes": {"email": "has-email@example.com", "phone_number": "+14165550100",
+                                         **{k: v for k, v in stored(props={"migration_hold": True}).items() if k != "_id"}}}]
+    result = check_cli(tmp_path, ["--role", "hold", "--file", str(f)], klaviyo_account, data)
+    assert result.exit_code == 0, result.output
+    assert "ok 1, mismatched 0" in result.output
 
 
 @respx.mock
 def test_check_command_writes_mismatches_and_fails(tmp_path, monkeypatch, klaviyo_account):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
-    klaviyo_account("T2aEdf")
-
-    def profiles(request):
-        data = []
-        if "ok@example.com" in request.url.params.get("filter", ""):
-            data.append({"attributes": {"email": "ok@example.com", "phone_number": None, **prof(migration_hold=False)}})
-        return httpx.Response(200, json={"data": data, "links": {"next": None}})
-    respx.get(f"{API}/profiles/").mock(side_effect=profiles)
     f = tmp_path / "05.csv"
     f.write_text("email,phone_number,migration_hold\nok@example.com,,false\nmissing@example.com,,false\n")
-    result = CliRunner().invoke(app, ["klaviyo", "dedupe", "check", "--instance", "klaviyo_sandbox", "--role", "hold",
-                                      "--file", str(f)])
+    data = [{"id": "P1", "attributes": {"email": "ok@example.com", "phone_number": None,
+                                         **{k: v for k, v in stored(props={"migration_hold": False}).items() if k != "_id"}}}]
+    result = check_cli(tmp_path, ["--role", "hold", "--file", str(f)], klaviyo_account, data)
     assert result.exit_code == 1
     assert "ok 1, mismatched 1" in result.output
     [m] = (tmp_path / "exports/klaviyo_sandbox/dedupe-check-hold").glob("*.mismatches.csv")
     assert "missing@example.com,no profile" in m.read_text()
+
+
+@pytest.mark.parametrize("args,message", [
+    (["--role", "new"], "needs --join-list"),
+    (["--role", "kept"], "needs --join-list"),
+    (["--role", "kept", "--join-list", "X"], "give --subscribe-list"),
+    (["--role", "suppress", "--join-list", "X"], "needs --us-snapshot"),
+])
+def test_check_needs_the_same_options_as_the_import(tmp_path, monkeypatch, args, message):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "f.csv"
+    f.write_text("Email Marketing Consent,email,migration_hold\nSubscribe,a@example.com,true\n")
+    result = CliRunner().invoke(app, ["klaviyo", "dedupe", "check", "--instance", "klaviyo_sandbox", "--file", str(f), *args])
+    plain = " ".join(re.sub(r"[│╭╮╰╯─]", " ", re.sub(r"\x1b\[[0-9;]*m", "", result.output)).split())
+    assert result.exit_code != 0 and message in plain
+
+
+@respx.mock
+def test_ambiguous_retry_is_recorded_and_gates_the_next_import(tmp_path, monkeypatch, klaviyo_account):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    monkeypatch.setattr("migtool.http.time.sleep", lambda s: None)
+    klaviyo_account("T2aEdf")
+    respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json={
+        "data": [{"attributes": {"email": "a@example.com", "phone_number": None}}], "links": {"next": None}}))
+    jobs = respx.post(f"{API}/profile-bulk-import-jobs/").mock(side_effect=[
+        httpx.ReadTimeout("response lost"), httpx.Response(202, json={"data": {"id": "J", "attributes": {"status": "queued"}}}),
+        httpx.Response(202, json={"data": {"id": "J2", "attributes": {"status": "queued"}}})])
+    respx.get(url__regex=rf"{API}/profile-bulk-import-jobs/J2?/").mock(return_value=httpx.Response(200, json={
+        "data": {"attributes": {"status": "complete", "completed_count": 1, "failed_count": 0}}}))
+    f = tmp_path / "01.csv"
+    f.write_text("email,phone_number,migration_hold\na@example.com,,true\n")
+    cmd = ["klaviyo", "dedupe", "import", "--to", "klaviyo_sandbox", "--role", "hold", "--file", str(f), "--yes"]
+    first = CliRunner().invoke(app, cmd)
+    assert first.exit_code == 0, first.output
+    saved = json.loads((tmp_path / "state/klaviyo_sandbox/ambiguous_writes.json").read_text())
+    assert len(saved) == 1 and "ReadTimeout" in saved[0]["message"]
+    second = CliRunner().invoke(app, cmd)
+    assert second.exit_code != 0 and "retried after a lost response" in str(second.exception)
+    assert jobs.call_count == 2  # the gated run sent nothing
+    third = CliRunner().invoke(app, [*cmd, "--retries-settled"])
+    assert third.exit_code == 0, third.output
+    assert "Settled:" in third.output and not (tmp_path / "state/klaviyo_sandbox/ambiguous_writes.json").exists()

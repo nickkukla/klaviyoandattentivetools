@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import httpx
 
@@ -23,7 +23,10 @@ TIERS: dict[str, tuple[Limit, Limit]] = {
 
 
 class KlaviyoClient:
-    def __init__(self, api_key: Secret, *, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self, api_key: Secret, *, transport: httpx.BaseTransport | None = None,
+        warn: Callable[[str], None] | None = None,
+    ) -> None:
         self._http = HttpClient(
             BASE_URL,
             headers={
@@ -33,6 +36,7 @@ class KlaviyoClient:
                 "content-type": "application/vnd.api+json",
             },
             transport=transport,
+            **({"warn": warn} if warn else {}),
         )
         self._limiters: dict[str, RateLimiter] = {}
 

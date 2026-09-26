@@ -28,6 +28,7 @@ from typing import Any
 
 from migtool.klaviyo.imports import Importer
 from migtool.klaviyo.writes import MIGRATED_FROM, finite_number, identity, property_column, typed_value
+from migtool.output import parse_iso
 
 CONSENT = "Email Marketing Consent"
 CONSENT_TIMESTAMP = "Email Marketing Consent Timestamp"
@@ -180,19 +181,34 @@ def usable(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[tuple
     return keep, skipped
 
 
+def load_snapshot(path: Path) -> set[str]:
+    """Emails (lowercased) and phone numbers in a pre-migration `profiles export`
+    of the destination: the profiles that existed before the migration."""
+    found: set[str] = set()
+    csv.field_size_limit(1 << 30)
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            if (row.get("email") or "").strip():
+                found.add(row["email"].strip().lower())
+            if (row.get("phone_number") or "").strip():
+                found.add(row["phone_number"].strip())
+    return found
+
+
 def plan(
     role: Role, rows: list[dict[str, str]], types: dict[str, str], run_id: str,
     existing: Callable[[list[str], list[str]], set[str]],
-    migrated: Callable[[list[str]], set[str]] = lambda emails: set(),
+    us_snapshot: set[str] | None = None,
 ) -> Plan:
     """Parse every row and look up which profiles exist (a read), so the
     confirmation shows exactly what will happen. `existing(emails, phones)`
-    returns the identities that already have a profile; `migrated(emails)`
-    those whose profile this migration created (tagged `migrated_from=ca`).
+    returns the identities that already have a profile.
 
-    For `suppress`, "existing" means an existing *US* profile: a profile the
-    migration created on an earlier run is handled as new again, so re-running
-    02 never puts CA-only profiles on the Updated US Profiles list."""
+    For `suppress`, "existing" means a *US* profile, taken from `us_snapshot`
+    (the pre-migration US export), never from the live account. A profile an
+    earlier or partly failed run created (including one the suppression call
+    itself created) is still CA-only, so re-running 02 never puts it on the
+    Updated US Profiles list."""
     result = Plan(role)
     kept, result.skipped = usable(rows)
     parsed = []
@@ -206,9 +222,12 @@ def plan(
             result.unreadable.append((identity(row), str(exc)))
     emails = [r["email"] for r, _ in parsed if r["email"]]
     phones = [r["phone_number"] for r, _ in parsed if not r["email"]]
-    result.existing = existing(emails, phones) if (emails or phones) else set()
-    if role.name == "suppress" and result.existing:
-        result.existing -= migrated(sorted(e for e in result.existing if "@" in e))
+    if role.name == "suppress":
+        if us_snapshot is None:
+            raise ValueError("role suppress needs the pre-migration US snapshot")
+        result.existing = {identity(r) for r, _ in parsed if identity(r) in us_snapshot}
+    else:
+        result.existing = existing(emails, phones) if (emails or phones) else set()
     for row, instruction in parsed:
         present = identity(row) in result.existing
         if not role.creates and not present:
@@ -258,29 +277,33 @@ def run(imp: Importer, p: Plan, *, join_list: str | None, subscribe_list: str | 
 # --- Checking an import (read-only) -----------------------------------------------
 
 CHECK_COLUMNS = ["identity", "problems"]
+PROFILE_FIELDS = "email,phone_number,first_name,last_name,organization,title,locale,image,location,subscriptions,properties"
 
 
 def list_members(client, list_id: str) -> set[str]:
-    """Identities (email, or phone for phone-only profiles) on a list."""
+    """Profile IDs on a list (compared by ID, so it doesn't matter whether a
+    row is identified by email or phone)."""
     found: set[str] = set()
-    params = {"fields[profile]": "email,phone_number", "page[size]": "100"}
-    for page in client.paginate(f"/lists/{list_id}/profiles/", tier="L", params=params):
-        for p in page["data"]:
-            found.add(identity(p["attributes"]))
+    for page in client.paginate(f"/lists/{list_id}/profiles/", tier="L",
+                                params={"fields[profile]": "email", "page[size]": "100"}):
+        found.update(p["id"] for p in page["data"])
     return found
 
 
 def fetch_profiles(client, emails: list[str], phones: list[str]) -> dict[str, dict[str, Any]]:
-    """Identity → profile attributes (with subscriptions and properties)."""
+    """The row identity (the email or phone it was *looked up by*) → profile
+    attributes, with the profile ID under `_id`. A phone-only row that matches
+    a profile which also has an email is still found under its phone."""
     out: dict[str, dict[str, Any]] = {}
     for field_name, values in (("email", sorted(set(emails))), ("phone_number", sorted(set(phones)))):
         for i in range(0, len(values), 100):
             listed = ",".join(json.dumps(v) for v in values[i:i + 100])
             params = {"filter": f"any({field_name},[{listed}])", "additional-fields[profile]": "subscriptions",
-                      "fields[profile]": "email,phone_number,subscriptions,properties", "page[size]": "100"}
+                      "fields[profile]": PROFILE_FIELDS, "page[size]": "100"}
             for page in client.paginate("/profiles/", tier="L", params=params):
                 for p in page["data"]:
-                    out[identity(p["attributes"])] = p["attributes"]
+                    key = (p["attributes"].get(field_name) or "")
+                    out[key.lower() if field_name == "email" else key] = {**p["attributes"], "_id": p["id"]}
     return out
 
 
@@ -288,47 +311,94 @@ def _marketing(attrs: dict[str, Any]) -> dict[str, Any]:
     return ((attrs.get("subscriptions") or {}).get("email") or {}).get("marketing") or {}
 
 
+def _same(expected: Any, actual: Any) -> bool:
+    """Equal, treating 3 and 3.0 as the same number (Klaviyo may return either)."""
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return expected is actual
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return abs(expected - actual) <= 1e-9 * max(1.0, abs(expected))
+    return expected == actual
+
+
+def _field_problems(sent: dict[str, Any], attrs: dict[str, Any]) -> list[str]:
+    """Every field and property the import sends, compared with what's stored.
+    The migration tags are checked separately (run IDs differ between runs)."""
+    found = []
+    for key, value in sent.items():
+        if key in ("email", "phone_number", "properties", "location"):
+            continue
+        if not _same(value, attrs.get(key)):
+            found.append(f"{key} is {attrs.get(key)!r}, expected {value!r}")
+    stored_location = attrs.get("location") or {}
+    for key, value in (sent.get("location") or {}).items():
+        if not _same(value, stored_location.get(key)):
+            found.append(f"location.{key} is {stored_location.get(key)!r}, expected {value!r}")
+    stored = attrs.get("properties") or {}
+    for key, value in (sent.get("properties") or {}).items():
+        if key in ("migrated_from", "migration_run_id"):
+            continue
+        if not _same(value, stored.get(key)):
+            found.append(f"property {key} is {stored.get(key)!r}, expected {value!r}")
+    return found
+
+
+def _strong_suppressions(attrs: dict[str, Any]) -> list[str]:
+    return [s.get("reason") for s in _marketing(attrs).get("suppression") or [] if s.get("reason") != "UNSUBSCRIBE"]
+
+
 def problems(
-    role: Role, row: dict[str, str], attrs: dict[str, Any] | None,
-    join: set[str] | None, subscribe: set[str] | None,
+    role: Role, row: dict[str, str], attrs: dict[str, Any] | None, *,
+    types: dict[str, str], us_profile: bool, join: set[str] | None, subscribe: set[str] | None,
 ) -> list[str]:
-    """What's wrong with one imported row, per its role's rules (empty if nothing)."""
-    who = identity(row)
+    """Everything that differs between what one row's import should have
+    produced and what's stored. `us_profile`: for `suppress`, whether the row
+    is an existing US profile (from the snapshot). Empty means it landed."""
     if attrs is None:
         return ["no profile"]
     found: list[str] = []
     props = attrs.get("properties") or {}
-    tagged = props.get("migrated_from") == MIGRATED_FROM
-    if row.get(HOLD):
-        want = parse_bool(row[HOLD])
-        if props.get(HOLD) is not want:
-            found.append(f"migration_hold is {props.get(HOLD)!r}, expected {want}")
-    if role.tags and role.name != "suppress" and not tagged:
+    pid = attrs.get("_id")
+    # The fields and properties this role sends.
+    found += _field_problems(payload(row, types, {}, only_hold=role.only_hold), attrs)
+    # Migration tags: every tagged role, except existing US profiles in 02.
+    if role.tags and not (role.name == "suppress" and us_profile) and props.get("migrated_from") != MIGRATED_FROM:
         found.append("missing migrated_from=ca tag")
-    if role.name == "suppress":
-        reasons = [s.get("reason") for s in _marketing(attrs).get("suppression") or []]
-        if not any(r and r != "UNSUBSCRIBE" for r in reasons):
-            found.append(f"not suppressed (suppressions: {reasons or 'none'})")
-        if join is not None and not tagged and who not in join:
-            found.append("existing US profile not on the join list")
-    elif role.join_list and join is not None and who not in join:
-        found.append("not on the join list")
+    # List membership.
+    if role.join_list and join is not None and not (role.name == "suppress" and not us_profile):
+        if pid not in join:
+            found.append("not on the join list")
+    # Suppression: rows carrying a CA suppression (02, 03d) must be suppressed.
+    reason = (row.get("ca_suppression_reason") or "").strip().upper()
+    if role.name == "suppress" or (reason and reason != "UNSUBSCRIBE"):
+        if not _strong_suppressions(attrs):
+            found.append(f"not suppressed (expected {reason or 'a suppression'})")
+    # Consent.
     if role.consent:
         instruction = consent_instruction(row)
-        consent = _marketing(attrs).get("consent")
+        m = _marketing(attrs)
         if instruction == "SUBSCRIBED":
-            if consent != "SUBSCRIBED":
-                found.append(f"consent is {consent}, expected SUBSCRIBED")
-            if subscribe is not None and who not in subscribe:
+            if m.get("consent") != "SUBSCRIBED":
+                found.append(f"consent is {m.get('consent')}, expected SUBSCRIBED")
+            if _strong_suppressions(attrs):
+                found.append(f"subscribed but still suppressed ({', '.join(_strong_suppressions(attrs))}): "
+                             "won't receive email")
+            if subscribe is not None and pid not in subscribe:
                 found.append("not on the subscribe list")
-        elif instruction == "UNSUBSCRIBED" and consent != "UNSUBSCRIBED":
-            found.append(f"consent is {consent}, expected UNSUBSCRIBED")
+            # A profile the migration creates (role new) must carry the file's
+            # original date. An existing subscriber (role kept) keeps whatever
+            # date it already had, earlier or later, so there's nothing to check.
+            want, got = consent_timestamp(row), m.get("consent_timestamp")
+            if role.name == "new" and want:
+                if not got or parse_iso(got).replace(microsecond=0) != parse_iso(want).replace(microsecond=0):
+                    found.append(f"consent_timestamp is {got}, expected {want}")
+        elif instruction == "UNSUBSCRIBED" and m.get("consent") != "UNSUBSCRIBED":
+            found.append(f"consent is {m.get('consent')}, expected UNSUBSCRIBED")
     return found
 
 
 def check(
-    client, role: Role, rows: list[dict[str, str]], *, join_list: str | None, subscribe_list: str | None,
-    progress: Callable[[str], None] = lambda _: None,
+    client, role: Role, rows: list[dict[str, str]], *, types: dict[str, str], us_snapshot: set[str] | None,
+    join_list: str | None, subscribe_list: str | None, progress: Callable[[str], None] = lambda _: None,
 ) -> tuple[dict[str, int], list[dict[str, str]], list[tuple[str, str]]]:
     """Check every usable row against its role's rules. Returns (counts, mismatch
     rows for the CSV, skipped rows). Read-only."""
@@ -347,13 +417,15 @@ def check(
     mismatches: list[dict[str, str]] = []
     for row in kept:
         counts["checked"] += 1
+        who = identity(row)
         try:
-            found = problems(role, row, profiles.get(identity(row)), join, subscribe)
+            found = problems(role, row, profiles.get(who), types=types,
+                             us_profile=bool(us_snapshot and who in us_snapshot), join=join, subscribe=subscribe)
         except ValueError as exc:
             found = [f"unreadable row: {exc}"]
         if found:
             counts["mismatched"] += 1
-            mismatches.append({"identity": identity(row), "problems": "; ".join(found)})
+            mismatches.append({"identity": who, "problems": "; ".join(found)})
         else:
             counts["ok"] += 1
     return counts, mismatches, skipped
