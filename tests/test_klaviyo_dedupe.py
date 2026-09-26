@@ -330,6 +330,10 @@ def test_values_compare_type_for_type_all_the_way_down():
     assert not same({"vip": True}, {"vip": 1}) and not same([1, True], [1, 1])
     assert same({"a": [1, {"b": "x"}]}, {"a": [1.0, {"b": "x"}]})
     assert not same("1", 1) and not same(None, "")
+    # No rounding allowance for ordinary values; coordinates only.
+    assert not same(1000000000, 1000000000.5)
+    assert not same(9007199254740993, 9007199254740992.0)
+    assert not same(43.6532, 43.65320000001) and same(43.6532, 43.65320000001, tolerance=True)
 
 
 def test_phone_sent_with_an_email_is_checked():

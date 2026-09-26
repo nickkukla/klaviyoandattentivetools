@@ -311,15 +311,16 @@ def _marketing(attrs: dict[str, Any]) -> dict[str, Any]:
     return ((attrs.get("subscriptions") or {}).get("email") or {}).get("marketing") or {}
 
 
-def _same(expected: Any, actual: Any) -> bool:
-    """Equal, type for type, all the way down. The one allowance: 3 and 3.0 are
-    the same number when one side is a float (Klaviyo may return either)."""
+def _same(expected: Any, actual: Any, *, tolerance: bool = False) -> bool:
+    """Equal, type for type, all the way down. Numbers compare exactly by value,
+    so 3 and 3.0 match (Klaviyo may return either) but nothing else does.
+    `tolerance` allows float rounding, for coordinates only."""
     if isinstance(expected, bool) or isinstance(actual, bool):
         return expected is actual
-    if isinstance(expected, int) and isinstance(actual, int):
-        return expected == actual
     if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-        return abs(expected - actual) <= 1e-9 * max(1.0, abs(expected))
+        if tolerance:
+            return abs(expected - actual) <= 1e-9 * max(1.0, abs(expected))
+        return expected == actual
     if isinstance(expected, list) and isinstance(actual, list):
         return len(expected) == len(actual) and all(_same(e, a) for e, a in zip(expected, actual))
     if isinstance(expected, dict) and isinstance(actual, dict):
@@ -345,7 +346,7 @@ def _field_problems(sent: dict[str, Any], attrs: dict[str, Any]) -> list[str]:
         # sent (None when they contradict the country), whatever the import says.
         if key == "timezone" and ("latitude" in sent_location or "longitude" in sent_location):
             continue
-        if not _same(value, stored_location.get(key)):
+        if not _same(value, stored_location.get(key), tolerance=key in ("latitude", "longitude")):
             found.append(f"location.{key} is {stored_location.get(key)!r}, expected {value!r}")
     stored = attrs.get("properties") or {}
     for key, value in (sent.get("properties") or {}).items():

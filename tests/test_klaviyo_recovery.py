@@ -50,11 +50,12 @@ def test_finished_jobs_are_recorded_and_looked_up_once(tmp_path, monkeypatch, kl
         {"id": "S1", "kind": "profile-suppression-bulk-create-jobs", "run_id": "R2", "size": 5}])
     j1 = respx.get(f"{API}/profile-bulk-import-jobs/J1/").mock(return_value=httpx.Response(200, json={"data": {
         "id": "J1", "attributes": {"status": "complete"}}}))
-    respx.get(f"{API}/profile-bulk-import-jobs/J2/").mock(return_value=httpx.Response(404))
+    j2 = respx.get(f"{API}/profile-bulk-import-jobs/J2/").mock(return_value=httpx.Response(404))
     assert lists_add().exit_code == 0
     assert added == [[{"email": "a@example.com"}]]
     saved = {j["id"]: j.get("status") for j in json.loads((state / "jobs.json").read_text())}
     # Suppression jobs aren't gated: their status isn't reliable.
     assert saved == {"J1": "complete", "J2": "not found", "S1": None}
     assert lists_add().exit_code == 0
-    assert j1.call_count == 1
+    # Neither the finished nor the expired job is looked up again.
+    assert j1.call_count == 1 and j2.call_count == 1
