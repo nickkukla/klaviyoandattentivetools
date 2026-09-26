@@ -69,9 +69,10 @@ class KlaviyoClient:
                 return
             page = self.get(nxt, tier=tier)
 
-    def post(self, path: str, body: dict, *, tier: str = "M") -> dict:
-        """Send a write. Returns the JSON body, or {} for a 202 with no body."""
-        response = self._http.post(path, json=body, limiter=self._limiter(tier))
+    def post(self, path: str, body: dict, *, tier: str = "M", retry_writes: bool = True) -> dict:
+        """Send a write. Returns the JSON body, or {} for a 202 with no body.
+        `retry_writes=False` for a write that isn't safe to repeat (see HttpClient.request)."""
+        response = self._http.post(path, json=body, limiter=self._limiter(tier), retry_writes=retry_writes)
         return response.json() if response.content else {}
 
     def account(self) -> dict:

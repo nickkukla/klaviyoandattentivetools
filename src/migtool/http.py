@@ -155,18 +155,31 @@ class HttpClient:
                 "so this write may be applied twice, and the first copy may land after later steps."
             )
 
+    def _warn_uncertain_write(self, method: str, url: str, why: str) -> None:
+        # The last attempt failed in a way that may have reached Klaviyo: the
+        # write may still be applied, so it's reported and recorded like a retry.
+        if method != "GET":
+            self._warn(
+                f"Warning: {method} {url} {why} and wasn't retried. Klaviyo may have accepted it, "
+                "so it may still be applied, possibly after later steps."
+            )
+
     def backoff(self, attempt: int) -> float:
         """Wait before retry number `attempt` (1-based) when the service gives no Retry-After."""
         return min(self._backoff_max, self._backoff_base * 2 ** (attempt - 1))
 
     def request(
-        self, method: str, url: str, *, cost: float = 1, limiter: RateLimiter | None = None, **kwargs
+        self, method: str, url: str, *, cost: float = 1, limiter: RateLimiter | None = None,
+        retry_writes: bool = True, **kwargs
     ) -> httpx.Response:
         """Send a request, retrying 429, 5xx and connection failures.
 
         `limiter` overrides the client's default limiter for this request, for
-        services whose limits differ per endpoint. Raises ApiError for any other
-        4xx, or once all attempts are used.
+        services whose limits differ per endpoint. With `retry_writes` False, a
+        write that may have reached the service (a 5xx, or a failure after the
+        connection opened) isn't retried: for writes that aren't safe to repeat,
+        such as creating a list. Raises ApiError for any other 4xx, or once all
+        attempts are used.
         """
         limiter = limiter or self._limiter
         for attempt in range(1, self._max_attempts + 1):
@@ -176,16 +189,24 @@ class HttpClient:
             try:
                 response = self._client.request(method, url, **kwargs)
             except httpx.TransportError as exc:
-                if last:
-                    raise ApiError(method, url, None, f"{type(exc).__name__}: {exc}") from exc
                 # A connection that never opened didn't send anything; any
                 # other failure may have happened after the request arrived.
-                if not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                arrived = not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+                if last or (arrived and not retry_writes):
+                    if arrived:
+                        self._warn_uncertain_write(method, url, f"failed with {type(exc).__name__}")
+                    raise ApiError(method, url, None, f"{type(exc).__name__}: {exc}") from exc
+                if arrived:
                     self._warn_retrying_write(method, url, f"failed with {type(exc).__name__}")
                 self._sleep(self.backoff(attempt))
                 continue
-            if _is_retryable(response.status_code) and not last:
-                if response.status_code >= 500:
+            if _is_retryable(response.status_code):
+                server_error = response.status_code >= 500
+                if last or (server_error and not retry_writes):
+                    if server_error:
+                        self._warn_uncertain_write(method, url, f"got {response.status_code}")
+                    raise ApiError(method, str(response.url), response.status_code, response.text)
+                if server_error:
                     self._warn_retrying_write(method, url, f"got {response.status_code}")
                 wait = retry_after_seconds(response)
                 self._sleep(self.backoff(attempt) if wait is None else wait)

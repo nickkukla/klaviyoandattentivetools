@@ -63,6 +63,13 @@ class StateStore:
     # Writes retried after an ambiguous failure (a lost response or server
     # error): Klaviyo may also apply the first attempt, possibly after later
     # steps. Kept until the user confirms things have settled.
+    def update_jobs(self, instance: str, updates: dict[str, dict[str, Any]]) -> None:
+        """Apply `{job_id: fields}` to saved jobs in one write."""
+        jobs = self.jobs(instance)
+        for job in jobs:
+            job.update(updates.get(job["id"], {}))
+        write_json_atomic(self._jobs_path(instance), jobs)
+
     def _ambiguous_path(self, instance: str) -> Path:
         return self.base / instance / "ambiguous_writes.json"
 

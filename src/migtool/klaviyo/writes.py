@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from migtool.http import ApiError
+from migtool.klaviyo import groups
 from migtool.klaviyo.client import KlaviyoClient
 
 IMPORT_BATCH = 1000  # profiles per bulk import job (limit 10,000 and 5 MB)
@@ -208,6 +209,10 @@ class Job:
         return self.status in ("complete", "cancelled", "failed")
 
 
+class ListCreateUncertain(RuntimeError):
+    """A list create failed in a way that may or may not have created it."""
+
+
 class Writer:
     """Bulk write calls against one Klaviyo account."""
 
@@ -388,9 +393,22 @@ class Writer:
         return Job("profile-suppression-bulk-create-jobs", data["id"], len(emails), data["attributes"], list(emails))
 
     def create_list(self, name: str) -> str:
-        """Create an empty list and return its ID."""
-        return self.client.post("/lists/", {"data": {"type": "list", "attributes": {"name": name}}},
-                                tier="M")["data"]["id"]
+        """Create an empty list and return its ID. Creating isn't safe to repeat
+        (a retry after a lost response makes a second list), so it isn't
+        retried: after an uncertain failure, the list is looked up by name."""
+        try:
+            return self.client.post("/lists/", {"data": {"type": "list", "attributes": {"name": name}}},
+                                    tier="M", retry_writes=False)["data"]["id"]
+        except ApiError as exc:
+            if exc.status is not None and exc.status < 500:
+                raise
+            found = groups.lists_named(self.client, name)
+            if len(found) == 1:
+                return found[0]
+            raise ListCreateUncertain(
+                f"Creating list '{name}' failed ({exc.detail}), and {len(found)} lists with that name exist now. "
+                "Check the lists in Klaviyo (a new one can take a minute to appear), then re-run with --to-list."
+            ) from exc
 
     def existing_emails(self, emails: Iterable[str]) -> set[str]:
         """Which of `emails` already have a profile (compared lowercased)."""

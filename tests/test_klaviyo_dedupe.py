@@ -323,6 +323,25 @@ def test_timezone_is_only_checked_when_klaviyo_does_not_recalculate_it():
     assert problems("new", row, attrs, join={"P1"}) == ["location.timezone is None, expected 'America/Toronto'"]
 
 
+def test_values_compare_type_for_type_all_the_way_down():
+    same = dedupe._same
+    assert same(3, 3.0) and same(12.5, 12.5)
+    assert not same(2**53, 2**53 + 1)
+    assert not same({"vip": True}, {"vip": 1}) and not same([1, True], [1, 1])
+    assert same({"a": [1, {"b": "x"}]}, {"a": [1.0, {"b": "x"}]})
+    assert not same("1", 1) and not same(None, "")
+
+
+def test_phone_sent_with_an_email_is_checked():
+    row = {"email": "a@x.com", "phone_number": "+14165550100"}
+    base = dict(join={"P1"})
+    assert problems("new", row, stored(phone_number="+14165550100", props={"migrated_from": "ca"}), **base) == []
+    assert problems("new", row, stored(phone_number=None, props={"migrated_from": "ca"}), **base) == [
+        "phone_number is None, expected '+14165550100'"]
+    # A phone-only row is looked up by that phone, so it isn't compared again.
+    assert problems("new", {"phone_number": "+14165550100"}, stored(props={"migrated_from": "ca"}), **base) == []
+
+
 def test_subscribe_date_rules():
     new_row = {"email": "a@x.com", "Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2022-05-05T05:00:00Z"}
     ok = stored("SUBSCRIBED", ts="2022-05-05T05:00:00+00:00", props={"migrated_from": "ca"})

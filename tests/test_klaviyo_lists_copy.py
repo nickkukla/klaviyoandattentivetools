@@ -93,3 +93,36 @@ def test_copy_needs_exactly_one_destination(args, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = run(*args)
     assert result.exit_code != 0
+
+
+@respx.mock
+def test_copy_end_to_end_recovers_a_lost_create_response(tmp_path, monkeypatch, klaviyo_account):
+    """The real writer against mocked HTTP: the create's response is lost, so
+    it isn't retried; the list is found by name and the members go there."""
+    klaviyo_account("T2aEdf")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    respx.get(f"{API}/lists/L1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "L1", "type": "list", "attributes": {"name": 'VIP "Canada"'}}}))
+    respx.get(f"{API}/lists/L1/profiles/").mock(return_value=httpx.Response(200, json=page([
+        {"id": "p1", "attributes": {"email": "a@example.com", "joined_group_at": None}}])))
+    named = respx.get(f"{API}/lists/").mock(side_effect=[
+        httpx.Response(200, json=page([])),
+        httpx.Response(200, json=page([{"id": "NEW", "attributes": {"name": 'VIP "Canada"'}}])),
+    ])
+    create = respx.post(f"{API}/lists/").mock(return_value=httpx.Response(504))
+    respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json=page([
+        {"id": "u1", "attributes": {"email": "a@example.com", "phone_number": None}}])))
+    job = respx.post(f"{API}/profile-bulk-import-jobs/").mock(return_value=httpx.Response(202, json={"data": {
+        "id": "J1", "attributes": {"status": "queued"}}}))
+    respx.get(f"{API}/profile-bulk-import-jobs/J1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "J1", "attributes": {"status": "complete", "completed_count": 1, "failed_count": 0}}}))
+    result = run("--create")
+    assert result.exit_code == 0, result.output
+    assert create.call_count == 1  # not retried
+    assert parse_qs(urlparse(str(named.calls[0].request.url)).query)["filter"] == ['equals(name,"VIP \\"Canada\\"")']
+    body = json.loads(job.calls.last.request.content)["data"]
+    assert body["relationships"]["lists"]["data"] == [{"type": "list", "id": "NEW"}]
+    assert [p["attributes"] for p in body["attributes"]["profiles"]["data"]] == [{"email": "a@example.com"}]
+    # The uncertain create is recorded, so the next write waits for confirmation.
+    assert len(json.loads((tmp_path / "state/klaviyo_sandbox/ambiguous_writes.json").read_text())) == 1
