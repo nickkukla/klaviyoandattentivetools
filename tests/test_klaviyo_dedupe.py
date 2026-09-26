@@ -312,6 +312,17 @@ def test_subscribed_but_still_suppressed_is_flagged():
         "subscribed but still suppressed (USER_SUPPRESSED): won't receive email"]
 
 
+def test_timezone_is_only_checked_when_klaviyo_does_not_recalculate_it():
+    # With coordinates, Klaviyo sets the timezone from them (None when they
+    # contradict the country), so only the coordinates are compared.
+    row = {"email": "a@x.com", "location_city": "Ottawa", "location_latitude": "45.3", "location_timezone": "America/Toronto"}
+    attrs = stored(location={"city": "Ottawa", "latitude": 45.3, "timezone": "America/Montreal"}, props={"migrated_from": "ca"})
+    assert problems("new", row, attrs, join={"P1"}) == []
+    row = {"email": "a@x.com", "location_city": "Ottawa", "location_timezone": "America/Toronto"}
+    attrs = stored(location={"city": "Ottawa", "timezone": None}, props={"migrated_from": "ca"})
+    assert problems("new", row, attrs, join={"P1"}) == ["location.timezone is None, expected 'America/Toronto'"]
+
+
 def test_subscribe_date_rules():
     new_row = {"email": "a@x.com", "Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2022-05-05T05:00:00Z"}
     ok = stored("SUBSCRIBED", ts="2022-05-05T05:00:00+00:00", props={"migrated_from": "ca"})

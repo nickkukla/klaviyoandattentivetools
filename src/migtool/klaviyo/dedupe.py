@@ -330,7 +330,12 @@ def _field_problems(sent: dict[str, Any], attrs: dict[str, Any]) -> list[str]:
         if not _same(value, attrs.get(key)):
             found.append(f"{key} is {attrs.get(key)!r}, expected {value!r}")
     stored_location = attrs.get("location") or {}
-    for key, value in (sent.get("location") or {}).items():
+    sent_location = sent.get("location") or {}
+    for key, value in sent_location.items():
+        # Klaviyo recalculates the timezone from the coordinates when they're
+        # sent (None when they contradict the country), whatever the import says.
+        if key == "timezone" and ("latitude" in sent_location or "longitude" in sent_location):
+            continue
         if not _same(value, stored_location.get(key)):
             found.append(f"location.{key} is {stored_location.get(key)!r}, expected {value!r}")
     stored = attrs.get("properties") or {}

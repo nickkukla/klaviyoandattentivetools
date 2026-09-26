@@ -46,7 +46,7 @@ Migration tags are `migrated_from=ca` and `migration_run_id` (one per run, in th
 
 ## Order and commands
 
-Before starting, **confirm that every destination flow excludes `migration_hold = true`** (all flows are gated on profile triggers for CA members). Give the `klaviyo_us` key write scopes.
+Before starting, **confirm that every destination flow excludes `migration_hold = true`** (all flows are gated on profile triggers for CA members). **As of 2026-09-26 none is:** a read-only check of all 24 live and manual US flows found no `migration_hold` anywhere in their definitions (filters, triggers or steps), and no segment uses it. No flow triggers on the three migration lists. The two "Welcome Series - APRIL 2024" flows trigger on list Xz4KGg, and Placed Order, fulfillment, shipping, cart and winback flows could fire for CA customers during the Shopify order migration. Give the `klaviyo_us` key write scopes.
 
 ```
 T=exports/mainrun/klaviyo_ca/profiles/20260925T151451Z.csv
@@ -75,7 +75,7 @@ uv run migtool klaviyo dedupe check --instance klaviyo_us --role suppress --file
 uv run migtool klaviyo dedupe check --instance klaviyo_us --role kept     --file $D/04b_kept_unsubscribed.csv --join-list Sc9zHg
 ```
 
-The check takes the same role and options as the import and compares every field and property the import sent, plus tags, lists (by profile ID), consent (and, for `new`, the original subscription date) and suppression. 03d rows must be suppressed, so check 03d after 02's suppressions have applied. A clean check ends `mismatched 0`. Otherwise `<run>.mismatches.csv` lists each row that's off and why. An import's own summary counts what Klaviyo *accepted*. The check confirms what actually *landed*.
+The check takes the same role and options as the import and compares every field and property the import sent, plus tags, lists (by profile ID), consent (and, for `new`, the original subscription date) and suppression. It skips `location.timezone` when the row also sends coordinates: Klaviyo recalculates the timezone from them (see the scale rehearsal below). 03d rows must be suppressed, so check 03d after 02's suppressions have applied. A clean check ends `mismatched 0`. Otherwise `<run>.mismatches.csv` lists each row that's off and why. An import's own summary counts what Klaviyo *accepted*. The check confirms what actually *landed*.
 
 Each run first works out a plan and shows it before asking for confirmation: rows to send, how many already exist and how many are new, rows skipped or unreadable, the lists by name, and the subscribe and unsubscribe counts. Update-only roles (`hold`, `kept`) skip any row with no existing profile, rather than create a stub, and list it in `<run>.skipped.csv`. For 05, run it last: the profiles 03 and 01b create only exist once those imports are done.
 
@@ -129,6 +129,27 @@ The first 10 rows of each real file were imported into three pilot lists in the 
 
 1. **Already-subscribed profiles.** Klaviyo refuses a historical subscribe dated **after** a profile's existing, earlier subscription ("backdated consent date … is after current subscription date"). That hit 1 of 10 in 03a and 5 of 10 in 04a. On the real run it would affect most of 04a: about 16,466 of 16,935 are already subscribed in US, and CA won because its date is later. The tool now treats that refusal as **already subscribed**: it adds the profile to `--subscribe-list` with a list-only import, keeping its existing subscription date and consent, and counts it under `steps.subscribe_list_only` rather than as an error. On the re-run, all 20 of 03a's and 04a's pilot rows were on the pilot newsletter list, with 0 failures. Any other subscribe refusal is still an error.
 2. **Re-running 02.** On a second run, profiles 02 had created were "existing", so they were handled as US profiles and joined Updated US Profiles. Now an existing profile counts as a US profile only if it isn't tagged `migrated_from=ca`. A re-run of the pilot showed "6 existing, 4 new", the same as the first run.
+
+## Pilot on current `main` (2026-09-26, `klaviyo_sandbox` only)
+
+The same real-data pilot again on `main` at PR #16: the first 10 rows of each file, plus the 02 rows for 03d's first 10 (so 03d's "must be suppressed" check applies), and the 90 05 rows for every pilot identity. Files, scripts and logs are in `exports/dedupe_trial/pilot2/`. Every import had 0 failures. `dedupe check` on every file:
+
+- **ok:** 01b 10/10, 02 20/20, 03b 10/10, 03c 10/10, 03d 10/10 (suppressed), 04a 10/10, and 05 79/79 of the profiles that exist in the dev account.
+- **"no profile":** 7 in 01, 4 in 04b and those 11 in 05. They aren't in the dev account, so the update-only imports skipped them. In US they exist.
+- **Subscription date:** 4 in 03a. These customers were already subscribed in the dev account, and Klaviyo keeps an existing subscriber's own date. None of the four is in the US export, so in US they're created fresh with the original date.
+
+## Scale rehearsal (2026-09-26, `klaviyo_sandbox` only)
+
+Rows 11 to 2,010 of 03b and of 03c (648 of them phone-only) were imported into the pilot Migrated list. Files and logs are in `exports/dedupe_trial/scale/`.
+
+| File | Import | Check | Result |
+|---|---|---|---|
+| 03b (2,000, unsubscribe) | 31 s | 24 s | 2,000 ok |
+| 03c (2,000, 1,555 existing, 445 new) | 16 s | 19 s | 2,000 ok |
+
+That is about 65 to 125 rows a second for an import and about 100 for a check, so the full set (about 590,000 rows, 290,705 of them in 05) should take a few hours, plus the check time.
+
+The first check flagged 48 rows (1.2%), all on `location.timezone`. **Klaviyo recalculates the timezone from the coordinates** whenever latitude or longitude is sent, whatever timezone the import says. Ottawa and Montreal coordinates become `America/Montreal`, and coordinates that contradict the country (for example Kuala Lumpur or Honolulu for "Canada") give none. All 48 had coordinates, and all 1,893 rows that sent a timezone without coordinates kept it. The check now skips the timezone when coordinates were sent, and it reran with 0 mismatches.
 
 ## Keep these files out of Excel
 
