@@ -100,7 +100,7 @@ Two limits on "safe to repeat":
 The main-run exports rounded consent times to whole seconds, and ties go to US. With full precision (read back for the 171 overlapping profiles whose CA and US times shared a second):
 - 98: US's change was later (US correctly won); 2 were exact ties (US by rule).
 - 69: CA's change was later, but both sides are never subscribed and suppressed at the same time, so US wins by rule anyway and they're already suppressed (01 is right).
-- **2**: both unsubscribed, and CA's change was later by a fraction of a second, so under the rules **CA wins: they belong in 04b** rather than 01. Their consent doesn't change (already unsubscribed); the difference is `market=CA`, the tags and audit fields, and the Updated US Profiles list. Their emails are in `exports/mainrun/tie_flips_to_ca.json`.
+- **2**: both unsubscribed, and CA's change was later by a fraction of a second, so under the rules **CA wins: they belong in 04b** rather than 01. Their consent doesn't change (already unsubscribed); the difference is `market=CA`, the tags and audit fields, and the Updated US Profiles list. They are dustidiane@gmail.com (CA later by 0.056 s) and jenniferhabelito@yahoo.com (0.609 s), both in `exports/mainrun/tie_flips_to_ca.json`. **Decision (2026-09-26): they stay in 01.** A sub-second gap is one unsubscribe reaching both accounts, not a later CA decision.
 
 Exports now keep fractions of a second, so the catch-up dedupe won't have this issue.
 
