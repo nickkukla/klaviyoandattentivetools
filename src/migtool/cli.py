@@ -520,8 +520,9 @@ def lists_copy(
     to_list: str | None = typer.Option(None, "--to-list", help="ID of an existing list to add the members to."),
     create: bool = typer.Option(False, "--create", help="Create the destination list instead."),
     name: str | None = typer.Option(
-        None, "--name", help="Name of the list --create makes (default: the source list's name)."
+        None, "--name", help="Name of the list --create makes (default: the source list's name plus --suffix)."
     ),
+    suffix: str = typer.Option(" (CA)", "--suffix", help="Added to the source list's name when --name isn't given."),
     limit: int | None = LIMIT,
     yes: bool = YES,
     allow_write_to_source: bool = ALLOW_SOURCE,
@@ -563,7 +564,7 @@ def lists_copy(
             dest_name = _list_name(client, to_list)
             typer.echo(f"Add to:          {dest_name} ({to_list})")
         else:
-            dest_name = name or source_name
+            dest_name = name or f"{source_name}{suffix}"
             if groups.lists_named(client, dest_name):
                 raise ConfigError(f"{to} already has a list named '{dest_name}'. Use --to-list with its ID, "
                                   "or --name for a different name.")
