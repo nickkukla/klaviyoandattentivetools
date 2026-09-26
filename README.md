@@ -53,7 +53,7 @@ Run the tests with `uv run pytest`. They use recorded responses and never call a
 
 ## How writes are protected
 
-Every write command (`profiles import`, `suppressions import`, `lists add`):
+Every write command (`profiles import`, `suppressions import`, `lists add`, `lists copy`):
 
 1. names its target with `--to <instance>`;
 2. prints the account name and ID, the instance and the number of records, and asks you to type the instance name to confirm (`--yes` skips this, for scripted runs);
@@ -343,6 +343,32 @@ uv run migtool klaviyo lists add --to klaviyo_sandbox --list Td8hfk --file vip_m
 uv run migtool klaviyo lists add --to klaviyo_ca --list XyZ789 --file members.csv --allow-write-to-source   # never needed for the migration
 ```
 
+### `migtool klaviyo lists copy`
+
+Copies one list's members into a list on another instance, in one step. It reads the source list (read-only), writes its members' emails to `exports/<from>/lists-copy/<run>.members.csv`, then adds them exactly as `lists add` does, to an existing list (`--to-list`) or to one it creates (`--create`, named like the source list unless `--name` is given).
+
+- Members are added by email only, so existing profiles get no field, property or consent change. Nobody is subscribed.
+- Members with no email (phone-only) are skipped and counted.
+- An email with no profile at the destination is created, with the migration tags.
+- `--create` refuses a name the destination already uses, and creates the list only after you confirm.
+- Adding people to a list starts any flow triggered by "Added to List" for it. Check before copying into an existing list.
+
+| Flag | |
+|---|---|
+| `--from` (required) | Instance to read the list from |
+| `--list` (required) | ID of the list to copy |
+| `--to` (required) | Instance to write to |
+| `--to-list` | ID of an existing destination list |
+| `--create` | Create the destination list instead (give exactly one of `--to-list` and `--create`) |
+| `--name` | Name for the list `--create` makes |
+| `--limit`, `--yes`, `--allow-write-to-source`, `--retries-settled` | As for `lists add` |
+
+```
+uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --create
+uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --create --name "VIP (from CA)"
+uv run migtool klaviyo lists copy --from klaviyo_ca --list AbC123 --to klaviyo_us --to-list XyZ789
+```
+
 Klaviyo segments can't have members added directly. To mirror a segment, add its members to a list and build the segment on membership of that list.
 
 ### `migtool klaviyo segments export`
@@ -420,7 +446,7 @@ The full order, with the reasons, is in `docs/BUILD_PLAN.md`. In short:
    uv run migtool klaviyo profiles import --to klaviyo_us --file ca_unique.csv --list-id <LOF Canada Newsletter ID>
    ```
 2. **Suppressions.** Export from `klaviyo_ca` and edit the file to choose which to apply. Pilot one address with `--limit 1`, then run `suppressions check` on it until it shows `suppressed` (hours, in the sandbox). Then import the rest and check them the same way. If the pilot never applies, import with `--as-unsubscribe` and suppress in the Klaviyo UI.
-3. **Lists and segments.** Export both from `klaviyo_ca`. Attach chosen sets of profiles to US lists with `lists add` or through the Klaviyo UI. Clone segments in the UI.
+3. **Lists and segments.** Export both from `klaviyo_ca`. Copy a whole list with `lists copy`, attach chosen sets of profiles to US lists with `lists add`, or use the Klaviyo UI. Clone segments in the UI.
 4. **Back in Stock.** `bis export` from `klaviyo_ca`, prepare the file (above), including removing unsubscribed and never-subscribed people, and upload it in the US store's STOQ admin.
 5. **Catch-up run.** Do this immediately before sign-ups are turned off on the CA Klaviyo site (next section).
 6. **Delete local data** (below), keeping `exports/og_exports/`.
