@@ -38,7 +38,7 @@ class Secret:
 @dataclass(frozen=True)
 class Instance:
     name: str
-    service: str  # "klaviyo"
+    service: str  # "klaviyo" or "shopify"
     env_var: str
     account_id: str  # the Klaviyo account this instance's key must belong to
 
@@ -54,6 +54,10 @@ INSTANCES: dict[str, Instance] = {
         Instance("klaviyo_ca", "klaviyo", "KLAVIYO_CA_API_KEY", "Ka6Lvr"),
         Instance("klaviyo_us", "klaviyo", "KLAVIYO_US_API_KEY", "KF4XLe"),
         Instance("klaviyo_sandbox", "klaviyo", "KLAVIYO_SANDBOX_API_KEY", "T2aEdf"),
+        # Shopify: read-only Admin API tokens. The store domain comes from
+        # SHOPIFY_<US|CA>_SHOP, and the token must belong to that store.
+        Instance("shopify_us", "shopify", "SHOPIFY_US_ACCESS_TOKEN", ""),
+        Instance("shopify_ca", "shopify", "SHOPIFY_CA_ACCESS_TOKEN", ""),
     )
 }
 
@@ -94,4 +98,27 @@ def check_account(inst: Instance, account_id: str) -> None:
         raise ConfigError(
             f"{inst.env_var} belongs to Klaviyo account {account_id}, but '{inst.name}' must be "
             f"account {inst.account_id}. Check which key is in which .env variable."
+        )
+
+
+def shopify_shop(inst: Instance, environ: Mapping[str, str] | None = None) -> str:
+    """The `*.myshopify.com` domain of a Shopify instance, from SHOPIFY_<US|CA>_SHOP."""
+    env = os.environ if environ is None else environ
+    var = inst.env_var.replace("_ACCESS_TOKEN", "_SHOP")
+    shop = env.get(var, "").strip().lower().removeprefix("https://").rstrip("/")
+    if not shop.endswith(".myshopify.com"):
+        raise ConfigError(f"{var} must be the store's *.myshopify.com domain (needed for instance '{inst.name}').")
+    others = [env.get(i.env_var.replace("_ACCESS_TOKEN", "_SHOP"), "").strip().lower()
+              for i in INSTANCES.values() if i.service == "shopify" and i.name != inst.name]
+    if shop in others:
+        raise ConfigError(f"{var} is the same store as another Shopify instance. Check the .env values.")
+    return shop
+
+
+def check_shop(inst: Instance, expected: str, actual: str) -> None:
+    """Stop unless the token belongs to the store this instance is configured for."""
+    if actual.lower() != expected.lower():
+        raise ConfigError(
+            f"{inst.env_var} belongs to Shopify store {actual}, but '{inst.name}' is {expected}. "
+            "Check which token is in which .env variable."
         )
