@@ -9,7 +9,9 @@ from pathlib import Path
 
 import typer
 
-from migtool.config import INSTANCES, ConfigError, check_account, credential, get_instance, load_env
+from migtool.config import (
+    INSTANCES, ConfigError, check_account, check_shop, credential, get_instance, load_env, shopify_shop,
+)
 from migtool.http import ApiError
 from migtool.klaviyo import bis, dedupe, groups, imports, profiles, segments, suppressions
 from migtool.klaviyo.client import KlaviyoClient
@@ -27,12 +29,15 @@ from migtool.output import (
 )
 from migtool.runlog import RunLog
 from migtool.safety import WriteRefused, confirm_write
+from migtool.shopify.client import ShopifyError
 from migtool.state import StateStore
 
 # Locals are hidden in tracebacks so a crash can't print a key.
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
 klaviyo_app = typer.Typer(no_args_is_help=True, help="Klaviyo exports and imports.")
 app.add_typer(klaviyo_app, name="klaviyo")
+shopify_app = typer.Typer(no_args_is_help=True, help="Shopify, read-only: customers and their marketing consent.")
+app.add_typer(shopify_app, name="shopify")
 profiles_app = typer.Typer(no_args_is_help=True, help="Profiles.")
 lists_app = typer.Typer(no_args_is_help=True, help="Lists and their members.")
 segments_app = typer.Typer(no_args_is_help=True, help="Segments and their members.")
@@ -854,6 +859,77 @@ def dedupe_check(
         raise typer.Exit(1)
 
 
+
+def _shopify(instance: str):
+    """A read-only client for `instance`, after checking the token belongs to its store."""
+    from migtool.shopify.client import ShopifyClient
+
+    inst = get_instance(instance, "shopify")
+    shop = shopify_shop(inst)
+    client = ShopifyClient(shop, credential(inst))
+    try:
+        info = client.shop_info()
+        check_shop(inst, shop, info["domain"])
+    except BaseException:
+        client.close()
+        raise
+    return client, info
+
+
+@shopify_app.command("whoami")
+def shopify_whoami(instance: str = typer.Option(..., "--instance", help="Shopify instance to check.")) -> None:
+    """Show the store a token belongs to and the scopes it was granted."""
+    client, info = _shopify(instance)
+    client.close()
+    typer.echo(f"{instance}: {info['name']} ({info['domain']})")
+    typer.echo(f"scopes: {', '.join(info['scopes']) or 'none'}")
+    writes = [s for s in info["scopes"] if s.startswith("write_")]
+    if writes:
+        typer.echo(f"Note: the token also has write scopes ({', '.join(writes)}); this tool only reads.")
+
+
+@shopify_app.command("customers")
+def shopify_customers(
+    instance: str = typer.Option(..., "--instance", help="Shopify instance to read."),
+    email: list[str] = typer.Option([], "--email", help="An email to look up (repeatable)."),
+    file: Path | None = typer.Option(None, "--file", exists=True, dir_okay=False, help="CSV with an email column."),
+    compare: str | None = typer.Option(None, "--compare", help="Klaviyo instance to compare consent with."),
+) -> None:
+    """Look customers up by email: marketing consent, tags, orders, and optionally the Klaviyo profile."""
+    from migtool.shopify import customers as sc
+
+    emails = [e.strip().lower() for e in email if e.strip()]
+    if file:
+        _, rows = imports.read_rows(file)
+        emails += [r["email"].strip().lower() for r in rows if (r.get("email") or "").strip()]
+    emails = sorted(set(emails))
+    if not emails:
+        raise typer.BadParameter("give --email or --file.", param_hint="--email")
+    client, info = _shopify(instance)
+    with client:
+        found = sc.customers_by_email(client, emails)
+    profiles = {}
+    if compare:
+        with _client(compare) as kc:
+            profiles = sc.klaviyo_profiles(kc, emails)
+    run = new_run(instance, "customers")
+    path = run.path(".csv")
+    writer = CsvWriter(path, sc.COLUMNS)
+    counts: dict[str, int] = {}
+    for e in emails:
+        r = sc.row(e, found.get(e), profiles.get(e) if compare else None)
+        if not compare:
+            r["match"] = "" if e in found else "no Shopify customer"
+        counts[r["match"] or "found"] = counts.get(r["match"] or "found", 0) + 1
+        writer.write(r)
+    writer.close()
+    write_manifest(run, files={path.name: writer.count}, counts=counts,
+                   extra={"store": info["domain"], "compared_with": compare, "source_file": str(file) if file else None})
+    typer.echo(f"{len(emails):,} emails, {len(found):,} Shopify customers found")
+    for k, v in sorted(counts.items()):
+        typer.echo(f"  {k}: {v:,}")
+    typer.echo(f"Wrote {path}")
+
 def main() -> None:
     """Console entry point: turns expected errors into a message and an exit code."""
     try:
@@ -863,4 +939,7 @@ def main() -> None:
         sys.exit(2)
     except ApiError as exc:
         typer.echo(f"API error: {exc}", err=True)
+        sys.exit(1)
+    except ShopifyError as exc:
+        typer.echo(f"Shopify error: {exc}", err=True)
         sys.exit(1)

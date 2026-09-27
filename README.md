@@ -42,6 +42,8 @@ Run every command from the repository root, since `.env` and the `exports/` and 
 | `klaviyo_ca` | `KLAVIYO_CA_API_KEY` | `Ka6Lvr`, Left On Friday Canada (source) | Read only: `accounts:read`, `profiles:read`, `lists:read`, `segments:read`, `metrics:read`, `events:read` |
 | `klaviyo_us` | `KLAVIYO_US_API_KEY` | `KF4XLe`, Left On Friday (destination) | The read scopes, plus `profiles:write`, `subscriptions:write`, `lists:write`. **Keep it read-only until the migration run.** |
 | `klaviyo_sandbox` | `KLAVIYO_SANDBOX_API_KEY` | `T2aEdf`, Left In Friday Dev (test account) | Read and write scopes as for `klaviyo_us` |
+| `shopify_us` | `SHOPIFY_US_ACCESS_TOKEN`, with the store in `SHOPIFY_US_SHOP` | The US store's `*.myshopify.com` domain | Read only: `read_customers`, `read_orders` |
+| `shopify_ca` | `SHOPIFY_CA_ACCESS_TOKEN`, with the store in `SHOPIFY_CA_SHOP` | The CA store's `*.myshopify.com` domain | Read only: `read_customers`, `read_orders` |
 
 Keys never appear in output, logs or error messages. Check a key before using it:
 
@@ -434,6 +436,34 @@ Reads "Subscribed to Back in Stock" events and writes:
 ```
 uv run migtool klaviyo bis export --instance klaviyo_ca
 uv run migtool klaviyo bis export --instance klaviyo_ca --since 2026-10-01
+```
+
+## Shopify (read-only)
+
+The Shopify commands only read. The client refuses to send a GraphQL mutation, even if the token would allow one. Every command first checks that the token belongs to the store in `SHOPIFY_<US|CA>_SHOP`, so a CA token under the US name is stopped.
+
+### `migtool shopify whoami`
+
+Shows the store a token belongs to and the scopes it was granted, and notes any write scopes.
+
+```
+uv run migtool shopify whoami --instance shopify_us
+```
+
+### `migtool shopify customers`
+
+Looks customers up by email and writes `exports/<instance>/customers/<run>.csv`: Shopify's email and SMS marketing state, opt-in level, when consent last changed, tags, order count and country. With `--compare <klaviyo instance>`, each row also has the Klaviyo profile's consent, suppression, `Accepts Marketing` and `migration_hold`, and a `match` column: `same`, `same (Klaviyo suppressed)`, `Shopify yes / Klaviyo no`, `Shopify no / Klaviyo yes`, `no Shopify customer` or `no Klaviyo profile`. The summary counts each.
+
+| Flag | |
+|---|---|
+| `--instance` (required) | Shopify instance to read |
+| `--email` | An email to look up (repeatable) |
+| `--file` | A CSV with an `email` column (for example a dedupe file) |
+| `--compare` | Klaviyo instance to compare with |
+
+```
+uv run migtool shopify customers --instance shopify_us --file pilot.csv --compare klaviyo_us
+uv run migtool shopify customers --instance shopify_us --email a@example.com --email b@example.com
 ```
 
 ## STOQ: preparing and uploading the Back in Stock file
