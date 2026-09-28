@@ -50,6 +50,8 @@ klaviyo_app.add_typer(segments_app, name="segments")
 klaviyo_app.add_typer(suppressions_app, name="suppressions")
 klaviyo_app.add_typer(bis_app, name="bis")
 klaviyo_app.add_typer(dedupe_app, name="dedupe")
+events_app = typer.Typer(no_args_is_help=True, help="Custom events (re-send a flow's trigger).")
+klaviyo_app.add_typer(events_app, name="events")
 
 INSTANCE = typer.Option(..., "--instance", help="Klaviyo instance to export from.")
 SINCE = typer.Option(
@@ -859,6 +861,70 @@ def dedupe_check(
         raise typer.Exit(1)
 
 
+
+
+@events_app.command("resend")
+def events_resend(
+    to: str = TO,
+    file: Path = FILE,
+    metric: str = typer.Option(..., "--metric", help="Name of the custom metric to send (the resend flow's trigger)."),
+    send_to: str | None = typer.Option(None, "--send-to", help="Send every event to this email instead (for tests)."),
+    limit: int | None = LIMIT,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
+) -> None:
+    """Re-send orders' Shopify Placed Order data as a custom event, to trigger a resend flow.
+
+    The file needs `email` (the customer) and `order_id` or `order_name`. Each
+    event is an exact copy of the order's Placed Order properties, sent to the
+    customer's profile (or `--send-to`). Repeats are dropped by Klaviyo."""
+    from migtool.klaviyo import events
+
+    inst = get_instance(to, "klaviyo")
+    _gate_unsettled(inst, retries_settled)
+    try:
+        _, rows = imports.read_rows(file, limit=limit)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    run = new_run(inst.name, "events-resend")
+    client, account = _connect(inst)
+    with client:
+        _gate_pending_jobs(client, inst)
+        try:
+            mid = events.source_metric_id(client)
+        except LookupError as exc:
+            raise ConfigError(str(exc)) from exc
+        p = events.plan(client, rows, metric_id=mid, send_to=send_to)
+        typer.echo(f"File:            {file} ({len(rows):,} rows)")
+        typer.echo(f"Metric:          {metric}")
+        typer.echo(f"Ready:           {len(p.ready):,}; not sendable: {len(p.items) - len(p.ready):,}")
+        if send_to:
+            typer.echo(f"Send to:         {send_to} (test: not the customers)")
+        for it in p.items:
+            typer.echo(f"  {it.order:>16}  {it.customer:40} -> {it.recipient}  {it.problem or 'ok'}")
+        confirm_write(inst, account=f"{account['name']} ({account['id']})", record_count=len(p.ready),
+                      yes=yes, allow_write_to_source=allow_write_to_source)
+        log = RunLog(run)
+        log.read(len(rows))
+        for it in p.items:
+            if it.problem:
+                log.error(it.customer or "?", it.problem, stage="plan")
+        now = iso(utc_now())
+        for it in p.ready:
+            try:
+                events.send(client, events.event_body(it, metric=metric, time=now))
+                log.written()
+            except ApiError as exc:
+                log.error(it.customer, f"refused by Klaviyo: {exc.detail}", stage="send")
+    write_manifest(run, files={}, counts=dict(log.counts),
+                   extra={"source_file": str(file), "metric": metric, "send_to": send_to, "account": account["id"],
+                          "orders": [{"order": it.order, "customer": it.customer, "recipient": it.recipient,
+                                      "source_event": it.event["id"] if it.event else None, "problem": it.problem}
+                                     for it in p.items]})
+    code = log.finish()
+    if code:
+        raise typer.Exit(code)
 
 def _shopify(instance: str):
     """A read-only client for `instance`, after checking the token belongs to its store."""
