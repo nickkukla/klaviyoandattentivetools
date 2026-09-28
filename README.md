@@ -438,6 +438,28 @@ uv run migtool klaviyo bis export --instance klaviyo_ca
 uv run migtool klaviyo bis export --instance klaviyo_ca --since 2026-10-01
 ```
 
+### `migtool klaviyo events resend`
+
+Re-sends orders' Shopify **Placed Order** data as a custom event, to trigger a flow for orders whose original flow email was blocked (for example by `migration_hold`). Each event is an exact copy of the order's Placed Order properties, `$extra` included, so a copy of the Order Confirmation email renders as it would have. It is sent to the customer's profile, or with `--send-to` to a test address.
+
+- The file needs `email` (the customer) and `order_id` or `order_name`. Rows whose order isn't found on that profile are reported and not sent.
+- Klaviyo creates the metric the first time it receives the event, and a flow can only use it as a trigger after that. So send a test to yourself first, then build the flow on the new metric.
+- Each event has a fixed `unique_id` per order and recipient, so running it again doesn't send twice.
+- It needs the `events:write` scope.
+
+| Flag | |
+|---|---|
+| `--to` (required) | Instance to write to |
+| `--file` (required) | CSV with `email` and `order_id` or `order_name` |
+| `--metric` (required) | Name of the custom metric (the resend flow's trigger) |
+| `--send-to` | Send every event to this email instead (tests) |
+| `--limit`, `--yes`, `--allow-write-to-source`, `--retries-settled` | As for `lists add` |
+
+```
+uv run migtool klaviyo events resend --to klaviyo_us --file held_orders.csv --metric "Order Confirmation – Resend" --send-to me@example.com
+uv run migtool klaviyo events resend --to klaviyo_us --file held_orders.csv --metric "Order Confirmation – Resend"
+```
+
 ## Shopify (read-only)
 
 The Shopify commands only read. The client refuses to send a GraphQL mutation, even if the token would allow one. Every command first checks that the token belongs to the store in `SHOPIFY_<US|CA>_SHOP`, so a CA token under the US name is stopped.
