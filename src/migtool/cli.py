@@ -516,13 +516,14 @@ def lists_add(
     existing_only: bool = typer.Option(
         False, "--existing-only", help="Only add profiles that already exist at the destination; skip the rest."
     ),
+    source: str = typer.Option("ca", "--source", help="The migrated_from tag for profiles this creates."),
 ) -> None:
     """Add every profile in the file to one list, by email or (phone-only rows) phone number; writes
     consent only if the file has consent columns."""
 
     def body(imp, rows, columns, run):
         return {"created": imports.lists_add(imp, rows, columns, list_id=list_id, run_id=run.run_id,
-                                             existing_only=existing_only)}
+                                             existing_only=existing_only, source=source)}
 
     _write_run(to, "lists-add", "add", file, limit, yes, allow_write_to_source, body, {"list_id": list_id},
                retries_settled=retries_settled, phones=True)
@@ -612,9 +613,11 @@ def _copy_group(
         # Re-running would take a new snapshot and miss anyone who has left the
         # source since. Finish this one from its saved file instead.
         if extra["list_id"]:
+            options = (f" --limit {limit}" if limit else "") + (" --existing-only" if existing_only else "")
+            if _provenance(from_) != "ca":
+                options += f" --source {_provenance(from_)}"
             typer.echo(f"To finish this copy from the same snapshot: uv run migtool klaviyo lists add --to {to} "
-                       f"--list {extra['list_id']} --file {members_path}"
-                       + (" --existing-only" if existing_only else ""))
+                       f"--list {extra['list_id']} --file {members_path}{options}")
         raise
 
 
@@ -902,29 +905,55 @@ def events_resend(
         if send_to:
             typer.echo(f"Send to:         {send_to} (test: not the customers)")
         for it in p.items:
-            typer.echo(f"  {it.order:>16}  {it.customer:40} -> {it.recipient}  {it.problem or 'ok'}")
+            matched = (f"order {events.order_name(it.event)} (id {events.order_id(it.event)}, placed "
+                       f"{it.event['attributes'].get('datetime', '')[:19]})") if it.event else it.problem
+            typer.echo(f"  {it.order:>16}  {it.customer:40} -> {it.recipient}  {matched}")
         confirm_write(inst, account=f"{account['name']} ({account['id']})", record_count=len(p.ready),
                       yes=yes, allow_write_to_source=allow_write_to_source)
-        log = RunLog(run)
+        log = RunLog(run, written_label="submitted")
         log.read(len(rows))
+        results = {id(it): ("not sent: " + it.problem) if it.problem else "not attempted" for it in p.items}
         for it in p.items:
             if it.problem:
-                log.error(it.customer or "?", it.problem, stage="plan")
+                log.error(f"{it.order} ({it.customer or '?'})", it.problem, stage="plan")
         now = iso(utc_now())
-        for it in p.ready:
-            try:
-                events.send(client, events.event_body(it, metric=metric, time=now))
-                log.written()
-            except ApiError as exc:
-                log.error(it.customer, f"refused by Klaviyo: {exc.detail}", stage="send")
-    write_manifest(run, files={}, counts=dict(log.counts),
-                   extra={"source_file": str(file), "metric": metric, "send_to": send_to, "account": account["id"],
-                          "orders": [{"order": it.order, "customer": it.customer, "recipient": it.recipient,
-                                      "source_event": it.event["id"] if it.event else None, "problem": it.problem}
-                                     for it in p.items]})
+        aborted = None
+        try:
+            for it in p.ready:
+                try:
+                    events.send(client, events.event_body(it, metric=metric, time=now))
+                    results[id(it)] = "submitted"
+                    log.written()
+                except ApiError as exc:
+                    results[id(it)] = f"refused: {exc.detail}"
+                    log.error(f"{it.order} ({it.customer})", f"refused by Klaviyo: {exc.detail}", stage="send")
+        except KeyboardInterrupt:
+            aborted = "interrupted"
+            log.error("run", "stopped: interrupted; rows marked 'not attempted' weren't sent", stage="aborted")
+        finally:
+            path = run.path(".results.csv")
+            writer = CsvWriter(path, ["order", "customer", "recipient", "metric", "source_event", "matched_order_id",
+                                      "matched_order_name", "unique_id", "outcome"])
+            for it in p.items:
+                writer.write({
+                    "order": it.order, "customer": it.customer, "recipient": it.recipient, "metric": metric,
+                    "source_event": it.event["id"] if it.event else "",
+                    "matched_order_id": events.order_id(it.event) if it.event else "",
+                    "matched_order_name": events.order_name(it.event) if it.event else "",
+                    "unique_id": (events.event_body(it, metric=metric, time=now)["data"]["attributes"]["unique_id"]
+                                  if it.event else ""),
+                    "outcome": results[id(it)]})
+            writer.close()
+            status = aborted or ("complete" if not log.counts["failed"] else "completed with errors")
+            write_manifest(run, files={path.name: writer.count}, counts=dict(log.counts), status=status,
+                           extra={"source_file": str(file), "metric": metric, "send_to": send_to,
+                                  "account": account["id"]})
+    typer.echo(f"Results per order: {path}")
     code = log.finish()
-    if code:
-        raise typer.Exit(code)
+    if code or aborted:
+        raise typer.Exit(code or 130)
+
+
 
 def _shopify(instance: str):
     """A read-only client for `instance`, after checking the token belongs to its store."""
@@ -955,33 +984,73 @@ def shopify_whoami(instance: str = typer.Option(..., "--instance", help="Shopify
 
 
 @shopify_app.command("customers-export")
-def shopify_customers_export(instance: str = typer.Option(..., "--instance", help="Shopify instance to read.")) -> None:
-    """Export every customer with their marketing consent, via a read-only bulk export."""
+def shopify_customers_export(
+    instance: str = typer.Option(..., "--instance", help="Shopify instance to read."),
+    fresh: bool = typer.Option(False, "--fresh", help="Start a new bulk export even if a recent one can be reused."),
+) -> None:
+    """Export every customer with their marketing consent, via a read-only bulk export.
+
+    The export's Shopify ID is saved as soon as it starts, so an interrupted
+    run continues the same export. A matching export from the last 24 hours
+    (running or finished) is reused unless --fresh is given."""
     import json as _json
+    from datetime import timedelta
 
     import httpx
 
     from migtool.shopify import customers as sc
+    from migtool.shopify.client import _same_query
 
+    store = StateStore()
+    key = "shopify-customers-bulk"
     client, info = _shopify(instance)
     with client:
-        url = client.bulk_export(sc.BULK_QUERY, progress=typer.echo)
+        op = None
+        saved = store.load_checkpoint(instance, key)
+        if saved and not fresh:
+            op = client.bulk_operation(saved["id"])
+            if op["status"] not in ("CREATED", "RUNNING", "COMPLETED"):
+                op = None
+            else:
+                typer.echo(f"Continuing bulk export {op['id']} ({op['status'].lower()}).")
+        if op is None and not fresh:
+            cutoff = iso(utc_now() - timedelta(hours=24))
+            recent = [o for o in client.recent_bulk_queries() if _same_query(o.get("query"), sc.BULK_QUERY)
+                      and o["status"] in ("CREATED", "RUNNING", "COMPLETED") and (o.get("createdAt") or "") >= cutoff]
+            if recent:
+                op = recent[0]
+                typer.echo(f"Reusing bulk export {op['id']} from {op['createdAt']} ({op['status'].lower()}); "
+                           "--fresh starts a new one.")
+        if op is None:
+            op = {"id": client.start_bulk_export(sc.BULK_QUERY)}
+            typer.echo(f"Started bulk export {op['id']}.")
+        store.save_checkpoint(instance, key, {"id": op["id"], "store": info["domain"]})
+        op = client.wait_bulk(op["id"], progress=typer.echo)
     run = new_run(instance, "customers-export")
     path = run.path(".csv")
-    writer = CsvWriter(path, sc.EXPORT_COLUMNS)
+    part = path.with_name(path.name + ".part")
+    writer = CsvWriter(part, sc.EXPORT_COLUMNS)
     counts = {"customers": 0, "with_email": 0}
-    if url:
-        with httpx.stream("GET", url, timeout=300) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line.strip():
-                    continue
-                row = sc.export_row(_json.loads(line))
-                writer.write(row)
-                counts["customers"] += 1
-                counts["with_email"] += bool(row["email"])
-    writer.close()
-    write_manifest(run, files={path.name: writer.count}, counts=counts, extra={"store": info["domain"]})
+    try:
+        if op.get("url"):
+            with httpx.stream("GET", op["url"], timeout=300) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line.strip():
+                        continue
+                    row = sc.export_row(_json.loads(line))
+                    writer.write(row)
+                    counts["customers"] += 1
+                    counts["with_email"] += bool(row["email"])
+    finally:
+        writer.close()
+    if counts["customers"] != int(op.get("objectCount") or 0):
+        raise ShopifyError(f"Downloaded {counts['customers']:,} customers but the export has "
+                           f"{int(op.get('objectCount') or 0):,}; the partial file is {part}. Re-run to try again.")
+    part.rename(path)
+    store.clear_checkpoint(instance, key)
+    write_manifest(run, files={path.name: writer.count}, counts=counts,
+                   extra={"store": info["domain"], "bulk_operation": op["id"], "exported_at": op.get("createdAt")})
     typer.echo(f"Exported {counts['customers']:,} customers ({counts['with_email']:,} with an email) to {path}")
 
 

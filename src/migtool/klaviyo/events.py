@@ -42,10 +42,19 @@ def source_metric_id(client: KlaviyoClient, name: str = SOURCE_METRIC[0], integr
     raise LookupError(f"No '{name}' metric from {integration} in this account.")
 
 
-def _order_keys(event: dict[str, Any]) -> set[str]:
+def order_id(event: dict[str, Any]) -> str:
     p = event["attributes"]["event_properties"]
-    extra = p.get("$extra") or {}
-    return {str(v) for v in (p.get("$event_id"), extra.get("id"), extra.get("name"), extra.get("order_number")) if v}
+    return str((p.get("$extra") or {}).get("id") or p.get("$event_id") or "")
+
+
+def order_name(event: dict[str, Any]) -> str:
+    return str((event["attributes"]["event_properties"].get("$extra") or {}).get("name") or "")
+
+
+def _matches(event: dict[str, Any], want_id: str, want_name: str) -> bool:
+    """Every identifier the row gives must match this order (ID and name are
+    compared separately, so a stale name can't pick another order)."""
+    return (not want_id or order_id(event) == want_id) and (not want_name or order_name(event) == want_name)
 
 
 def plan(client: KlaviyoClient, rows: list[dict[str, str]], *, metric_id: str, send_to: str | None) -> Plan:
@@ -64,17 +73,17 @@ def plan(client: KlaviyoClient, rows: list[dict[str, str]], *, metric_id: str, s
         if not profiles:
             item.problem = "no Klaviyo profile"
             continue
-        wanted = {order, row.get("order_name", "").strip(), row.get("order_id", "").strip()} - {""}
+        want_id, want_name = (row.get("order_id") or "").strip(), (row.get("order_name") or "").strip()
         params = {"filter": f'equals(profile_id,"{profiles[0]["id"]}"),equals(metric_id,"{metric_id}")'}
-        for page in client.paginate("/events/", tier="L", params=params):
-            for ev in page["data"]:
-                if _order_keys(ev) & wanted:
-                    item.event = ev
-                    break
-            if item.event:
-                break
-        if not item.event:
-            item.problem = f"no Placed Order event for {order} on that profile"
+        found = [ev for page in client.paginate("/events/", tier="L", params=params)
+                 for ev in page["data"] if _matches(ev, want_id, want_name)]
+        if len({ev["id"] for ev in found}) > 1:
+            item.problem = f"{len(found)} Placed Order events match {order}; resolve it by hand"
+        elif not found:
+            item.problem = (f"no Placed Order event with id {want_id or '(any)'} and name {want_name or '(any)'} "
+                            "on that profile")
+        else:
+            item.event = found[0]
     return out
 
 
@@ -84,7 +93,7 @@ def event_body(item: Resend, *, metric: str, time: str) -> dict[str, Any]:
     props["resent_from_event_id"] = item.event["id"]
     props["resent_from_time"] = source.get("datetime")
     # One resend per order and recipient: Klaviyo drops a repeat with the same unique_id.
-    unique = f"resend-{props.get('$event_id') or item.event['id']}"
+    unique = f"resend-{order_id(item.event) or item.event['id']}"
     if item.recipient != item.customer:
         unique += f"-to-{item.recipient}"
     props.pop("$event_id", None)

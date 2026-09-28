@@ -212,7 +212,7 @@ def test_segment_copy_end_to_end(job_status, tmp_path, monkeypatch, klaviyo_acco
     else:
         assert result.exit_code != 0
         assert (f"To finish this copy from the same snapshot: uv run migtool klaviyo lists add --to klaviyo_sandbox "
-                f"--list NEW --file {snapshot.relative_to(tmp_path)}") in result.output
+                f"--list NEW --file {snapshot.relative_to(tmp_path)} --source sandbox") in result.output
 
 
 @respx.mock
@@ -245,3 +245,21 @@ def test_segment_copy_existing_only_end_to_end(tmp_path, monkeypatch, klaviyo_ac
     assert list(csv.DictReader(skipped.open())) == [
         {"email": "new@example.com", "reason": "no profile at the destination (--existing-only)"}]
     assert "written 1, skipped 1, failed 0" in result.output
+
+
+@respx.mock
+def test_recovery_command_keeps_the_limit(tmp_path, monkeypatch, klaviyo_account):
+    klaviyo_account("T2aEdf")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    respx.get(f"{API}/segments/S1/").mock(return_value=httpx.Response(200, json={"data": {
+        "id": "S1", "attributes": {"name": "Seg"}}}))
+    respx.get(f"{API}/segments/S1/profiles/").mock(return_value=httpx.Response(200, json=page([
+        {"id": f"p{i}", "attributes": {"email": f"m{i}@x.com", "phone_number": None}} for i in range(5)])))
+    respx.get(f"{API}/lists/").mock(return_value=httpx.Response(200, json=page([])))
+    respx.post(f"{API}/lists/").mock(return_value=httpx.Response(201, json={"data": {"id": "NEW"}}))
+    monkeypatch.setattr(imports, "lists_add", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    result = CliRunner().invoke(app, ["klaviyo", "segments", "copy", "--from", "klaviyo_sandbox", "--segment", "S1",
+                                      "--to", "klaviyo_sandbox", "--create", "--limit", "2", "--yes"])
+    assert result.exit_code != 0
+    assert "--limit 2 --source sandbox" in result.output
