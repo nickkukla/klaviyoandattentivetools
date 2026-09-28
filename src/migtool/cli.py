@@ -954,6 +954,37 @@ def shopify_whoami(instance: str = typer.Option(..., "--instance", help="Shopify
         typer.echo(f"Note: the token also has write scopes ({', '.join(writes)}); this tool only reads.")
 
 
+@shopify_app.command("customers-export")
+def shopify_customers_export(instance: str = typer.Option(..., "--instance", help="Shopify instance to read.")) -> None:
+    """Export every customer with their marketing consent, via a read-only bulk export."""
+    import json as _json
+
+    import httpx
+
+    from migtool.shopify import customers as sc
+
+    client, info = _shopify(instance)
+    with client:
+        url = client.bulk_export(sc.BULK_QUERY, progress=typer.echo)
+    run = new_run(instance, "customers-export")
+    path = run.path(".csv")
+    writer = CsvWriter(path, sc.EXPORT_COLUMNS)
+    counts = {"customers": 0, "with_email": 0}
+    if url:
+        with httpx.stream("GET", url, timeout=300) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.strip():
+                    continue
+                row = sc.export_row(_json.loads(line))
+                writer.write(row)
+                counts["customers"] += 1
+                counts["with_email"] += bool(row["email"])
+    writer.close()
+    write_manifest(run, files={path.name: writer.count}, counts=counts, extra={"store": info["domain"]})
+    typer.echo(f"Exported {counts['customers']:,} customers ({counts['with_email']:,} with an email) to {path}")
+
+
 @shopify_app.command("customers")
 def shopify_customers(
     instance: str = typer.Option(..., "--instance", help="Shopify instance to read."),

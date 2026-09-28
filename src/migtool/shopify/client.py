@@ -2,7 +2,8 @@
 
 Every request is a GraphQL query; a document containing a mutation is refused
 before anything is sent, so the tool can't change a store even with a token
-that allows it. Shopify rate-limits GraphQL by query cost and reports it in the
+that allows it. The one exception is starting a bulk export
+(`bulkOperationRunQuery`), which only reads, sent from `bulk_export` alone. Shopify rate-limits GraphQL by query cost and reports it in the
 response (`THROTTLED`), so throttled queries wait for the bucket to refill.
 """
 
@@ -20,6 +21,13 @@ from migtool.http import HttpClient
 
 API_VERSION = "2026-07"
 MUTATION = re.compile(r"\bmutation\b")
+
+
+BULK_START = """mutation($q: String!) {
+  bulkOperationRunQuery(query: $q) { bulkOperation { id status } userErrors { field message } }
+}"""
+BULK_STATUS = """query($id: ID!) { node(id: $id) { ... on BulkOperation {
+  id status errorCode objectCount url } } }"""
 
 
 class ShopifyError(Exception):
@@ -54,6 +62,37 @@ class ShopifyClient:
                 raise ShopifyError("; ".join(e.get("message", str(e)) for e in errors))
             return body["data"]
         raise ShopifyError("Still throttled after retrying; try again later.")
+
+    def bulk_export(self, inner_query: str, *, poll_seconds: float = 10, timeout: float = 4 * 3600,
+                    progress: Callable[[str], None] = lambda _: None) -> str | None:
+        """Run a read-only bulk export of `inner_query` and return the URL of its
+        JSONL result (None when there's nothing). Starting one takes the
+        `bulkOperationRunQuery` mutation: the only mutation this client sends,
+        and only from here, with a query that must itself contain no mutation."""
+        if MUTATION.search(inner_query):
+            raise ValueError("A bulk export query can't contain a mutation.")
+        running = self.query("query { currentBulkOperation { id status } }")["currentBulkOperation"]
+        if running and running["status"] in ("CREATED", "RUNNING"):
+            raise ShopifyError(f"Another bulk operation ({running['id']}) is still running; try again when it finishes.")
+        body = self._http.post("/graphql.json", json={"query": BULK_START, "variables": {"q": inner_query}}).json()
+        if body.get("errors"):
+            raise ShopifyError("; ".join(e.get("message", str(e)) for e in body["errors"]))
+        started = body["data"]["bulkOperationRunQuery"]
+        if started["userErrors"]:
+            raise ShopifyError("; ".join(e["message"] for e in started["userErrors"]))
+        op_id = started["bulkOperation"]["id"]
+        waited = 0.0
+        while True:
+            op = self.query(BULK_STATUS, {"id": op_id})["node"]
+            progress(f"  bulk export {op['status'].lower()}: {int(op.get('objectCount') or 0):,} objects")
+            if op["status"] == "COMPLETED":
+                return op.get("url")
+            if op["status"] in ("FAILED", "CANCELED", "EXPIRED"):
+                raise ShopifyError(f"Bulk export {op['status'].lower()}: {op.get('errorCode')}")
+            if waited >= timeout:
+                raise ShopifyError(f"Bulk export still {op['status'].lower()} after {int(timeout)}s ({op_id}).")
+            self._sleep(poll_seconds)
+            waited += poll_seconds
 
     def shop_info(self) -> dict[str, Any]:
         data = self.query("""query { shop { name myshopifyDomain }
