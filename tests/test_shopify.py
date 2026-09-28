@@ -65,10 +65,13 @@ def test_shop_config_and_guard():
     us, ca = INSTANCES["shopify_us"], INSTANCES["shopify_ca"]
     env = {"SHOPIFY_US_SHOP": "https://LOF-US.myshopify.com/", "SHOPIFY_CA_SHOP": "lof-ca.myshopify.com"}
     assert shopify_shop(us, env) == SHOP
-    with pytest.raises(ConfigError, match="myshopify.com"):
-        shopify_shop(us, {"SHOPIFY_US_SHOP": "leftonfriday.com"})
+    for bad in ("leftonfriday.com", "outside.invalid/path.myshopify.com", "user@lof-us.myshopify.com",
+                "lof-us.myshopify.com:8443", "lof-us.myshopify.com/admin", "http://lof-us.myshopify.com",
+                "lof-us.myshopify.com?x=1", "evil.com#.myshopify.com", ""):
+        with pytest.raises(ConfigError, match="myshopify.com"):
+            shopify_shop(us, {"SHOPIFY_US_SHOP": bad})
     with pytest.raises(ConfigError, match="same store"):
-        shopify_shop(ca, {"SHOPIFY_US_SHOP": SHOP, "SHOPIFY_CA_SHOP": SHOP})
+        shopify_shop(ca, {"SHOPIFY_US_SHOP": "https://LOF-US.myshopify.com/", "SHOPIFY_CA_SHOP": SHOP})
     with pytest.raises(ConfigError, match="belongs to Shopify store lof-ca"):
         check_shop(us, SHOP, "lof-ca.myshopify.com")
 
@@ -140,53 +143,99 @@ def test_whoami_stops_on_the_wrong_store(monkeypatch):
     assert result.exit_code != 0 and "belongs to Shopify store lof-ca" in str(result.exception)
 
 
-def bulk_responses(url="https://storage.example/result.jsonl", running=None):
-    return [
-        httpx.Response(200, json={"data": {"currentBulkOperation": running}}),
-        httpx.Response(200, json={"data": {"bulkOperationRunQuery": {
-            "bulkOperation": {"id": "gid://shopify/BulkOperation/1", "status": "CREATED"}, "userErrors": []}}}),
-        httpx.Response(200, json={"data": {"node": {"id": "gid://shopify/BulkOperation/1", "status": "RUNNING", "objectCount": "1"}}}),
-        httpx.Response(200, json={"data": {"node": {"id": "gid://shopify/BulkOperation/1", "status": "COMPLETED",
-                                                    "objectCount": "2", "url": url}}}),
-    ]
+OP = "gid://shopify/BulkOperation/1"
+RESULT = "https://storage.example/result.jsonl"
+
+
+def op(status, count="2", **kw):
+    return {"id": OP, "status": status, "type": "QUERY", "objectCount": count, "url": RESULT if status == "COMPLETED" else None,
+            "query": sc.BULK_QUERY, "createdAt": "2099-01-01T00:00:00Z", **kw}
+
+
+def started():
+    return httpx.Response(200, json={"data": {"bulkOperationRunQuery": {
+        "bulkOperation": {"id": OP, "status": "CREATED"}, "userErrors": []}}})
+
+
+def node(o):
+    return httpx.Response(200, json={"data": {"node": o}})
+
+
+def listing(*ops):
+    return httpx.Response(200, json={"data": {"bulkOperations": {"nodes": list(ops)}}})
 
 
 @respx.mock
-def test_bulk_export_starts_only_a_bulk_query_and_waits_for_it():
-    route = respx.post(GQL).mock(side_effect=bulk_responses())
-    assert client().bulk_export(sc.BULK_QUERY, poll_seconds=0) == "https://storage.example/result.jsonl"
-    sent = [json.loads(c.request.content)["query"] for c in route.calls]
-    mutations = [q for q in sent if "mutation" in q]
-    assert len(mutations) == 1 and "bulkOperationRunQuery" in mutations[0]
-    assert json.loads(route.calls[1].request.content)["variables"]["q"] == sc.BULK_QUERY
+def test_start_bulk_export_sends_only_the_bulk_mutation():
+    route = respx.post(GQL).mock(side_effect=[started()])
+    assert client().start_bulk_export(sc.BULK_QUERY) == OP
+    [call] = route.calls
+    body = json.loads(call.request.content)
+    assert "bulkOperationRunQuery" in body["query"] and body["variables"]["q"] == sc.BULK_QUERY
 
 
 def test_bulk_export_refuses_a_query_containing_a_mutation():
     with pytest.raises(ValueError):
-        client().bulk_export("mutation { customerDelete(input: {id: \"1\"}) { deletedCustomerId } }")
+        client().start_bulk_export("mutation { customerDelete(input: {id: \"1\"}) { deletedCustomerId } }")
 
 
 @respx.mock
-def test_bulk_export_waits_its_turn():
-    respx.post(GQL).mock(side_effect=bulk_responses(running={"id": "gid://shopify/BulkOperation/9", "status": "RUNNING"}))
-    with pytest.raises(ShopifyError, match="still running"):
-        client().bulk_export(sc.BULK_QUERY, poll_seconds=0)
+def test_a_lost_start_is_looked_up_not_retried():
+    route = respx.post(GQL).mock(side_effect=[httpx.Response(504), listing(op("RUNNING"))])
+    assert client().start_bulk_export(sc.BULK_QUERY) == OP
+    assert sum("bulkOperationRunQuery" in json.loads(c.request.content)["query"] for c in route.calls) == 1
 
 
 @respx.mock
-def test_customers_export_writes_every_customer(tmp_path, monkeypatch):
+def test_wait_bulk_polls_until_complete():
+    respx.post(GQL).mock(side_effect=[node(op("RUNNING", "1")), node(op("COMPLETED"))])
+    assert client().wait_bulk(OP, poll_seconds=0)["url"] == RESULT
+
+
+def export_env(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SHOPIFY_US_SHOP", SHOP)
     monkeypatch.setenv("SHOPIFY_US_ACCESS_TOKEN", "shpat_x")
-    shop = httpx.Response(200, json={"data": {"shop": {"name": "LOF US", "myshopifyDomain": SHOP},
+    monkeypatch.setattr(ShopifyClient, "wait_bulk", functools.partialmethod(ShopifyClient.wait_bulk, poll_seconds=0))
+    return httpx.Response(200, json={"data": {"shop": {"name": "LOF US", "myshopifyDomain": SHOP},
                                               "currentAppInstallation": {"accessScopes": []}}})
-    respx.post(GQL).mock(side_effect=[shop] + bulk_responses())
-    respx.get("https://storage.example/result.jsonl").mock(return_value=httpx.Response(200, text="\n".join(
-        json.dumps(customer(e, s)) for e, s in (("A@x.com", "SUBSCRIBED"), ("b@x.com", "NOT_SUBSCRIBED"))) + "\n"))
-    monkeypatch.setattr(ShopifyClient, "bulk_export", functools.partialmethod(ShopifyClient.bulk_export, poll_seconds=0))
+
+
+def jsonl(*pairs):
+    return httpx.Response(200, text="\n".join(json.dumps(customer(e, s)) for e, s in pairs) + "\n")
+
+
+@respx.mock
+def test_customers_export_starts_saves_and_writes(tmp_path, monkeypatch):
+    shop = export_env(tmp_path, monkeypatch)
+    route = respx.post(GQL).mock(side_effect=[shop, listing(), started(), node(op("COMPLETED"))])
+    respx.get(RESULT).mock(return_value=jsonl(("A@x.com", "SUBSCRIBED"), ("b@x.com", "NOT_SUBSCRIBED")))
     result = CliRunner().invoke(app, ["shopify", "customers-export", "--instance", "shopify_us"])
     assert result.exit_code == 0, result.output
     [out] = (tmp_path / "exports/shopify_us/customers-export").glob("*.csv")
-    rows = list(csv.DictReader(out.open()))
-    assert [(r["email"], r["email_marketing"]) for r in rows] == [("a@x.com", "SUBSCRIBED"), ("b@x.com", "NOT_SUBSCRIBED")]
+    assert [(r["email"], r["email_marketing"]) for r in csv.DictReader(out.open())] == [
+        ("a@x.com", "SUBSCRIBED"), ("b@x.com", "NOT_SUBSCRIBED")]
+    assert not (tmp_path / "state/shopify_us/shopify-customers-bulk.checkpoint.json").exists()
 
+
+@respx.mock
+def test_customers_export_reuses_a_recent_export(tmp_path, monkeypatch):
+    shop = export_env(tmp_path, monkeypatch)
+    route = respx.post(GQL).mock(side_effect=[shop, listing(op("COMPLETED")), node(op("COMPLETED"))])
+    respx.get(RESULT).mock(return_value=jsonl(("a@x.com", "SUBSCRIBED"), ("b@x.com", "SUBSCRIBED")))
+    result = CliRunner().invoke(app, ["shopify", "customers-export", "--instance", "shopify_us"])
+    assert result.exit_code == 0, result.output and "Reusing bulk export" in result.output
+    assert not any("bulkOperationRunQuery" in json.loads(c.request.content)["query"] for c in route.calls)
+
+
+@respx.mock
+def test_an_incomplete_download_stays_a_part_file(tmp_path, monkeypatch):
+    shop = export_env(tmp_path, monkeypatch)
+    respx.post(GQL).mock(side_effect=[shop, listing(), started(), node(op("COMPLETED", "3"))])
+    respx.get(RESULT).mock(return_value=jsonl(("a@x.com", "SUBSCRIBED")))
+    result = CliRunner().invoke(app, ["shopify", "customers-export", "--instance", "shopify_us"])
+    assert result.exit_code != 0 and "Downloaded 1 customers but the export has 3" in str(result.exception)
+    d = tmp_path / "exports/shopify_us/customers-export"
+    assert not list(d.glob("*.csv")) and list(d.glob("*.csv.part"))
+    # the saved operation lets a re-run continue it
+    assert json.loads((tmp_path / "state/shopify_us/shopify-customers-bulk.checkpoint.json").read_text())["id"] == OP

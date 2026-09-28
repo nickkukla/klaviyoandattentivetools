@@ -7,6 +7,7 @@ variable holding its API key.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,14 +106,28 @@ def shopify_shop(inst: Instance, environ: Mapping[str, str] | None = None) -> st
     """The `*.myshopify.com` domain of a Shopify instance, from SHOPIFY_<US|CA>_SHOP."""
     env = os.environ if environ is None else environ
     var = inst.env_var.replace("_ACCESS_TOKEN", "_SHOP")
-    shop = env.get(var, "").strip().lower().removeprefix("https://").rstrip("/")
-    if not shop.endswith(".myshopify.com"):
-        raise ConfigError(f"{var} must be the store's *.myshopify.com domain (needed for instance '{inst.name}').")
-    others = [env.get(i.env_var.replace("_ACCESS_TOKEN", "_SHOP"), "").strip().lower()
+    shop = _shop_host(env.get(var, ""))
+    if shop is None:
+        raise ConfigError(f"{var} must be the store's *.myshopify.com domain, such as my-store.myshopify.com "
+                          f"(needed for instance '{inst.name}').")
+    others = [_shop_host(env.get(i.env_var.replace("_ACCESS_TOKEN", "_SHOP"), ""))
               for i in INSTANCES.values() if i.service == "shopify" and i.name != inst.name]
     if shop in others:
         raise ConfigError(f"{var} is the same store as another Shopify instance. Check the .env values.")
     return shop
+
+
+_SHOP_HOST = re.compile(r"[a-z0-9][a-z0-9-]*\.myshopify\.com")
+
+
+def _shop_host(value: str) -> str | None:
+    """The bare `*.myshopify.com` host in `value` (optionally written as
+    https://host or with a trailing slash), or None. Anything else, such as a
+    path, port, credentials or query, is refused, so the token can only ever be
+    sent to a Shopify store's own domain."""
+    v = value.strip().lower()
+    v = v.removeprefix("https://").removesuffix("/")
+    return v if _SHOP_HOST.fullmatch(v) else None
 
 
 def check_shop(inst: Instance, expected: str, actual: str) -> None:

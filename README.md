@@ -337,6 +337,7 @@ Adds every profile in the file to one list, by the `email` column, or by `phone_
 | `--list` (required) | ID of the list to add profiles to |
 | `--file` (required) | CSV with an `email` column, and optionally `phone_number` for phone-only rows |
 | `--existing-only` | Only add profiles that already exist; skip (and list) the rest |
+| `--source` | The `migrated_from` tag for profiles it creates (default `ca`) |
 | `--limit` | Only the first N rows |
 | `--yes` | Skip the typed confirmation |
 | `--allow-write-to-source` | Allow writing to a `_ca` instance |
@@ -355,7 +356,7 @@ Copies one list's members into a list on another instance, in one step. It reads
 - Members are matched by email, or by phone number when they have no email, and only that identifier is sent, so existing profiles get no field, property or consent change. Nobody is subscribed (by email or SMS).
 - Members with neither an email nor a phone number are skipped and counted.
 - A member with no profile at the destination is created, tagged `migrated_from` with the source (`ca` for `klaviyo_ca`, otherwise the instance name, such as `sandbox`) and `migration_run_id`.
-- If a copy is interrupted, don't just re-run it: that reads the source again. Finish it from the saved snapshot with `lists add --to <instance> --list <new list ID> --file <the .members.csv>`; the run prints this command when it fails.
+- If a copy is interrupted, don't just re-run it: that reads the source again. Finish it from the saved snapshot with `lists add --to <instance> --list <new list ID> --file <the .members.csv>`; the run prints this command when it fails, with the same `--limit`, `--existing-only` and `--source`.
 - With `--existing-only`, a member with no profile at the destination is skipped instead of created, and listed in the run's `.skipped.csv`. Use it when new source profiles should come over through the import (with their consent) rather than as bare profiles; copy again with `--to-list` afterwards to add them.
 - `--create` refuses a name the destination already uses, and creates the list only after you confirm.
 - Adding people to a list starts any flow triggered by "Added to List" for it. Check before copying into an existing list.
@@ -442,7 +443,8 @@ uv run migtool klaviyo bis export --instance klaviyo_ca --since 2026-10-01
 
 Re-sends orders' Shopify **Placed Order** data as a custom event, to trigger a flow for orders whose original flow email was blocked (for example by `migration_hold`). Each event is an exact copy of the order's Placed Order properties, `$extra` included, so a copy of the Order Confirmation email renders as it would have. It is sent to the customer's profile, or with `--send-to` to a test address.
 
-- The file needs `email` (the customer) and `order_id` or `order_name`. Rows whose order isn't found on that profile are reported and not sent.
+- The file needs `email` (the customer) and `order_id` or `order_name`. When both are given, they must name the **same** order; a row that matches no order, or more than one, is reported and not sent. The plan shows the order each row matched (name, ID, date) before you confirm.
+- `<run>.results.csv` records each order's source event, recipient, `unique_id` and outcome (`submitted`, `refused: …`, `not sent: …`, `not attempted`), also when the run is interrupted. "Submitted" means Klaviyo accepted the event; check the flow's emails for delivery.
 - Klaviyo creates the metric the first time it receives the event, and a flow can only use it as a trigger after that. So send a test to yourself first, then build the flow on the new metric.
 - Each event has a fixed `unique_id` per order and recipient, so running it again doesn't send twice.
 - It needs the `events:write` scope.
@@ -474,7 +476,12 @@ uv run migtool shopify whoami --instance shopify_us
 
 ### `migtool shopify customers-export`
 
-Exports every customer with their marketing consent to `exports/<instance>/customers-export/<run>.csv`, using a Shopify **bulk export**: Shopify builds the file, typically in minutes. Starting a bulk export takes the `bulkOperationRunQuery` call, the one GraphQL mutation this tool sends. It only reads data, and the query it runs must itself contain no mutation. Only one bulk export can run at a time per app.
+Exports every customer with their marketing consent to `exports/<instance>/customers-export/<run>.csv`, using a Shopify **bulk export**: Shopify builds the file, typically in minutes. Starting a bulk export takes the `bulkOperationRunQuery` call, the one GraphQL mutation this tool sends. It only reads data, and the query it runs must itself contain no mutation.
+
+- **Recoverable:** the export's Shopify ID is saved in `state/<instance>/` as soon as it starts, so an interrupted run continues the same export. A start whose response is lost isn't retried; the new export is looked up instead.
+- **Reuse:** a matching export from the last 24 hours (running or finished) is reused rather than started again; `--fresh` starts a new one.
+- **Complete or nothing:** the CSV is written as `.csv.part` and renamed only once every customer Shopify counted has been downloaded.
+- The tool runs one export at a time by choice (Shopify allows several).
 
 ```
 uv run migtool shopify customers-export --instance shopify_us
