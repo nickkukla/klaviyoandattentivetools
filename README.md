@@ -472,6 +472,14 @@ Shows the store a token belongs to and the scopes it was granted, and notes any 
 uv run migtool shopify whoami --instance shopify_us
 ```
 
+### `migtool shopify customers-export`
+
+Exports every customer with their marketing consent to `exports/<instance>/customers-export/<run>.csv`, using a Shopify **bulk export**: Shopify builds the file, typically in minutes. Starting a bulk export takes the `bulkOperationRunQuery` call, the one GraphQL mutation this tool sends. It only reads data, and the query it runs must itself contain no mutation. Only one bulk export can run at a time per app.
+
+```
+uv run migtool shopify customers-export --instance shopify_us
+```
+
 ### `migtool shopify customers`
 
 Looks customers up by email and writes `exports/<instance>/customers/<run>.csv`: Shopify's email and SMS marketing state, opt-in level, when consent last changed, tags, order count and country. With `--compare <klaviyo instance>`, each row also has the Klaviyo profile's consent, suppression, `Accepts Marketing` and `migration_hold`, and a `match` column: `same`, `same (Klaviyo suppressed)`, `Shopify yes / Klaviyo no`, `Shopify no / Klaviyo yes`, `no Shopify customer` or `no Klaviyo profile`. The summary counts each.

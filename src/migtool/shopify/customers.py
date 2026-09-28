@@ -120,3 +120,30 @@ def compare(r: dict[str, Any], *, has_customer: bool, has_profile: bool) -> str:
     if shop_yes == klav_yes:
         return "same" if not (klav_yes and not r["klaviyo_can_receive_email"]) else "same (Klaviyo suppressed)"
     return "Shopify yes / Klaviyo no" if shop_yes else "Shopify no / Klaviyo yes"
+
+
+BULK_QUERY = """{ customers { edges { node {
+  id email phone state createdAt updatedAt tags numberOfOrders
+  emailMarketingConsent { marketingState marketingOptInLevel consentUpdatedAt }
+  smsMarketingConsent { marketingState }
+  defaultAddress { countryCodeV2 }
+} } } }"""
+
+EXPORT_COLUMNS = [
+    "customer_id", "email", "phone", "state", "email_marketing", "email_opt_in_level", "email_consent_updated",
+    "sms_marketing", "tags", "orders", "country", "created", "updated",
+]
+
+
+def export_row(node: dict[str, Any]) -> dict[str, Any]:
+    em = node.get("emailMarketingConsent") or {}
+    return {
+        "customer_id": (node.get("id") or "").rsplit("/", 1)[-1], "email": (node.get("email") or "").lower(),
+        "phone": node.get("phone"), "state": node.get("state"),
+        "email_marketing": em.get("marketingState"), "email_opt_in_level": em.get("marketingOptInLevel"),
+        "email_consent_updated": em.get("consentUpdatedAt"),
+        "sms_marketing": (node.get("smsMarketingConsent") or {}).get("marketingState"),
+        "tags": ";".join(node.get("tags") or []), "orders": node.get("numberOfOrders"),
+        "country": (node.get("defaultAddress") or {}).get("countryCodeV2"),
+        "created": node.get("createdAt"), "updated": node.get("updatedAt"),
+    }
