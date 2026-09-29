@@ -481,8 +481,9 @@ def profiles_set_property(
     """Set one custom property on the existing profiles in a CSV (`email` column).
 
     Only that property is sent: consent, lists and other fields are untouched.
-    Emails without a profile are skipped (never created) and listed in the
-    skipped file. Run `profiles check-property` afterwards."""
+    Emails without a profile are skipped (not created) and listed in the
+    skipped file; the lookup runs just before the write, which is an upsert.
+    Run `profiles check-property` afterwards."""
     key, parsed = _property(key, value, kind)
 
     def preview(client, rows):
@@ -510,7 +511,9 @@ def profiles_check_property(
 ) -> None:
     """Check (read-only) that every email in the CSV has a profile with the
     property set to the value (type for type). Problems go to
-    <run>.mismatches.csv. Klaviyo can take a few minutes to apply an import."""
+    <run>.mismatches.csv, rows that can't be checked to <run>.skipped.csv;
+    either, or nothing checked, exits 1. Klaviyo can take a few minutes to
+    apply an import."""
     key, parsed = _property(key, value, kind)
     inst = get_instance(instance, "klaviyo")
     try:
@@ -523,6 +526,9 @@ def profiles_check_property(
     with client:
         counts, mismatches = properties.check(client, [r["email"] for r in batch.rows], key, parsed,
                                               progress=lambda m: typer.echo(f"  {m}"))
+    # A repeated email is checked once; any other skipped row couldn't be
+    # checked at all, so the file isn't fully verified.
+    unchecked = [(who, why) for who, why in batch.skipped if not why.startswith("duplicate")]
     run = new_run(inst.name, "check-property")
     files = {}
     if mismatches:
@@ -532,12 +538,21 @@ def profiles_check_property(
             w.write(m)
         w.close()
         files[path.name] = w.count
-    write_manifest(run, files=files, counts={**counts, "skipped": len(batch.skipped)},
+    skipped_path = imports.write_skipped(run, batch.skipped)
+    if skipped_path:
+        files[skipped_path.name] = len(batch.skipped)
+    write_manifest(run, files=files, counts={**counts, "skipped": len(batch.skipped), "unchecked": len(unchecked)},
                    extra={"source_file": str(file), "key": key, "value": parsed, "type": kind})
     typer.echo(f"checked {counts['checked']:,}: ok {counts['ok']:,}, no profile {counts['no profile']:,}, "
-               f"mismatched {counts['mismatched']:,} (skipped {len(batch.skipped):,} unusable rows)")
+               f"mismatched {counts['mismatched']:,}; {len(unchecked):,} rows couldn't be checked, "
+               f"{len(batch.skipped) - len(unchecked):,} duplicates")
     if mismatches:
         typer.echo(f"Mismatches: {run.path('.mismatches.csv')}")
+    if skipped_path:
+        typer.echo(f"Skipped rows: {skipped_path}")
+    if mismatches or unchecked or not counts["checked"]:
+        if not counts["checked"]:
+            typer.echo("Nothing was checked: no usable email in the file.")
         raise typer.Exit(1)
 
 
@@ -958,6 +973,9 @@ def dedupe_check(
 
 
 
+UNKNOWN_SEND = "unknown, may have been accepted"
+
+
 @events_app.command("resend")
 def events_resend(
     to: str = TO,
@@ -1012,16 +1030,24 @@ def events_resend(
         aborted = None
         try:
             for it in p.ready:
+                # Until Klaviyo answers, the event may or may not have arrived.
+                results[id(it)] = UNKNOWN_SEND
                 try:
                     events.send(client, events.event_body(it, metric=metric, time=now))
                     results[id(it)] = "submitted"
                     log.written()
                 except ApiError as exc:
-                    results[id(it)] = f"refused: {exc.detail}"
-                    log.error(f"{it.order} ({it.customer})", f"refused by Klaviyo: {exc.detail}", stage="send")
+                    if exc.status is not None and 400 <= exc.status < 500:
+                        results[id(it)] = f"refused: {exc.detail}"
+                        log.error(f"{it.order} ({it.customer})", f"refused by Klaviyo: {exc.detail}", stage="send")
+                    else:
+                        results[id(it)] = f"{UNKNOWN_SEND}: {exc.detail}"
+                        log.error(f"{it.order} ({it.customer})", f"{UNKNOWN_SEND}: {exc.detail}", stage="send")
         except KeyboardInterrupt:
             aborted = "interrupted"
-            log.error("run", "stopped: interrupted; rows marked 'not attempted' weren't sent", stage="aborted")
+            log.error("run", "stopped: interrupted; rows marked 'not attempted' weren't sent, and a row marked "
+                      f"'{UNKNOWN_SEND}' may have been. Re-sending is safe: the fixed unique_id stops repeats.",
+                      stage="aborted")
         finally:
             path = run.path(".results.csv")
             writer = CsvWriter(path, ["order", "customer", "recipient", "metric", "source_event", "matched_order_id",

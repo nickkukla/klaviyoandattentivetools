@@ -80,16 +80,20 @@ class ShopifyClient:
         `bulkOperationRunQuery` is the only mutation this client sends, and only
         from here, with a query that must itself contain no mutation. It's not
         retried after a response is lost; the new operation is looked up instead,
-        so a retry can't start a second export."""
+        so a retry can't start a second export. Only an operation that wasn't
+        there before the start counts, so an older export of the same query is
+        never taken for this one."""
         if MUTATION.search(inner_query):
             raise ValueError("A bulk export query can't contain a mutation.")
+        before = {op["id"] for op in self.recent_bulk_queries(10)}
         try:
             body = self._http.post("/graphql.json", json={"query": BULK_START, "variables": {"q": inner_query}},
                                    retry_writes=False).json()
         except ApiError as exc:
             if exc.status is not None and exc.status < 500:
                 raise
-            recent = [op for op in self.recent_bulk_queries(3) if _same_query(op.get("query"), inner_query)
+            recent = [op for op in self.recent_bulk_queries(10) if op["id"] not in before
+                      and _same_query(op.get("query"), inner_query)
                       and op["status"] in ("CREATED", "RUNNING", "COMPLETED")]
             if len(recent) == 1:
                 return recent[0]["id"]

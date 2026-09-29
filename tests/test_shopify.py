@@ -167,9 +167,9 @@ def listing(*ops):
 
 @respx.mock
 def test_start_bulk_export_sends_only_the_bulk_mutation():
-    route = respx.post(GQL).mock(side_effect=[started()])
+    route = respx.post(GQL).mock(side_effect=[listing(), started()])
     assert client().start_bulk_export(sc.BULK_QUERY) == OP
-    [call] = route.calls
+    [_, call] = route.calls
     body = json.loads(call.request.content)
     assert "bulkOperationRunQuery" in body["query"] and body["variables"]["q"] == sc.BULK_QUERY
 
@@ -181,9 +181,17 @@ def test_bulk_export_refuses_a_query_containing_a_mutation():
 
 @respx.mock
 def test_a_lost_start_is_looked_up_not_retried():
-    route = respx.post(GQL).mock(side_effect=[httpx.Response(504), listing(op("RUNNING"))])
+    route = respx.post(GQL).mock(side_effect=[listing(), httpx.Response(504), listing(op("RUNNING"))])
     assert client().start_bulk_export(sc.BULK_QUERY) == OP
     assert sum("bulkOperationRunQuery" in json.loads(c.request.content)["query"] for c in route.calls) == 1
+
+
+@respx.mock
+def test_a_lost_start_never_takes_an_older_export_for_the_new_one():
+    old = op("COMPLETED", id="gid://shopify/BulkOperation/0", createdAt="2020-01-01T00:00:00Z")
+    respx.post(GQL).mock(side_effect=[listing(old), httpx.Response(504), listing(old)])
+    with pytest.raises(ShopifyError, match="can't be told whether it started"):
+        client().start_bulk_export(sc.BULK_QUERY)
 
 
 @respx.mock
@@ -208,7 +216,7 @@ def jsonl(*pairs):
 @respx.mock
 def test_customers_export_starts_saves_and_writes(tmp_path, monkeypatch):
     shop = export_env(tmp_path, monkeypatch)
-    route = respx.post(GQL).mock(side_effect=[shop, listing(), started(), node(op("COMPLETED"))])
+    route = respx.post(GQL).mock(side_effect=[shop, listing(), listing(), started(), node(op("COMPLETED"))])
     respx.get(RESULT).mock(return_value=jsonl(("A@x.com", "SUBSCRIBED"), ("b@x.com", "NOT_SUBSCRIBED")))
     result = CliRunner().invoke(app, ["shopify", "customers-export", "--instance", "shopify_us"])
     assert result.exit_code == 0, result.output
@@ -231,7 +239,7 @@ def test_customers_export_reuses_a_recent_export(tmp_path, monkeypatch):
 @respx.mock
 def test_an_incomplete_download_stays_a_part_file(tmp_path, monkeypatch):
     shop = export_env(tmp_path, monkeypatch)
-    respx.post(GQL).mock(side_effect=[shop, listing(), started(), node(op("COMPLETED", "3"))])
+    respx.post(GQL).mock(side_effect=[shop, listing(), listing(), started(), node(op("COMPLETED", "3"))])
     respx.get(RESULT).mock(return_value=jsonl(("a@x.com", "SUBSCRIBED")))
     result = CliRunner().invoke(app, ["shopify", "customers-export", "--instance", "shopify_us"])
     assert result.exit_code != 0 and "Downloaded 1 customers but the export has 3" in str(result.exception)
