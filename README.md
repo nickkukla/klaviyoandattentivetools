@@ -55,7 +55,7 @@ Run the tests with `uv run pytest`. They use recorded responses and never call a
 
 ## How writes are protected
 
-Every write command (`profiles import`, `suppressions import`, `lists add`, `lists copy`, `segments copy`):
+Every write command (`profiles import`, `profiles set-property`, `suppressions import`, `lists add`, `lists copy`, `segments copy`):
 
 1. names its target with `--to <instance>`;
 2. prints the account name and ID, the instance and the number of records, and asks you to type the instance name to confirm (`--yes` skips this, for scripted runs);
@@ -191,6 +191,29 @@ uv run migtool klaviyo profiles import --to klaviyo_ca --file fix.csv --list-id 
 ```
 
 The run's `migration_run_id` is printed and saved in the manifest. Every imported profile carries it, so a bad batch can be found and segmented or deleted in Klaviyo.
+
+### `migtool klaviyo profiles set-property`
+
+Sets one custom property on existing profiles listed in a CSV with an `email` column, for holds such as `catchup_hold=true`. A flow profile filter `catchup_hold equals false` then skips those profiles, while profiles without the property still pass.
+
+- Only the property is sent. Consent, lists and other fields are untouched.
+- Only existing profiles are updated. Emails with no profile are listed in the skipped file and never created.
+- Before the confirmation, the command looks up which emails have a profile, so the count you confirm is the count it writes.
+- `--type` is `bool` (the default), `number` or `text`. To release a hold, run it again with `--value false`.
+- Klaviyo takes a few minutes to apply the import. Run `profiles check-property` before relying on the property, for example before an order import.
+
+```
+uv run migtool klaviyo profiles set-property --to klaviyo_sandbox --file hold.csv --key catchup_hold --value true --limit 5
+uv run migtool klaviyo profiles set-property --to klaviyo_us --file hold.csv --key catchup_hold --value true
+```
+
+### `migtool klaviyo profiles check-property`
+
+Read-only. Reads every email in the CSV back from Klaviyo and checks that the property holds the value, type for type (`true` stored as text doesn't count as `true`). Profiles that are missing, or that have a different or unset value, go to `<run>.mismatches.csv`, and the command then exits with code 1. It takes the same `--key`, `--value` and `--type` as `set-property`.
+
+```
+uv run migtool klaviyo profiles check-property --instance klaviyo_us --file hold.csv --key catchup_hold --value true
+```
 
 ### `migtool klaviyo dedupe import`
 
