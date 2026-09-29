@@ -94,3 +94,39 @@ def test_plan_shows_the_matched_order_and_results_are_written(tmp_path, monkeypa
     [res] = (tmp_path / "exports/klaviyo_sandbox/events-resend").glob("*.results.csv")
     [row] = list(csv.DictReader(res.open()))
     assert (row["source_event"], row["unique_id"], row["outcome"]) == ("E111", "resend-111", "submitted")
+
+
+def outcomes(tmp_path):
+    [res] = (tmp_path / "exports/klaviyo_sandbox/events-resend").glob("*.results.csv")
+    return [r["outcome"] for r in csv.DictReader(res.open())]
+
+
+@respx.mock
+def test_an_interrupted_send_is_unknown_not_unattempted(tmp_path, monkeypatch, klaviyo_account):
+    from migtool.klaviyo import events
+
+    setup(tmp_path, monkeypatch, klaviyo_account, [("a@x.com", "#660803LOF")])
+
+    def interrupted(client, body):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(events, "send", interrupted)
+    result = run()
+    assert result.exit_code != 0
+    assert outcomes(tmp_path) == ["unknown, may have been accepted"]
+
+
+@respx.mock
+def test_a_transport_failure_is_unknown_and_a_4xx_is_refused(tmp_path, monkeypatch, klaviyo_account):
+    from migtool.http import ApiError
+    from migtool.klaviyo import events
+
+    setup(tmp_path, monkeypatch, klaviyo_account, [("a@x.com", "#660803LOF")])
+    monkeypatch.setattr(events, "send", lambda c, b: (_ for _ in ()).throw(
+        ApiError("POST", "u", None, "ReadTimeout: timed out")))
+    assert run().exit_code != 0
+    assert outcomes(tmp_path) == ["unknown, may have been accepted: ReadTimeout: timed out"]
+    for f in (tmp_path / "exports/klaviyo_sandbox/events-resend").glob("*"):
+        f.unlink()
+    monkeypatch.setattr(events, "send", lambda c, b: (_ for _ in ()).throw(ApiError("POST", "u", 400, "bad")))
+    assert run().exit_code != 0
+    assert outcomes(tmp_path) == ["refused: bad"]

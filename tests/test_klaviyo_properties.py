@@ -103,9 +103,32 @@ def test_check_property_reports_wrong_and_missing_values(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["klaviyo", "profiles", "check-property", "--instance", "klaviyo_sandbox",
                                       "--file", str(f), "--key", "catchup_hold", "--value", "true"])
     assert result.exit_code == 1, result.output
-    assert "checked 4: ok 1, no profile 1, mismatched 2" in result.output
+    assert "checked 4: ok 1, no profile 1, mismatched 2; 0 rows couldn't be checked" in result.output
     [mismatches] = (tmp_path / "exports/klaviyo_sandbox/check-property").glob("*.mismatches.csv")
     with open(mismatches, newline="") as fh:
         rows = {r["email"]: r["problem"] for r in csv.DictReader(fh)}
     assert rows == {"text@example.com": "catchup_hold is 'true', expected True",
                     "unset@example.com": "catchup_hold is None, expected True", "gone@example.com": "no profile"}
+
+
+@respx.mock
+def test_check_property_fails_when_rows_cant_be_checked(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KLAVIYO_SANDBOX_API_KEY", "pk_x")
+    mock_account_and_lists()
+    respx.get(f"{API}/profiles/").mock(return_value=httpx.Response(200, json={
+        "data": [{"id": "P1", "attributes": {"email": "ok@example.com", "properties": {"catchup_hold": True}}}],
+        "links": {"next": None}}))
+    f = tmp_path / "hold.csv"
+    args = ["klaviyo", "profiles", "check-property", "--instance", "klaviyo_sandbox", "--file", str(f),
+            "--key", "catchup_hold", "--value", "true"]
+    write_csv(f, ["email"], [{"email": "not-an-email"}])
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 1 and "Nothing was checked" in result.output
+    write_csv(f, ["email"], [{"email": "ok@example.com"}, {"email": "not-an-email"}])
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 1 and "1 rows couldn't be checked" in result.output
+    write_csv(f, ["email"], [{"email": "ok@example.com"}, {"email": "OK@example.com"}])
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert "ok 1" in result.output and "1 duplicates" in result.output

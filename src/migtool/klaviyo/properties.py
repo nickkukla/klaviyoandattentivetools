@@ -2,8 +2,11 @@
 
 Used for holds like `catchup_hold=true`: a flow profile filter `<key> equals
 false` then skips the listed profiles, while profiles without the property
-pass. Only existing profiles are updated; emails with no profile are skipped,
-never created (a bare profile would carry nothing but the hold).
+pass (seen in live flows on 2026-09-27; segment conditions treat unset
+differently). Only existing profiles are sent; emails with no profile are
+skipped, not created. The bulk import is an upsert, so a profile deleted in the
+moment between the lookup and the write would come back carrying only the
+property.
 """
 
 from __future__ import annotations
