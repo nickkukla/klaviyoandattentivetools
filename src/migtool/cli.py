@@ -13,7 +13,7 @@ from migtool.config import (
     INSTANCES, ConfigError, check_account, check_shop, credential, get_instance, load_env, shopify_shop,
 )
 from migtool.http import ApiError
-from migtool.klaviyo import bis, dedupe, groups, imports, profiles, segments, suppressions
+from migtool.klaviyo import bis, dedupe, groups, imports, profiles, properties, segments, suppressions
 from migtool.klaviyo.client import KlaviyoClient
 from migtool.klaviyo.writes import Job, Writer
 from migtool.output import (
@@ -368,11 +368,15 @@ def bis_export(
 def _write_run(
     to: str, obj: str, main_step: str, file: Path, limit: int | None, yes: bool,
     allow_write_to_source: bool, body, extra_manifest: dict | None = None, retries_settled: bool = False,
-    phones: bool = False,
+    phones: bool = False, preview=None,
 ) -> None:
     """Shared frame for the write commands: read and check the file, confirm the
     target, run `body(importer, rows, columns, run)`, then write the skipped
-    file, manifest and summary. Exits non-zero if anything failed."""
+    file, manifest and summary. Exits non-zero if anything failed.
+
+    `preview(client, rows)` (optional, read-only) runs before the confirmation
+    and returns (rows to send, skipped rows), so the count confirmed is what
+    will be written."""
     inst = get_instance(to, "klaviyo")
     _gate_unsettled(inst, retries_settled)
     try:
@@ -385,14 +389,15 @@ def _write_run(
     client, account = _connect(inst)
     with client:
         _gate_pending_jobs(client, inst)
-        typer.echo(f"File:            {file} ({len(raw):,} rows, {len(batch.skipped):,} skipped)")
+        rows, previewed = preview(client, batch.rows) if preview else (batch.rows, [])
+        typer.echo(f"File:            {file} ({len(raw):,} rows, {len(batch.skipped) + len(previewed):,} skipped)")
         confirm_write(
-            inst, account=f"{account['name']} ({account['id']})", record_count=len(batch.rows),
+            inst, account=f"{account['name']} ({account['id']})", record_count=len(rows),
             yes=yes, allow_write_to_source=allow_write_to_source,
         )
         log = RunLog(run, written_label="submitted" if main_step == "suppress" else "written")
         log.read(len(raw))
-        log.skipped(len(batch.skipped))
+        log.skipped(len(batch.skipped) + len(previewed))
 
         def save_job(job: Job) -> None:
             store.add_job(inst.name, {"id": job.id, "kind": job.kind, "run_id": run.run_id, "size": job.size})
@@ -401,7 +406,7 @@ def _write_run(
         counts: dict = {}
         aborted: str | None = None
         try:
-            counts = body(imp, batch.rows, columns, run) or {}
+            counts = body(imp, rows, columns, run) or {}
         except (Exception, KeyboardInterrupt) as exc:
             # Stop, but still record what was sent: earlier jobs may be running.
             aborted = "interrupted" if isinstance(exc, KeyboardInterrupt) else f"{type(exc).__name__}: {exc}"
@@ -409,7 +414,7 @@ def _write_run(
                       "be applied; re-running the file is safe.", stage="aborted")
         for job in imp.unfinished:
             typer.echo(f"Job {job.id} ({job.kind}) was still {job.status or 'processing'} when the run ended.")
-    skipped = batch.skipped + imp.skipped
+    skipped = batch.skipped + previewed + imp.skipped
     skipped_path = imports.write_skipped(run, skipped)
     files = {skipped_path.name: len(skipped)} if skipped_path else {}
     if aborted:
@@ -447,6 +452,93 @@ def profiles_import(
 
     _write_run(to, "profiles-import", "import", file, limit, yes, allow_write_to_source, body,
                {"list_id": list_id, "as_unsubscribe": as_unsubscribe}, retries_settled=retries_settled)
+
+
+def _property(key: str, value: str, kind: str):
+    try:
+        return properties.check_key(key), properties.parse_value(value, kind)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+KEY = typer.Option(..., "--key", help="Custom property name, e.g. catchup_hold.")
+VALUE = typer.Option(..., "--value", help="Value to set, e.g. true.")
+KIND = typer.Option("bool", "--type", help="Value type: " + ", ".join(properties.KINDS) + ".")
+
+
+@profiles_app.command("set-property")
+def profiles_set_property(
+    to: str = TO,
+    file: Path = FILE,
+    key: str = KEY,
+    value: str = VALUE,
+    kind: str = KIND,
+    limit: int | None = LIMIT,
+    yes: bool = YES,
+    allow_write_to_source: bool = ALLOW_SOURCE,
+    retries_settled: bool = RETRIES_SETTLED,
+) -> None:
+    """Set one custom property on the existing profiles in a CSV (`email` column).
+
+    Only that property is sent: consent, lists and other fields are untouched.
+    Emails without a profile are skipped (never created) and listed in the
+    skipped file. Run `profiles check-property` afterwards."""
+    key, parsed = _property(key, value, kind)
+
+    def preview(client, rows):
+        w = Writer(client)
+        keep, missing = properties.plan(rows, w.existing_emails)
+        typer.echo(f"Property:        {key} = {parsed!r} ({kind})")
+        typer.echo(f"To update:       {len(keep):,} existing profiles; {len(missing):,} emails have no profile")
+        return keep, missing
+
+    def body(imp, rows, columns, run):
+        imp.import_profiles(properties.payloads(rows, key, parsed), list_id=None, stage="update")
+
+    _write_run(to, "set-property", "update", file, limit, yes, allow_write_to_source, body,
+               {"key": key, "value": parsed, "type": kind}, retries_settled=retries_settled, preview=preview)
+
+
+@profiles_app.command("check-property")
+def profiles_check_property(
+    instance: str = typer.Option(..., "--instance", help="Klaviyo instance to check."),
+    file: Path = FILE,
+    key: str = KEY,
+    value: str = VALUE,
+    kind: str = KIND,
+    limit: int | None = LIMIT,
+) -> None:
+    """Check (read-only) that every email in the CSV has a profile with the
+    property set to the value (type for type). Problems go to
+    <run>.mismatches.csv. Klaviyo can take a few minutes to apply an import."""
+    key, parsed = _property(key, value, kind)
+    inst = get_instance(instance, "klaviyo")
+    try:
+        _, raw = imports.read_rows(file, limit=limit)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    batch = imports.usable(raw)
+    _warn_unsettled(inst)
+    client, _ = _connect(inst)
+    with client:
+        counts, mismatches = properties.check(client, [r["email"] for r in batch.rows], key, parsed,
+                                              progress=lambda m: typer.echo(f"  {m}"))
+    run = new_run(inst.name, "check-property")
+    files = {}
+    if mismatches:
+        path = run.path(".mismatches.csv")
+        w = CsvWriter(path, properties.CHECK_COLUMNS)
+        for m in mismatches:
+            w.write(m)
+        w.close()
+        files[path.name] = w.count
+    write_manifest(run, files=files, counts={**counts, "skipped": len(batch.skipped)},
+                   extra={"source_file": str(file), "key": key, "value": parsed, "type": kind})
+    typer.echo(f"checked {counts['checked']:,}: ok {counts['ok']:,}, no profile {counts['no profile']:,}, "
+               f"mismatched {counts['mismatched']:,} (skipped {len(batch.skipped):,} unusable rows)")
+    if mismatches:
+        typer.echo(f"Mismatches: {run.path('.mismatches.csv')}")
+        raise typer.Exit(1)
 
 
 @suppressions_app.command("import")
