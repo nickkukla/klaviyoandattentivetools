@@ -492,7 +492,7 @@ uv run migtool klaviyo events resend --to klaviyo_us --file held_orders.csv --me
 
 ## Shopify
 
-The Shopify commands only read, except `shopify consent-sync`, which writes email marketing consent and nothing else. The client refuses to send a GraphQL mutation from any query, even if the token would allow one. Exactly two mutations exist, each sent from one place: the bulk-export start (`customers-export`) and `customerEmailMarketingConsentUpdate` (`consent-sync`). Every command first checks that the token belongs to the store in `SHOPIFY_<US|CA>_SHOP`, so a CA token under the US name is stopped.
+The Shopify commands only read, except `shopify consent-sync`, which writes email marketing consent and nothing else. The client refuses to send a GraphQL mutation from any query, even if the token would allow one. Exactly two mutations exist, each sent from one place: the bulk-export start (`customers-export`) and `customerEmailMarketingConsentUpdate` (`consent-sync`, up to 50 per request as aliases). Every command first checks that the token belongs to the store in `SHOPIFY_<US|CA>_SHOP`, so a CA token under the US name is stopped.
 
 ### `migtool shopify whoami`
 
@@ -567,10 +567,11 @@ The only Shopify write.
   - reads the customers' current email consent and email
   - **identity conflict** if a customer's email no longer matches the plan: it isn't written, because the decision came from the Klaviyo profile of the planned email
   - **skips customers already in the target state:** Shopify treats even an identical write as a customer update and notifies apps
-  - sends `customerEmailMarketingConsentUpdate` for the rest, dated with the original date, or the sync time if Shopify's live date is newer or equal (D16)
+  - sends `customerEmailMarketingConsentUpdate` for the rest **in one request** (up to 50 aliases), each dated with the original date, or the sync time if Shopify's live date is newer or equal (D16)
   - counts a write as written only if Shopify now holds the target state; one Shopify accepted without applying is recorded as **ignored**
 - **Results** per customer go to `<run-id>.results.csv` (one file per run): written, skipped, refused (with Shopify's message), not found, identity conflict, ignored, or unknown. Each row has the date actually sent and its `date_rule`.
-- **A lost response is never resent.** The customer is read back instead.
+- **A lost response is never resent.** The batch's customers are read back instead, as is any customer missing from a response. A throttled request isn't executed, so it waits for Shopify's budget to refill and is sent again.
+- **Speed:** on Shopify Plus (1,000 points per second; about 10 per write), roughly 50–100 writes per second. The rate is printed as it goes.
 - **Exit code:** 1 if anything in the plan is still unresolved (refused, not found, identity conflict, ignored or unknown), including earlier runs' failures that a resume didn't retry, or if the run stopped.
 
 | Flag | |
