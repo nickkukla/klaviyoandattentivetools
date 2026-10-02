@@ -230,7 +230,7 @@ Imports one of the dedupe files (Klaviyo UI-import layout) under the rules of it
 | `suppress` | 02 | Rows that were US profiles before the migration (per `--us-snapshot`) join `--join-list` and get `ca_suppression_*`. The rest are CA-only: created or updated and tagged. Then all are submitted for suppression. |
 | `new` | 03a–03d | Creates or updates, joins `--join-list`, adds tags. Consent from `Email Marketing Consent`: `Subscribe` → historical subscribe to `--subscribe-list`; `Unsubscribed` → unsubscribe. |
 | `kept` | 04a, 04b | Updates existing profiles only, joins `--join-list`, adds tags. Consent as for `new`, using `ca_consent_timestamp`. |
-| `consent` | consent sync D14 | Updates existing profiles only. Subscribes them to `--subscribe-list` with the file's date (Shopify's consent date) and the custom source "Shopify email consent (consent sync)". No join list, no tags, no other fields. |
+| `consent` | consent sync D14 | Existing profiles only; the profile write sends the email and nothing else (other columns, such as `shopify_customer_id`, are never written). Subscribes them to `--subscribe-list` with the file's date (Shopify's consent date) and the custom source "Shopify email consent (consent sync)". No join list, no tags. |
 
 | Flag | |
 |---|---|
@@ -564,12 +564,13 @@ The only Shopify write.
 
 - **Checks first:** the token belongs to the store and has `write_customers`, then a typed confirmation of the store and the number of customers.
 - **For each batch of 50:**
-  - reads the customers' current email consent
+  - reads the customers' current email consent and email
+  - **identity conflict** if a customer's email no longer matches the plan: it isn't written, because the decision came from the Klaviyo profile of the planned email
   - **skips customers already in the target state:** Shopify treats even an identical write as a customer update and notifies apps
   - sends `customerEmailMarketingConsentUpdate` for the rest
-- **Results** per customer go to `<run>.results.csv`: written, skipped, refused (with Shopify's message), not found, or unknown.
+- **Results** per customer go to `<run-id>.results.csv` (one file per run): written, skipped, refused (with Shopify's message), not found, identity conflict, or unknown.
 - **A lost response is never resent.** The customer is read back instead.
-- **Exit code:** 1 if anything was refused, not found, unknown or stopped.
+- **Exit code:** 1 if anything in the plan is still unresolved (refused, not found, identity conflict or unknown), including earlier runs' failures that a resume didn't retry, or if the run stopped.
 
 | Flag | |
 |---|---|
@@ -577,10 +578,11 @@ The only Shopify write.
 | `--plan` (required) | `<run>.plan.csv` |
 | `--target` | Only `SUBSCRIBED` or only `UNSUBSCRIBED` rows (for the canary) |
 | `--limit` | At most N customers in this run |
-| `--resume` | Continue the saved run of this plan, skipping customers already done (unknown ones are retried) |
+| `--resume` | Continue the saved run of this plan: skips customers written or skipped, retries unknown ones, and reports (but doesn't retry) refused, not found and conflicting ones |
+| `--retry-failed` | With `--resume`, also retry refused, not-found and conflicting customers |
 | `--yes` | Skip the typed confirmation |
 
-The run is saved in `state/<instance>/shopify-consent-sync.checkpoint.json`. A new run of a plan needs `--resume`, or that file deleted.
+The run is saved in `state/<instance>/shopify-consent-sync.checkpoint.json`, bound to the plan's path, content (sha256), row count and store. `--resume` refuses a plan that has changed since, or a different store: a changed plan is a new run. A new run needs that file deleted.
 
 ```
 uv run migtool shopify consent-sync --to shopify_us --plan <run>.plan.csv --target SUBSCRIBED --limit 100     # canary
@@ -590,11 +592,11 @@ uv run migtool shopify consent-sync --to shopify_us --plan <run>.plan.csv --resu
 
 #### `migtool shopify consent-validate`
 
-Local and read-only. It works on exports taken after the run and checks that every matched customer's Shopify state matches Klaviyo under the rules (D12 counts as a match; `INVALID`/`REDACTED` are reported separately). It also checks:
+Local and read-only. It works on exports taken after the run and checks that every matched customer's Shopify state matches Klaviyo under the rules (D12 counts as a match; `INVALID`/`REDACTED` are reported separately). Both exports must have the expected columns and values; anything else is refused rather than guessed. It also checks:
 
-- with `--results`: for customers the run wrote, Shopify's date equals the date written
-- with `--d14`: for D14 customers, Klaviyo's date equals Shopify's
-- with `--klaviyo-before <backup>`: every Klaviyo consent state, date or method change since the backup is listed in `<run>.klaviyo_changes.csv` for review
+- with `--results`: every customer the run wrote is still in the Shopify export, under the same email, in the state and with the date written
+- with `--d14`: every D14 customer has a Klaviyo profile and a Shopify customer, both subscribed, with Klaviyo's date equal to Shopify's
+- with `--klaviyo-before <backup>`: every Klaviyo consent state, date or method change since the backup, and every profile gone (deleted or merged), is listed in `<run>.klaviyo_changes.csv` for review
 
 Mismatches go to `<run>.mismatches.csv` and exit 1.
 

@@ -1221,7 +1221,21 @@ CONSENT_BATCH = 50  # customers read (and written) per round
 CONSENT_KEY = "shopify-consent-sync"
 RESULT_COLUMNS = ["time", "shopify_customer_id", "email", "target_state", "target_date", "state_before",
                   "outcome", "detail"]
-DONE_OUTCOMES = {"written", "skipped", "refused", "not found"}  # `unknown` is retried by --resume
+# A customer's latest outcome across a plan's runs decides what --resume does:
+# done ones are skipped; unresolved ones are skipped and reported (and retried
+# only with --retry-failed); `unknown` is always retried.
+DONE_OUTCOMES = {"written", "skipped"}
+UNRESOLVED_OUTCOMES = {"refused", "not found", "identity conflict"}
+
+
+def _file_sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _write_rows(path: Path, columns: list[str], rows: list[dict]) -> int:
@@ -1293,6 +1307,8 @@ def shopify_consent_sync(
     target: str | None = typer.Option(None, "--target", help="Only rows with this target state (canary)."),
     limit: int | None = LIMIT,
     resume: bool = typer.Option(False, "--resume", help="Continue the saved run of this plan."),
+    retry_failed: bool = typer.Option(False, "--retry-failed",
+                                      help="With --resume, also retry customers refused, not found or in conflict."),
     yes: bool = YES,
 ) -> None:
     """Write Shopify email marketing consent from a consent plan. The only Shopify write.
@@ -1312,7 +1328,10 @@ def shopify_consent_sync(
     bad = [r for r in rows if r["target_state"] not in CONSENT_STATES]
     if bad:
         raise ConfigError(f"{len(bad):,} plan rows have a target state Shopify can't take (e.g. {bad[0]['target_state']}).")
+    if retry_failed and not resume:
+        raise typer.BadParameter("needs --resume.", param_hint="--retry-failed")
     plan_key = str(plan_file.resolve())
+    plan_hash = _file_sha256(plan_file)
     store = StateStore()
     saved = store.load_checkpoint(to, CONSENT_KEY)
     if saved and not resume:
@@ -1320,12 +1339,17 @@ def shopify_consent_sync(
                           f"state/{to}/{CONSENT_KEY}.checkpoint.json to start a new one.")
     if resume and not saved:
         raise ConfigError("There's no saved consent sync to resume.")
-    if saved and saved["plan"] != plan_key:
-        raise ConfigError(f"The saved consent sync is for {saved['plan']}, not {plan_key}.")
-    done: set[str] = set()
+    if saved and (saved["plan"] != plan_key or saved.get("sha256") != plan_hash or saved.get("rows") != len(rows)):
+        raise ConfigError(f"The saved consent sync is for {saved['plan']} as it was then ({saved.get('rows')} rows, "
+                          f"sha256 {str(saved.get('sha256'))[:12]}); {plan_key} is different now. A changed plan "
+                          "is a new run: review it and start it separately.")
+    latest: dict[str, str] = {}
     for path in (saved or {}).get("results", []):
-        done |= {r["shopify_customer_id"] for r in consent.read_csv(Path(path)) if r["outcome"] in DONE_OUTCOMES}
-    todo = [r for r in rows if r["shopify_customer_id"] not in done and (target is None or r["target_state"] == target)]
+        for r in consent.read_csv(Path(path)):
+            latest[r["shopify_customer_id"]] = r["outcome"]
+    skip = {c for c, o in latest.items() if o in DONE_OUTCOMES or (o in UNRESOLVED_OUTCOMES and not retry_failed)}
+    unresolved_before = {c for c, o in latest.items() if o in UNRESOLVED_OUTCOMES}
+    todo = [r for r in rows if r["shopify_customer_id"] not in skip and (target is None or r["target_state"] == target)]
     if limit is not None:
         todo = todo[:limit]
     inst = get_instance(to, "shopify")
@@ -1333,18 +1357,27 @@ def shopify_consent_sync(
     with client:
         if "write_customers" not in info["scopes"]:
             raise ConfigError(f"The {to} token doesn't have write_customers; nothing was written.")
-        typer.echo(f"Plan:            {plan_file} ({len(rows):,} rows, {len(done):,} already done)")
+        if saved and saved.get("store") != info["domain"]:
+            raise ConfigError(f"The saved consent sync was against {saved.get('store')}, not {info['domain']}.")
+        typer.echo(f"Plan:            {plan_file} ({len(rows):,} rows, "
+                   f"{sum(o in DONE_OUTCOMES for o in latest.values()):,} already done)")
+        if unresolved_before:
+            typer.echo(f"Unresolved:      {len(unresolved_before):,} from earlier runs "
+                       + ("(retried in this run)" if retry_failed else "(not retried; --retry-failed retries them)"))
         typer.echo(f"This run:        {len(todo):,} customers "
                    f"({sum(r['target_state'] == 'SUBSCRIBED' for r in todo):,} → SUBSCRIBED, "
                    f"{sum(r['target_state'] == 'UNSUBSCRIBED' for r in todo):,} → UNSUBSCRIBED)")
         typer.echo("Writes:          email marketing consent only (customerEmailMarketingConsentUpdate)")
         confirm_write(inst, account=f"{info['name']} ({info['domain']})", record_count=len(todo), yes=yes)
         run = new_run(to, "consent-sync")
-        results = run.path(".results.csv")
+        results = run.dir / f"{run.run_id}.results.csv"  # the run ID is unique even within one second
+        if results.exists():
+            raise ConfigError(f"{results} already exists; nothing was written.")
         writer = CsvWriter(results, RESULT_COLUMNS)
-        store.save_checkpoint(to, CONSENT_KEY, {"plan": plan_key, "store": info["domain"],
+        store.save_checkpoint(to, CONSENT_KEY, {"plan": plan_key, "sha256": plan_hash, "rows": len(rows),
+                                                "store": info["domain"],
                                                 "results": [*(saved or {}).get("results", []), str(results)]})
-        counts = {k: 0 for k in ("written", "skipped", "refused", "not found", "unknown")}
+        counts = {k: 0 for k in ("written", "skipped", "refused", "not found", "identity conflict", "unknown")}
         started = utc_now()
         aborted = None
 
@@ -1364,6 +1397,11 @@ def shopify_consent_sync(
                         record(r, "", "not found")
                         continue
                     before = (node.get("emailMarketingConsent") or {}).get("marketingState") or ""
+                    live_email = (node.get("email") or "").strip().lower()
+                    if live_email != r["email"]:
+                        # The plan's decision came from the Klaviyo profile for the planned email.
+                        record(r, before, "identity conflict", f"Shopify email is now {node.get('email')!r}")
+                        continue
                     if before == r["target_state"]:
                         record(r, before, "skipped", "already in the target state")
                         continue
@@ -1397,13 +1435,23 @@ def shopify_consent_sync(
         finally:
             writer.close()
     secs = max((utc_now() - started).total_seconds(), 1)
-    write_manifest(run, files={results.name: writer.count}, counts={**counts, "seconds": round(secs)},
-                   status="aborted" if aborted else "complete",
-                   extra={"plan": plan_key, "store": info["domain"], "target": target, "limit": limit})
+    # Unresolved across the plan so far: this run's failures, plus earlier ones it didn't retry or resolve.
+    retried = {r["shopify_customer_id"] for r in todo}
+    unresolved = (unresolved_before - retried) | {
+        r["shopify_customer_id"] for r in consent.read_csv(results)
+        if r["outcome"] in UNRESOLVED_OUTCOMES or r["outcome"] == "unknown"}
+    status = "aborted" if aborted else ("completed with errors" if unresolved else "complete")
+    write_manifest(run, files={results.name: writer.count},
+                   counts={**counts, "unresolved_in_plan": len(unresolved), "seconds": round(secs)}, status=status,
+                   extra={"plan": plan_key, "plan_sha256": plan_hash, "store": info["domain"], "target": target,
+                          "limit": limit, "retry_failed": retry_failed})
     typer.echo(f"written {counts['written']:,}, skipped {counts['skipped']:,}, refused {counts['refused']:,}, "
-               f"not found {counts['not found']:,}, unknown {counts['unknown']:,} in {round(secs):,}s")
+               f"not found {counts['not found']:,}, identity conflict {counts['identity conflict']:,}, "
+               f"unknown {counts['unknown']:,} in {round(secs):,}s")
+    if unresolved:
+        typer.echo(f"Unresolved in this plan so far: {len(unresolved):,} (see the results files)")
     typer.echo(f"Results: {results}")
-    if aborted or counts["refused"] or counts["not found"] or counts["unknown"]:
+    if aborted or unresolved:
         raise typer.Exit(1)
 
 
@@ -1442,8 +1490,11 @@ def shopify_consent_validate(
     c = v.counts
     typer.echo(f"checked {c['checked']:,}: ok {c['ok']:,}, mismatched {c['mismatched']:,} "
                f"(D12 {c['d12']:,}, excluded {c['excluded']:,})")
+    if results:
+        typer.echo(f"written by the run: {c['written_checked']:,} checked, {c['written_mismatched']:,} mismatched")
     if klaviyo_before:
-        typer.echo(f"Klaviyo consent changes since the backup: {c['klaviyo_changed']:,} (D14: {c['klaviyo_changed_d14']:,})")
+        typer.echo(f"Klaviyo consent changes since the backup: {c['klaviyo_changed']:,} (D14: {c['klaviyo_changed_d14']:,}); "
+                   f"profiles gone (deleted or merged): {c['klaviyo_missing']:,}")
     for name in files:
         typer.echo(f"  {run.dir / name}")
     if v.mismatches:

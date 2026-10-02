@@ -51,6 +51,7 @@ class Role:
     tags: bool  # adds migrated_from / migration_run_id
     only_hold: bool = False  # sends migration_hold and nothing else
     source: str | None = None  # Klaviyo custom source for subscribes (default: the migration's)
+    email_only: bool = False  # the profile write sends the email and nothing else
 
 
 ROLES: dict[str, Role] = {r.name: r for r in (
@@ -61,7 +62,7 @@ ROLES: dict[str, Role] = {r.name: r for r in (
     Role("kept", "04a, 04b", creates=False, join_list=True, consent=True, tags=True),
     # Consent sync D14: subscribe existing profiles with Shopify's date; nothing else.
     Role("consent", "consent sync D14", creates=False, join_list=False, consent=True, tags=False,
-         source="Shopify email consent (consent sync)"),
+         source="Shopify email consent (consent sync)", email_only=True),
 )}
 
 
@@ -93,6 +94,15 @@ def consent_instruction(row: dict[str, str]) -> str | None:
 
 def consent_timestamp(row: dict[str, str]) -> str:
     return row.get(CONSENT_TIMESTAMP) or row.get(FALLBACK_TIMESTAMP) or ""
+
+
+def role_payload(role: Role, row: dict[str, str], types: dict[str, str], extra: dict[str, Any]) -> dict[str, Any]:
+    """The profile write for one row under `role`. An email-only role (consent)
+    sends just the email: it exists to confirm the profile before the consent
+    step, so no file column (e.g. an audit column) becomes a property."""
+    if role.email_only:
+        return {"email": row["email"]}
+    return payload(row, types, extra, only_hold=role.only_hold)
 
 
 def payload(row: dict[str, str], types: dict[str, str], extra: dict[str, Any], *, only_hold: bool) -> dict[str, Any]:
@@ -242,7 +252,7 @@ def plan(
         tagged = role.tags and not (role.name == "suppress" and present)
         extra = {"migrated_from": MIGRATED_FROM, "migration_run_id": run_id} if tagged else {}
         try:
-            result.payloads.append(payload(row, types, extra, only_hold=role.only_hold))
+            result.payloads.append(role_payload(role, row, types, extra))
         except ValueError as exc:
             result.unreadable.append((identity(row), f"not sent: {exc}"))
             continue
@@ -378,7 +388,7 @@ def problems(
     props = attrs.get("properties") or {}
     pid = attrs.get("_id")
     # The fields and properties this role sends.
-    found += _field_problems(payload(row, types, {}, only_hold=role.only_hold), attrs)
+    found += _field_problems(role_payload(role, row, types, {}), attrs)
     # Migration tags: every tagged role, except existing US profiles in 02.
     if role.tags and not (role.name == "suppress" and us_profile) and props.get("migrated_from") != MIGRATED_FROM:
         found.append("missing migrated_from=ca tag")

@@ -254,6 +254,9 @@ def test_sync_refuses_a_plan_with_not_subscribed(tmp_path, monkeypatch):
 
 # --- consent-validate ---------------------------------------------------------------------
 
+RES_COLUMNS = ["shopify_customer_id", "email", "target_state", "target_date", "outcome"]
+
+
 def test_validate_states_dates_d12_d14_and_klaviyo_changes(tmp_path):
     k, s = exports(tmp_path, [
         kprofile("ok@x.com"),
@@ -268,17 +271,17 @@ def test_validate_states_dates_d12_d14_and_klaviyo_changes(tmp_path):
         scustomer("dated@x.com", "SUBSCRIBED", "2026-10-02T21:00:00Z", cid="4"),
         scustomer("d14@x.com", "SUBSCRIBED", "2026-03-02T02:24:25Z", cid="5"),
     ])
-    res = write(tmp_path / "r.csv", ["shopify_customer_id", "target_state", "target_date", "outcome"], [
-        {"shopify_customer_id": "1", "target_state": "SUBSCRIBED", "target_date": "2025-05-01T10:00:00Z", "outcome": "written"},
-        {"shopify_customer_id": "4", "target_state": "SUBSCRIBED", "target_date": "2025-05-01T10:00:00Z", "outcome": "written"}])
+    res = write(tmp_path / "r.csv", RES_COLUMNS, [
+        {"shopify_customer_id": "1", "email": "ok@x.com", "target_state": "SUBSCRIBED", "target_date": "2025-05-01T10:00:00Z", "outcome": "written"},
+        {"shopify_customer_id": "4", "email": "dated@x.com", "target_state": "SUBSCRIBED", "target_date": "2025-05-01T10:00:00Z", "outcome": "written"}])
     before = write(tmp_path / "before.csv", K_COLUMNS, [kprofile("ok@x.com"), kprofile("d14@x.com", "NEVER_SUBSCRIBED", "", pid="KD14"),
                                                        kprofile("wrong@x.com", "UNSUBSCRIBED", method="PREFERENCE_PAGE")])
     v = consent.validate(k, s, written=consent.written_targets([res]), d14_emails={"d14@x.com"}, klaviyo_before=before)
     problems = {m["email"]: m["problem"] for m in v.mismatches}
-    assert set(problems) == {"wrong@x.com", "dated@x.com"}
+    assert set(problems) == {"wrong@x.com", "dated@x.com"}  # dated appears via the written-customer check
     assert "Klaviyo unsubscribed, Shopify SUBSCRIBED" in problems["wrong@x.com"]
     assert "the run wrote 2025-05-01T10:00:00Z" in problems["dated@x.com"]  # P8b: dates checked where written
-    assert (v.counts["ok"], v.counts["d12"]) == (3, 1)  # ok, d12, d14
+    assert (v.counts["ok"], v.counts["d12"]) == (4, 1)  # ok, d12, d14, dated (its state matches)
     assert v.counts["klaviyo_changed_d14"] == 2 and v.counts["klaviyo_changed"] == 1  # d14 state+date; wrong's method
     assert {c["field"] for c in v.klaviyo_changes if c["email"] == "wrong@x.com"} == {"method"}
 
@@ -329,3 +332,113 @@ def test_consent_role_check_compares_the_consent_date():
     stored = {"_id": "P1", "subscriptions": {"email": {"marketing": {"consent": "SUBSCRIBED", "consent_timestamp": "2026-10-02T21:00:00Z"}}}}
     found = dedupe.problems(role, row, stored, types={}, us_profile=False, join=None, subscribe={"P1"})
     assert any("consent_timestamp" in f for f in found)
+
+
+# --- Review 105 regressions ------------------------------------------------------------
+
+def test_plan_refuses_exports_without_the_needed_columns_or_values(tmp_path):
+    k = write(tmp_path / "k.csv", ["id", "email"], [{"id": "K1", "email": "a@x.com"}])
+    s = write(tmp_path / "s.csv", sc.EXPORT_COLUMNS, [scustomer("a@x.com", "SUBSCRIBED")])
+    with pytest.raises(ValueError, match="missing column"):  # not read as "never subscribed" → D14
+        consent.plan(k, s, now=NOW)
+    k, s = exports(tmp_path, [kprofile("a@x.com", "")], [scustomer("a@x.com", "SUBSCRIBED")])
+    with pytest.raises(ValueError, match="has consent ''"):
+        consent.plan(k, s, now=NOW)
+    k, s = exports(tmp_path, [kprofile("a@x.com")], [scustomer("a@x.com", "")])
+    with pytest.raises(ValueError, match="email state"):
+        consent.plan(k, s, now=NOW)
+    bad = kprofile("a@x.com"); bad["suppressions"] = "{not json"
+    k, s = exports(tmp_path, [bad], [scustomer("a@x.com", "SUBSCRIBED")])
+    with pytest.raises(ValueError, match="valid JSON"):
+        consent.plan(k, s, now=NOW)
+
+
+def test_unsubscribe_suppression_date_is_used_when_consent_has_none():
+    k = consent.klaviyo_consent(kprofile("a@x.com", "NEVER_SUBSCRIBED", "", sup=[("UNSUBSCRIBE", "2025-06-01T00:00:00Z")]))
+    assert (k.state, k.date) == ("unsubscribed", "2025-06-01T00:00:00Z")
+
+
+def test_validate_requires_written_and_d14_customers_to_be_present_and_subscribed(tmp_path):
+    k, s = exports(tmp_path, [kprofile("d14@x.com", "NEVER_SUBSCRIBED", ""), kprofile("moved@x.com")],
+                   [scustomer("d14@x.com", "NOT_SUBSCRIBED", "", cid="5"), scustomer("new@x.com", "SUBSCRIBED", cid="7")])
+    res = write(tmp_path / "r.csv", RES_COLUMNS, [
+        {"shopify_customer_id": "6", "email": "gone@x.com", "target_state": "SUBSCRIBED", "target_date": "", "outcome": "written"},
+        {"shopify_customer_id": "7", "email": "moved@x.com", "target_state": "SUBSCRIBED", "target_date": "", "outcome": "written"}])
+    v = consent.validate(k, s, written=consent.written_targets([res]), d14_emails={"d14@x.com", "lost@x.com"})
+    problems = {m["email"]: m["problem"] for m in v.mismatches}
+    assert "expected subscribed on both sides" in problems["d14@x.com"]  # never/NOT_SUBSCRIBED isn't a D14 pass
+    assert "not in the post-run Shopify export" in problems["gone@x.com"]
+    assert "email is now new@x.com" in problems["moved@x.com"]
+    assert "no matching Klaviyo profile" in problems["lost@x.com"]
+
+
+def test_klaviyo_profiles_gone_since_the_backup_are_listed(tmp_path):
+    k, s = exports(tmp_path, [kprofile("a@x.com")], [scustomer("a@x.com", "SUBSCRIBED")])
+    before = write(tmp_path / "before.csv", K_COLUMNS, [kprofile("a@x.com"), kprofile("merged@x.com")])
+    v = consent.validate(k, s, klaviyo_before=before)
+    assert v.counts["klaviyo_missing"] == 1 and v.klaviyo_changes[0]["email"] == "merged@x.com"
+
+
+class EmailChangedStore(FakeStore):
+    def __call__(self, request):
+        response = super().__call__(request)
+        body = json.loads(request.content)
+        if "nodes(ids" in body["query"]:
+            data = response.json()
+            data["data"]["nodes"][0]["email"] = "someone-else@x.com"
+            return httpx.Response(200, json=data)
+        return response
+
+
+@respx.mock
+def test_sync_never_writes_a_customer_whose_email_changed(tmp_path, monkeypatch):
+    store = EmailChangedStore({"1": "NOT_SUBSCRIBED"})
+    sync_env(tmp_path, monkeypatch, store)
+    result = sync("--plan", str(plan_file(tmp_path, [("1", "SUBSCRIBED", "2024-05-01T00:00:00Z")])))
+    assert result.exit_code == 1 and not store.mutations
+    assert results(tmp_path)["1"]["outcome"] == "identity conflict"
+
+
+@respx.mock
+def test_resume_refuses_an_edited_plan(tmp_path, monkeypatch):
+    sync_env(tmp_path, monkeypatch, FakeStore({"1": "NOT_SUBSCRIBED", "2": "NOT_SUBSCRIBED"}))
+    p = plan_file(tmp_path, [("1", "SUBSCRIBED", ""), ("2", "SUBSCRIBED", "")])
+    assert sync("--plan", str(p), "--limit", "1").exit_code == 0
+    plan_file(tmp_path, [("1", "UNSUBSCRIBED", ""), ("2", "SUBSCRIBED", "")])  # same path, new content
+    result = sync("--plan", str(p), "--resume")
+    assert result.exit_code != 0 and "different now" in str(result.exception)
+
+
+@respx.mock
+def test_unresolved_customers_stay_reported_until_retried(tmp_path, monkeypatch):
+    store = FakeStore({"1": "NOT_SUBSCRIBED", "2": "NOT_SUBSCRIBED"}, refuse={"1"})
+    sync_env(tmp_path, monkeypatch, store)
+    p = plan_file(tmp_path, [("1", "SUBSCRIBED", ""), ("2", "SUBSCRIBED", "")])
+    assert sync("--plan", str(p), "--limit", "1").exit_code == 1  # 1 refused
+    store.refuse.clear()
+    again = sync("--plan", str(p), "--resume")  # writes 2; 1 is still unresolved and not retried
+    assert again.exit_code == 1 and "Unresolved in this plan so far: 1" in again.output
+    assert [m[0] for m in store.mutations] == ["1", "2"]
+    retried = sync("--plan", str(p), "--resume", "--retry-failed")
+    assert retried.exit_code == 0, retried.output
+    assert [m[0] for m in store.mutations] == ["1", "2", "1"] and store.states["1"] == "SUBSCRIBED"
+
+
+@respx.mock
+def test_each_sync_run_gets_its_own_results_file(tmp_path, monkeypatch):
+    sync_env(tmp_path, monkeypatch, FakeStore({"1": "NOT_SUBSCRIBED", "2": "NOT_SUBSCRIBED"}))
+    p = plan_file(tmp_path, [("1", "SUBSCRIBED", ""), ("2", "SUBSCRIBED", "")])
+    fixed = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("migtool.output.utc_now", lambda: fixed)  # both runs in the same second
+    assert sync("--plan", str(p), "--limit", "1").exit_code == 0
+    assert sync("--plan", str(p), "--resume").exit_code == 0
+    files = list((tmp_path / "exports/shopify_us/consent-sync").glob("*.results.csv"))
+    assert len(files) == 2 and set(results(tmp_path)) == {"1", "2"}
+
+
+def test_consent_role_sends_only_the_email():
+    role = dedupe.ROLES["consent"]
+    row = {"Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2026-03-02T02:24:25Z",
+           "email": "d14@x.com", "shopify_customer_id": "5", "first_name": "Changed"}
+    p = dedupe.plan(role, [row], {}, "RUN", lambda e, ph: {"d14@x.com"})
+    assert p.payloads == [{"email": "d14@x.com"}]
