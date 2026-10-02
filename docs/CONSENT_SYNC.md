@@ -20,6 +20,7 @@ Status: **planned; pilot passed (2026-10-02).** The build is specified in `docs/
 | D12 | Klaviyo **never subscribed**, Shopify `UNSUBSCRIBED`: **left as `UNSUBSCRIBED`**, because `NOT_SUBSCRIBED` can't be set (pilot). Validation counts these as matching. |
 | D13 | The user turns **"Sync Klaviyo profiles to Shopify" off** for the duration of the run and back on afterwards. Both steps are on the run checklist. The pilot confirmed that with it off, Klaviyo changes don't reach Shopify. |
 | D14 | Klaviyo **never subscribed** (not suppressed), Shopify **`SUBSCRIBED`** (26 on 2026-10-02): treated as real checkout opt-ins that never reached Klaviyo. **Shopify is kept**, and **Klaviyo is updated to subscribed** with Shopify's `consentUpdatedAt` as the consent date, via a back-dated subscribe with a custom source of "Shopify email consent (consent sync)" (Klaviyo shows the method as API). This is the only change to Klaviyo, and it runs **before** the Shopify writes, after which both sides match. Validation: both subscribed, Klaviyo's date = Shopify's. |
+| D15 | The D14 Klaviyo subscribes go into **LOF USA Newsletter - Main (Xz4KGg)** (user, 2026-10-02). They may receive the Welcome Series, which the user accepts. The Welcome flows' "Placed Order = 0" filter will exclude any who have ordered. |
 
 
 ## 1. The request (as stated by the user, 2026-10-02)
@@ -208,7 +209,7 @@ After the run and validation:
 - ~~Q12~~ → D10.
 - ~~Q13~~ → D12.
 - ~~Q14~~ → D13.
-- **Q15.** D14 needs a Klaviyo list to subscribe into (the subscribe API takes one, and Main would trigger the Welcome Series). Use a new list with no flows, for example "Shopify consent sync – Klaviyo updates", created by the user?
+- ~~Q15~~ → D15.
 
 ## 9. Test-account pilot (draft for approval)
 
