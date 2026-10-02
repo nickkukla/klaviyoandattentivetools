@@ -325,3 +325,9 @@ The built commands ran end to end on the six test accounts. Settings were normal
 - **Attentive (user):** pilot3's SMS still subscribed after the Shopify email unsubscribe.
 
 **Gate met.** The run is planned for **Monday 2026-10-05**, following phase 6's run order in `BUILD_PLAN.md` and the checklist in 5.4.
+
+### 9.10 Re-trial of batched writes (2026-10-02 22:54–22:55 UTC)
+
+After writes were batched as GraphQL aliases (PR #37), the batched path was re-tried on the test accounts. Three pilot-script setup writes created mismatches. `consent-plan` then planned 3 writes: pilot1 → UNSUBSCRIBED with the original date; pilot4 and pilot6 → SUBSCRIBED at the sync time (D16). `consent-sync` sent all three in **one request** and Shopify applied each as sent; a `--resume` in the same second sent nothing and got its own results file. `consent-validate`: 6 of 6 ok, 0 mismatches, all 3 writes verified, no Klaviyo consent changes.
+
+The re-trial left a consent-sync checkpoint saved. On run day, archive `state/shopify_us/shopify-consent-sync.checkpoint.json` (to `exports/consent_sync/trial/checkpoints/`) before the real plan, because `consent-sync` refuses a new plan while one is saved.
