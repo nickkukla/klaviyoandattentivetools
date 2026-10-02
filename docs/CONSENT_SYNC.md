@@ -21,6 +21,7 @@ Status: **planned; pilot passed (2026-10-02).** The build is specified in `docs/
 | D13 | The user turns **"Sync Klaviyo profiles to Shopify" off** for the duration of the run and back on afterwards. Both steps are on the run checklist. The pilot confirmed that with it off, Klaviyo changes don't reach Shopify. |
 | D14 | Klaviyo **never subscribed** (not suppressed), Shopify **`SUBSCRIBED`** (26 on 2026-10-02): treated as real checkout opt-ins that never reached Klaviyo. **Shopify is kept**, and **Klaviyo is updated to subscribed** with Shopify's `consentUpdatedAt` as the consent date, via a back-dated subscribe with a custom source of "Shopify email consent (consent sync)" (Klaviyo shows the method as API). This is the only change to Klaviyo, and it runs **before** the Shopify writes, after which both sides match. Validation: both subscribed, Klaviyo's date = Shopify's. |
 | D15 | The D14 Klaviyo subscribes go into **LOF USA Newsletter - Main (Xz4KGg)** (user, 2026-10-02). They may receive the Welcome Series, which the user accepts. The Welcome flows' "Placed Order = 0" filter will exclude any who have ordered. |
+| D16 | **Shopify silently ignores a consent change dated before the customer's current consent date** (no error; state and `updatedAt` unchanged; found in the phase 6 trial, 2026-10-02). Where Shopify's date is newer than or equal to Klaviyo's original date (or there's no date), the write is **dated at the sync time** (user, option A), so Klaviyo's state still wins (D11). Klaviyo keeps the original date. On 2026-10-02 data: **506** writes. `consent-sync` re-checks the live date at write time and records any change Shopify didn't apply as **ignored** (unresolved). |
 
 
 ## 1. The request (as stated by the user, 2026-10-02)
@@ -121,7 +122,7 @@ Fresh exports: Klaviyo US 2026-10-02T17:57Z (818,110 profiles), Shopify US 2026-
 | never | UNSUBSCRIBED | leave; counts as a match (D12) | 2 |
 | never | INVALID | can't be written | 6 |
 
-**Shopify writes: 261,017** (73,080 to `SUBSCRIBED`, 187,937 to `UNSUBSCRIBED`). **Klaviyo writes: 26** (D14). In **504** writes Shopify's consent date is newer than Klaviyo's (D11: overwritten). No write has a future date or is missing a date. A client-facing summary of these counts is the doc "Shopify email consent sync – planned changes".
+**Shopify writes: 261,017** (73,080 to `SUBSCRIBED`, 187,937 to `UNSUBSCRIBED`). **Klaviyo writes: 26** (D14). In **506** writes Shopify's consent date is newer than or equal to Klaviyo's. They're overwritten (D11) and dated at the sync time (D16). No write has a future date or is missing a date. A client-facing summary of these counts is the doc "Shopify email consent sync – planned changes".
 
 ## 5. Consent dates and authority (for discussion)
 

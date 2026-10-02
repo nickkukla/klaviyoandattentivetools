@@ -13,6 +13,9 @@ D1–D15 and section 4.1:
   `SUBSCRIBED` is kept and Klaviyo is subscribed with Shopify's date (D14).
 - The date written is the original one (D5): `ca_consent_timestamp` /
   `ca_suppression_timestamp` on migrated CA profiles, Klaviyo's own otherwise.
+  Where Shopify's consent date is newer than or equal to it (or there's no
+  date), the write is dated at the sync time instead (D16): Shopify silently
+  ignores a change dated before its current consent date.
 """
 
 from __future__ import annotations
@@ -29,7 +32,11 @@ from typing import Any
 from migtool.output import parse_iso
 
 PLAN_COLUMNS = ["shopify_customer_id", "email", "klaviyo_profile_id", "klaviyo_state", "shopify_state",
-                "target_state", "target_date", "shopify_date", "shopify_newer"]
+                "target_state", "target_date", "date_rule", "klaviyo_date", "shopify_date", "shopify_newer"]
+# D16: Shopify silently ignores a consent change dated before the customer's
+# current consent date (trial, 2026-10-02). Such writes are dated at the sync time.
+DATE_ORIGINAL = "original"
+DATE_SYNC_TIME = "sync time"
 D14_COLUMNS = ["Email Marketing Consent", "Email Marketing Consent Timestamp", "email", "shopify_customer_id"]
 EXCLUDED_COLUMNS = ["email", "shopify_customer_id", "klaviyo_profile_id", "klaviyo_state", "shopify_state", "reason"]
 MISMATCH_COLUMNS = ["email", "shopify_customer_id", "klaviyo_profile_id", "problem"]
@@ -155,6 +162,7 @@ class Plan:
     no_date: int = 0
     clamped: int = 0
     shopify_newer: int = 0
+    sync_time: int = 0  # writes dated at the sync time (D16)
 
 
 def plan(klaviyo_path: Path, shopify_path: Path, *, now: datetime, only: set[str] | None = None) -> Plan:
@@ -184,11 +192,14 @@ def plan(klaviyo_path: Path, shopify_path: Path, *, now: datetime, only: set[str
             else:
                 result.no_date += 1
             sh_date = s.get("email_consent_updated") or ""
-            newer = bool(sh_date and date and parse_iso(sh_date) > parse_iso(date))
+            newer = bool(sh_date and date and parse_iso(sh_date) >= parse_iso(date))
             result.shopify_newer += newer
+            sync_time = newer or not date  # D16
+            result.sync_time += sync_time
             result.writes.append({**base, "klaviyo_state": k.state, "shopify_state": sh_state,
-                                  "target_state": TARGET[k.state], "target_date": date,
-                                  "shopify_date": sh_date, "shopify_newer": newer})
+                                  "target_state": TARGET[k.state], "target_date": "" if sync_time else date,
+                                  "date_rule": DATE_SYNC_TIME if sync_time else DATE_ORIGINAL,
+                                  "klaviyo_date": date, "shopify_date": sh_date, "shopify_newer": newer})
         elif act == "d14":
             result.d14.append({"Email Marketing Consent": "Subscribe",
                                "Email Marketing Consent Timestamp": s.get("email_consent_updated") or "",
@@ -212,7 +223,8 @@ class Validation:
 
 def written_targets(results_paths: list[Path]) -> dict[str, tuple[str, str, str]]:
     """Shopify customer ID → (state, date, email) for every customer a sync run
-    wrote (the latest result per customer wins)."""
+    wrote; the date is the one sent (an original date or the sync time). The
+    latest result per customer wins."""
     out: dict[str, tuple[str, str, str]] = {}
     for path in results_paths:
         for row in read_csv(path, {"shopify_customer_id", "email", "target_state", "target_date", "outcome"}):

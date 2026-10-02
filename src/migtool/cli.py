@@ -1219,13 +1219,13 @@ def shopify_customers(
 
 CONSENT_BATCH = 50  # customers read (and written) per round
 CONSENT_KEY = "shopify-consent-sync"
-RESULT_COLUMNS = ["time", "shopify_customer_id", "email", "target_state", "target_date", "state_before",
-                  "outcome", "detail"]
+RESULT_COLUMNS = ["time", "shopify_customer_id", "email", "target_state", "target_date", "date_rule",
+                  "state_before", "outcome", "detail"]
 # A customer's latest outcome across a plan's runs decides what --resume does:
 # done ones are skipped; unresolved ones are skipped and reported (and retried
 # only with --retry-failed); `unknown` is always retried.
 DONE_OUTCOMES = {"written", "skipped"}
-UNRESOLVED_OUTCOMES = {"refused", "not found", "identity conflict"}
+UNRESOLVED_OUTCOMES = {"refused", "not found", "identity conflict", "ignored"}
 
 
 def _file_sha256(path: Path) -> str:
@@ -1282,6 +1282,7 @@ def shopify_consent_plan(
         files[path.name] = _write_rows(path, columns, rows)
     by_target = {t: sum(1 for w in p.writes if w["target_state"] == t) for t in ("SUBSCRIBED", "UNSUBSCRIBED")}
     counts = {"klaviyo_profiles": p.profiles, "matched": p.matched, "shopify_writes": len(p.writes), **by_target,
+              "dated_at_sync_time": p.sync_time,
               "klaviyo_d14": len(p.d14), "excluded": len(p.excluded), "shopify_newer": p.shopify_newer,
               "no_date": p.no_date, "future_dates_clamped": p.clamped,
               "by_transition": {" | ".join(k): v for k, v in sorted(p.counts.items())}}
@@ -1293,6 +1294,7 @@ def shopify_consent_plan(
         typer.echo(f"  {k:12} | {sh:14} | {act:8} | {n:,}")
     typer.echo(f"Shopify writes: {len(p.writes):,} ({by_target['SUBSCRIBED']:,} SUBSCRIBED, "
                f"{by_target['UNSUBSCRIBED']:,} UNSUBSCRIBED); Shopify date newer than Klaviyo's: {p.shopify_newer:,}")
+    typer.echo(f"Dated at the sync time (D16: Shopify's date is newer or equal, or there's no date): {p.sync_time:,}")
     typer.echo(f"Klaviyo writes (D14): {len(p.d14):,}; excluded: {len(p.excluded):,}")
     if p.no_date or p.clamped:
         typer.echo(f"Writes without a date: {p.no_date:,}; future dates set to now: {p.clamped:,}")
@@ -1377,15 +1379,25 @@ def shopify_consent_sync(
         store.save_checkpoint(to, CONSENT_KEY, {"plan": plan_key, "sha256": plan_hash, "rows": len(rows),
                                                 "store": info["domain"],
                                                 "results": [*(saved or {}).get("results", []), str(results)]})
-        counts = {k: 0 for k in ("written", "skipped", "refused", "not found", "identity conflict", "unknown")}
+        counts = {k: 0 for k in ("written", "skipped", "refused", "not found", "identity conflict", "ignored", "unknown")}
         started = utc_now()
         aborted = None
 
-        def record(r: dict, before: str, outcome: str, detail: str = "") -> None:
+        def record(r: dict, before: str, outcome: str, detail: str = "", *, date: str = "", rule: str = "") -> None:
             counts[outcome] += 1
             writer.write({"time": iso(utc_now()), "shopify_customer_id": r["shopify_customer_id"], "email": r["email"],
-                          "target_state": r["target_state"], "target_date": r["target_date"],
+                          "target_state": r["target_state"], "target_date": date, "date_rule": rule,
                           "state_before": before, "outcome": outcome, "detail": detail})
+
+        def outcome_of(r: dict, stored: dict, sent: str) -> tuple[str, str]:
+            """Written only if Shopify now holds the target state; Shopify ignores
+            a change dated before its current consent date without an error."""
+            state, at = stored.get("marketingState"), stored.get("consentUpdatedAt")
+            if state != r["target_state"]:
+                return "ignored", f"Shopify kept {state} {at}"
+            if not consent.same_second(at, sent):
+                return "written", f"stored {state} {at} (sent {sent})"
+            return "written", f"stored {state} {at}"
 
         try:
             for i in range(0, len(todo), CONSENT_BATCH):
@@ -1396,7 +1408,8 @@ def shopify_consent_sync(
                     if node is None:
                         record(r, "", "not found")
                         continue
-                    before = (node.get("emailMarketingConsent") or {}).get("marketingState") or ""
+                    live = node.get("emailMarketingConsent") or {}
+                    before = live.get("marketingState") or ""
                     live_email = (node.get("email") or "").strip().lower()
                     if live_email != r["email"]:
                         # The plan's decision came from the Klaviyo profile for the planned email.
@@ -1405,24 +1418,31 @@ def shopify_consent_sync(
                     if before == r["target_state"]:
                         record(r, before, "skipped", "already in the target state")
                         continue
-                    date = r["target_date"] or None
-                    if date and parse_iso(date) > utc_now():
-                        date = iso(utc_now())  # Shopify refuses future dates
+                    # The original date, unless Shopify's live date is newer or equal (it
+                    # would ignore the change) or there's none: then the sync time (D16).
+                    now = utc_now().replace(microsecond=0)
+                    date, rule = r["target_date"], consent.DATE_ORIGINAL
+                    live_at = live.get("consentUpdatedAt")
+                    if not date or parse_iso(date) > now or (live_at and parse_iso(live_at) >= parse_iso(date)):
+                        date, rule = now.strftime("%Y-%m-%dT%H:%M:%SZ"), consent.DATE_SYNC_TIME
                     try:
                         result = client.update_email_consent(r["shopify_customer_id"], r["target_state"], date)
                     except ApiError as exc:
                         back = client.email_consents([r["shopify_customer_id"]]).get(r["shopify_customer_id"]) or {}
-                        now_state = (back.get("emailMarketingConsent") or {}).get("marketingState")
-                        if now_state == r["target_state"]:
-                            record(r, before, "written", f"response lost ({exc.status}); confirmed by read-back")
+                        stored = back.get("emailMarketingConsent") or {}
+                        if stored.get("marketingState") == r["target_state"]:
+                            out, detail = outcome_of(r, stored, date)
+                            record(r, before, out, f"response lost ({exc.status}); read back: {detail}", date=date, rule=rule)
                         else:
-                            record(r, before, "unknown", f"response lost ({exc.status}); state now {now_state}")
+                            record(r, before, "unknown", f"response lost ({exc.status}); state now "
+                                   f"{stored.get('marketingState')}", date=date, rule=rule)
                         continue
                     if result.get("userErrors"):
-                        record(r, before, "refused", "; ".join(e.get("message", "") for e in result["userErrors"]))
+                        record(r, before, "refused", "; ".join(e.get("message", "") for e in result["userErrors"]),
+                               date=date, rule=rule)
                     else:
-                        stored = ((result.get("customer") or {}).get("emailMarketingConsent") or {})
-                        record(r, before, "written", f"stored {stored.get('marketingState')} {stored.get('consentUpdatedAt')}")
+                        out, detail = outcome_of(r, (result.get("customer") or {}).get("emailMarketingConsent") or {}, date)
+                        record(r, before, out, detail, date=date, rule=rule)
                 writer.flush()
                 n = i + len(batch)
                 if n % 1000 < CONSENT_BATCH or n == len(todo):
@@ -1447,7 +1467,7 @@ def shopify_consent_sync(
                           "limit": limit, "retry_failed": retry_failed})
     typer.echo(f"written {counts['written']:,}, skipped {counts['skipped']:,}, refused {counts['refused']:,}, "
                f"not found {counts['not found']:,}, identity conflict {counts['identity conflict']:,}, "
-               f"unknown {counts['unknown']:,} in {round(secs):,}s")
+               f"ignored {counts['ignored']:,}, unknown {counts['unknown']:,} in {round(secs):,}s")
     if unresolved:
         typer.echo(f"Unresolved in this plan so far: {len(unresolved):,} (see the results files)")
     typer.echo(f"Results: {results}")

@@ -543,7 +543,7 @@ Local and read-only: joins a Klaviyo `profiles export` and a Shopify `customers-
 - `<run>.klaviyo_d14.csv`: the D14 Klaviyo subscribes, in the dedupe layout
 - `<run>.excluded.csv`: D12 and unwritable (`INVALID`/`REDACTED`) customers
 
-It prints counts by transition. Future dates are set to the plan time, since Shopify refuses them. `--emails <csv>` limits the plan to those emails, for trials.
+It prints counts by transition. Future dates are set to the plan time, since Shopify refuses them. Where Shopify's consent date is newer than or equal to Klaviyo's, or there's no date, the row is marked `date_rule = sync time` (D16): Shopify silently ignores a change dated before its current consent date, so these are dated when they're written. Klaviyo's date is kept in `klaviyo_date`. `--emails <csv>` limits the plan to those emails, for trials.
 
 ```
 uv run migtool shopify consent-plan --klaviyo exports/klaviyo_us/profiles/<ts>.csv --shopify exports/shopify_us/customers-export/<ts>.csv
@@ -567,10 +567,11 @@ The only Shopify write.
   - reads the customers' current email consent and email
   - **identity conflict** if a customer's email no longer matches the plan: it isn't written, because the decision came from the Klaviyo profile of the planned email
   - **skips customers already in the target state:** Shopify treats even an identical write as a customer update and notifies apps
-  - sends `customerEmailMarketingConsentUpdate` for the rest
-- **Results** per customer go to `<run-id>.results.csv` (one file per run): written, skipped, refused (with Shopify's message), not found, identity conflict, or unknown.
+  - sends `customerEmailMarketingConsentUpdate` for the rest, dated with the original date, or the sync time if Shopify's live date is newer or equal (D16)
+  - counts a write as written only if Shopify now holds the target state; one Shopify accepted without applying is recorded as **ignored**
+- **Results** per customer go to `<run-id>.results.csv` (one file per run): written, skipped, refused (with Shopify's message), not found, identity conflict, ignored, or unknown. Each row has the date actually sent and its `date_rule`.
 - **A lost response is never resent.** The customer is read back instead.
-- **Exit code:** 1 if anything in the plan is still unresolved (refused, not found, identity conflict or unknown), including earlier runs' failures that a resume didn't retry, or if the run stopped.
+- **Exit code:** 1 if anything in the plan is still unresolved (refused, not found, identity conflict, ignored or unknown), including earlier runs' failures that a resume didn't retry, or if the run stopped.
 
 | Flag | |
 |---|---|

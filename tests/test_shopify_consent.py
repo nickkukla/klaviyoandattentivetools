@@ -96,6 +96,10 @@ def test_plan_writes_d14_excluded_and_dates(tmp_path):
     assert by["unsub@x.com"]["target_state"] == "UNSUBSCRIBED"
     assert by["future@x.com"]["target_date"] == "2026-10-02T20:00:00Z" and p.clamped == 1
     assert by["newer@x.com"]["shopify_newer"] is True and p.shopify_newer == 1
+    # D16: Shopify ignores a change dated before its own date, so this one is dated at the sync time.
+    assert (by["newer@x.com"]["date_rule"], by["newer@x.com"]["target_date"]) == ("sync time", "")
+    assert by["newer@x.com"]["klaviyo_date"] == "2024-01-01T00:00:00Z"
+    assert by["sub@x.com"]["date_rule"] == "original" and p.sync_time == 1
     assert p.d14 == [{"Email Marketing Consent": "Subscribe", "Email Marketing Consent Timestamp": "2026-03-02T02:24:25Z",
                       "email": "never@x.com", "shopify_customer_id": by_id(s, "never@x.com")}]
     assert [e["email"] for e in p.excluded] == ["d12@x.com"]
@@ -143,8 +147,10 @@ def test_query_still_refuses_mutations():
 class FakeStore:
     """Shopify customers' email consent, answering the queries consent-sync sends."""
 
-    def __init__(self, states, *, scopes=("read_customers", "write_customers"), refuse=(), lose=(), domain=SHOP):
+    def __init__(self, states, *, scopes=("read_customers", "write_customers"), refuse=(), lose=(), domain=SHOP,
+                 dates=None):
         self.states = dict(states)  # numeric id → state
+        self.dates = dict(dates or {})  # numeric id → consentUpdatedAt
         self.scopes, self.refuse, self.lose, self.domain = scopes, set(refuse), set(lose), domain
         self.mutations = []
 
@@ -159,7 +165,8 @@ class FakeStore:
             for gid in v["ids"]:
                 cid = gid.rsplit("/", 1)[-1]
                 nodes.append(None if cid not in self.states else {"id": gid, "email": f"{cid}@x.com", "emailMarketingConsent": {
-                    "marketingState": self.states[cid], "marketingOptInLevel": "SINGLE_OPT_IN", "consentUpdatedAt": None}})
+                    "marketingState": self.states[cid], "marketingOptInLevel": "SINGLE_OPT_IN",
+                    "consentUpdatedAt": self.dates.get(cid)}})
             return httpx.Response(200, json={"data": {"nodes": nodes}})
         assert "customerEmailMarketingConsentUpdate" in q, q
         cid = v["input"]["customerId"].rsplit("/", 1)[-1]
@@ -167,11 +174,17 @@ class FakeStore:
         if cid in self.refuse:
             return httpx.Response(200, json={"data": {"customerEmailMarketingConsentUpdate": {
                 "customer": None, "userErrors": [{"field": ["input"], "message": "nope", "code": "INVALID"}]}}})
-        self.states[cid] = v["input"]["emailMarketingConsent"]["marketingState"]
+        sent = v["input"]["emailMarketingConsent"]
+        at = sent.get("consentUpdatedAt")
+        # Like Shopify: a change dated before the current consent date is ignored, without an error.
+        if not (at and self.dates.get(cid) and at < self.dates[cid]):
+            self.states[cid], self.dates[cid] = sent["marketingState"], at
         if cid in self.lose:
             return httpx.Response(503)
         return httpx.Response(200, json={"data": {"customerEmailMarketingConsentUpdate": {
-            "customer": {"id": v["input"]["customerId"], "emailMarketingConsent": v["input"]["emailMarketingConsent"]},
+            "customer": {"id": v["input"]["customerId"], "emailMarketingConsent": {
+                "marketingState": self.states[cid], "marketingOptInLevel": "SINGLE_OPT_IN",
+                "consentUpdatedAt": self.dates.get(cid)}},
             "userErrors": []}}})
 
 
@@ -213,7 +226,7 @@ def test_sync_writes_skips_refuses_and_reads_back_lost_responses(tmp_path, monke
     r = results(tmp_path)
     assert {k: v["outcome"] for k, v in r.items()} == {"1": "written", "2": "skipped", "3": "refused",
                                                        "4": "written", "5": "not found"}
-    assert "confirmed by read-back" in r["4"]["detail"] and r["3"]["detail"] == "nope"
+    assert "read back: stored UNSUBSCRIBED" in r["4"]["detail"] and r["3"]["detail"] == "nope"
     assert [m[0] for m in store.mutations] == ["1", "3", "4"]  # 2 was already SUBSCRIBED: nothing sent
     assert store.mutations[0][1] == {"marketingState": "SUBSCRIBED", "marketingOptInLevel": "SINGLE_OPT_IN",
                                      "consentUpdatedAt": "2024-05-01T00:00:00Z"}
@@ -442,3 +455,44 @@ def test_consent_role_sends_only_the_email():
            "email": "d14@x.com", "shopify_customer_id": "5", "first_name": "Changed"}
     p = dedupe.plan(role, [row], {}, "RUN", lambda e, ph: {"d14@x.com"})
     assert p.payloads == [{"email": "d14@x.com"}]
+
+
+# --- D16: Shopify ignores changes dated before its current consent date ---------------------
+
+@respx.mock
+def test_sync_dates_at_sync_time_when_shopify_is_newer_and_detects_ignored_writes(tmp_path, monkeypatch):
+    # 1: plan has an original date, but Shopify's live date is newer → sent at the sync time and applied.
+    # 2: plan says "sync time" (blank date) → sent at the sync time.
+    store = FakeStore({"1": "SUBSCRIBED", "2": "SUBSCRIBED"},
+                      dates={"1": "2026-06-01T00:00:00Z", "2": "2026-01-01T00:00:00Z"})
+    sync_env(tmp_path, monkeypatch, store)
+    p = plan_file(tmp_path, [("1", "UNSUBSCRIBED", "2025-08-01T00:00:00Z"), ("2", "UNSUBSCRIBED", "")])
+    result = sync("--plan", str(p))
+    assert result.exit_code == 0, result.output
+    r = results(tmp_path)
+    assert {k: (v["outcome"], v["date_rule"]) for k, v in r.items()} == {"1": ("written", "sync time"),
+                                                                       "2": ("written", "sync time")}
+    assert store.states == {"1": "UNSUBSCRIBED", "2": "UNSUBSCRIBED"}
+    assert all(m[1]["consentUpdatedAt"] > "2026-06-01" for m in store.mutations)
+
+
+class IgnoringStore(FakeStore):
+    """Accepts every write without an error but changes nothing."""
+
+    def __call__(self, request):
+        body = json.loads(request.content)
+        if "customerEmailMarketingConsentUpdate" in body["query"]:
+            cid = body["variables"]["input"]["customerId"].rsplit("/", 1)[-1]
+            self.mutations.append((cid, body["variables"]["input"]["emailMarketingConsent"]))
+            return httpx.Response(200, json={"data": {"customerEmailMarketingConsentUpdate": {
+                "customer": {"id": f"gid://shopify/Customer/{cid}", "emailMarketingConsent": {
+                    "marketingState": self.states[cid], "consentUpdatedAt": None}}, "userErrors": []}}})
+        return super().__call__(request)
+
+
+@respx.mock
+def test_a_write_shopify_ignores_is_not_counted_as_written(tmp_path, monkeypatch):
+    sync_env(tmp_path, monkeypatch, IgnoringStore({"1": "SUBSCRIBED"}))
+    result = sync("--plan", str(plan_file(tmp_path, [("1", "UNSUBSCRIBED", "2025-01-01T00:00:00Z")])))
+    assert result.exit_code == 1 and "ignored 1" in result.output
+    assert results(tmp_path)["1"]["outcome"] == "ignored"
