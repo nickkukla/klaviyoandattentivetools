@@ -1,24 +1,25 @@
 # Klaviyo US → Shopify US consent sync (plan, not started)
 
-Status: **discussion**. No code, no integration changes, and no writes to Klaviyo, Shopify or Attentive until the open questions below are answered and the plan is agreed.
+Status: **planned; pilot passed (2026-10-02).** The build is specified in `docs/BUILD_PLAN.md` (phase 6). No production writes until the command is built, reviewed and the run is started by the user.
 
 ## 0. Decisions so far (2026-10-02)
 
 | # | Decision |
 |---|---|
 | D1 | **Email marketing only.** No SMS consent changes are made (Klaviyo has no SMS consent state; see 2.3). The client is told this. |
-| D2 | Klaviyo **never subscribed** → Shopify **`NOT_SUBSCRIBED`** ("null"). Shopify `SUBSCRIBED` is changed to `NOT_SUBSCRIBED`; Shopify `NOT_SUBSCRIBED` counts as a match. |
+| D2 | Klaviyo **never subscribed**, Shopify `SUBSCRIBED`: **superseded by D14.** The pilot showed the API can't set `NOT_SUBSCRIBED` ("Cannot specify NOT_SUBSCRIBED as a marketing state input"). Klaviyo never subscribed + Shopify `NOT_SUBSCRIBED` remains a match. |
 | D3 | Klaviyo **suppressed** (bounce, spam complaint, manual) → Shopify **`UNSUBSCRIBED`**, whatever Shopify shows now. |
-| D4 | A separate Shopify token with `write_customers` is provisioned by the user for this job; the current token stays read-only. |
+| D4 | `write_customers` was added **in place to the single existing Shopify token** (2026-10-02). migtool's Shopify client still refuses every mutation except the bulk-export start and the one consent mutation added for this job (phase 6). The user removes the write scopes after the sync (task #11). |
 | D5 | Shopify's consent date is set to the **original** consent date: `ca_consent_timestamp` / `ca_suppression_timestamp` for migrated CA profiles, Klaviyo's own date otherwise. |
 | D6 | **Shopify-newer conflicts:** count them before deciding (section 5.1). Nothing changes until there's a decision. |
 | D7 | Klaviyo app settings in Shopify US (read by the user): *From Shopify*: "Sync Shopify email subscribers to Klaviyo" **on**, into list **LOF USA Newsletter - Main** (Xz4KGg); SMS sync on but inactive (texting not set up). *To Shopify*: "Sync Klaviyo profiles to Shopify" **on**, existing Shopify customers only; it creates no new customers. |
 | D8 | **Full Klaviyo US backup** (all ~815k profiles) immediately before any change. |
-| D9 | **Welcome Series protection:** point the Shopify→Klaviyo subscriber sync at a dummy list (no flows) for the duration of the run (preferred), or filter the two Welcome flows. See 5.3. |
+| D9 | **Final (2026-10-02): Option B.** During the run, "Sync Klaviyo profiles to Shopify" is off (D13) and "Sync Shopify email subscribers to Klaviyo" stays **on**, pointed at the dummy list **NK_consentsync (VhVV8j)** in Klaviyo US (empty, no flows). Real signups keep reaching Klaviyo during the run; any feedback from our writes is contained and visible on the dummy list. Start with a **canary batch** of subscribe and unsubscribe writes, wait 15 minutes, check the dummy list and those customers' Klaviyo consent, and continue only if nothing changed. Afterwards, restore Main and move real signups from the dummy list to Main. Rejected: A (both directions off: a gap for real customers' consent changes needing a catch-up) and C (Main list: list additions would trigger the Welcome Series). |
 | D10 | Klaviyo **unsubscribed**, Shopify `NOT_SUBSCRIBED` → write **`UNSUBSCRIBED`** (Q12). |
 | D11 | **Overwrite all** Shopify-newer conflicts, including the 165 re-subscribes (Q5): Klaviyo is the source of truth. |
-| D12 | Klaviyo **never subscribed**, Shopify `UNSUBSCRIBED` → `NOT_SUBSCRIBED` if Shopify allows it, otherwise leave `UNSUBSCRIBED` (Q13). |
-| D13 | The user turns **"Sync Klaviyo profiles to Shopify" off** for the duration of the run and back on afterwards; both steps are on the run checklist (Q14). |
+| D12 | Klaviyo **never subscribed**, Shopify `UNSUBSCRIBED`: **left as `UNSUBSCRIBED`**, because `NOT_SUBSCRIBED` can't be set (pilot). Validation counts these as matching. |
+| D13 | The user turns **"Sync Klaviyo profiles to Shopify" off** for the duration of the run and back on afterwards. Both steps are on the run checklist. The pilot confirmed that with it off, Klaviyo changes don't reach Shopify. |
+| D14 | Klaviyo **never subscribed** (not suppressed), Shopify **`SUBSCRIBED`** (26 on 2026-10-02): treated as real checkout opt-ins that never reached Klaviyo. **Shopify is kept**, and **Klaviyo is updated to subscribed** with Shopify's `consentUpdatedAt` as the consent date, via a back-dated subscribe with a custom source of "Shopify email consent (consent sync)" (Klaviyo shows the method as API). This is the only change to Klaviyo, and it runs **before** the Shopify writes, after which both sides match. Validation: both subscribed, Klaviyo's date = Shopify's. |
 
 
 ## 1. The request (as stated by the user, 2026-10-02)
@@ -58,7 +59,7 @@ Conclusions:
 | Klaviyo profiles with a Shopify customer by email | **508,065** |
 | … whose email consent differs (subscribed in one, not the other) | **147,086** (72,875 Shopify yes / Klaviyo no; 74,211 Shopify no / Klaviyo yes, of which 54,180 are migrated CA customers whose Shopify consent the import left blank) |
 
-So the matched set is about 508k (not ~300k). Under the agreed mapping (section 4.1), **261,490** need a write; the rest already match. That count is higher than the simple subscribed/not-subscribed split above because suppressed profiles and never-subscribed cases are treated separately.
+So the matched set is about 508k (not ~300k). Under the agreed mapping, the fresh dry run (section 4.1, 2026-10-02) gives **261,017** Shopify writes plus 26 Klaviyo writes (D14); the rest already match. That count is higher than the simple subscribed/not-subscribed split above because suppressed profiles and never-subscribed cases are treated separately.
 
 ### 2.3 SMS
 
@@ -99,27 +100,27 @@ These are the full set of customer-level marketing consent fields. The writes ar
 | B. Klaviyo "touch" | Edit profiles in Klaviyo and let the integration push | No Shopify token | **Shown not to work** (2.1): property edits don't sync, historical subscribes don't sync, re-subscribing rewrites Klaviyo consent |
 | C. Shopify customer CSV import | Admin CSV import with "Accepts Email Marketing" | No API token | Can't set consent dates; overwrites every column in the file, so other customer data is at risk; poor validation; no per-row results |
 
-## 4.1 Mapping and counts (Sep 28 data; refresh before the run)
+## 4.1 Mapping and counts (dry run, 2026-10-02)
 
-Matched profiles (Klaviyo email = Shopify email): 508,065. The target state comes from D1–D3. Klaviyo "unsubscribed" includes profiles whose only suppression is `UNSUBSCRIBE`.
+Fresh exports: Klaviyo US 2026-10-02T17:57Z (818,110 profiles), Shopify US 2026-10-02T18:02Z (649,535 customers, 508,539 with an email). The six pilot test accounts are excluded. **508,533** profiles match a Shopify customer by email; no email is on more than one Shopify customer. The per-customer plan is in `exports/consent_sync/dryrun/plan_20261002.csv`. **Recompute immediately before the run.**
 
 | Klaviyo | Shopify now | Action | Count |
 |---|---|---|---|
-| subscribed | SUBSCRIBED | match | 143,705 |
-| subscribed | NOT_SUBSCRIBED | write `SUBSCRIBED` | 73,275 |
-| subscribed | UNSUBSCRIBED | write `SUBSCRIBED` | 318 |
-| unsubscribed | UNSUBSCRIBED | match | 40,116 |
-| unsubscribed | SUBSCRIBED | write `UNSUBSCRIBED` | 72,151 |
-| unsubscribed | NOT_SUBSCRIBED | write `UNSUBSCRIBED` (D10) | 101,685 |
-| suppressed | UNSUBSCRIBED | match | 513 |
-| suppressed | SUBSCRIBED | write `UNSUBSCRIBED` | 7,273 |
-| suppressed | NOT_SUBSCRIBED | write `UNSUBSCRIBED` (D3) | 6,760 |
-| never | NOT_SUBSCRIBED | match (D2) | 62,235 |
-| never | SUBSCRIBED | write `NOT_SUBSCRIBED` (D2) | 26 |
-| never | UNSUBSCRIBED | write `NOT_SUBSCRIBED` if allowed, else leave (D12) | 2 |
+| subscribed | SUBSCRIBED | match | 143,791 |
+| subscribed | NOT_SUBSCRIBED | write `SUBSCRIBED` | 72,759 |
+| subscribed | UNSUBSCRIBED | write `SUBSCRIBED` | 321 |
+| unsubscribed | UNSUBSCRIBED | match | 40,992 |
+| unsubscribed | SUBSCRIBED | write `UNSUBSCRIBED` | 72,184 |
+| unsubscribed | NOT_SUBSCRIBED | write `UNSUBSCRIBED` (D10) | 101,489 |
+| suppressed | UNSUBSCRIBED | match | 522 |
+| suppressed | SUBSCRIBED | write `UNSUBSCRIBED` (D3) | 7,477 |
+| suppressed | NOT_SUBSCRIBED | write `UNSUBSCRIBED` (D3) | 6,787 |
+| never | NOT_SUBSCRIBED | match | 62,177 |
+| never | SUBSCRIBED | **Klaviyo → subscribed** with Shopify's date (D14) | 26 |
+| never | UNSUBSCRIBED | leave; counts as a match (D12) | 2 |
 | never | INVALID | can't be written | 6 |
 
-**Writes: 261,490** (73,593 to subscribed; 187,869 to unsubscribed; 28 to not subscribed).
+**Shopify writes: 261,017** (73,080 to `SUBSCRIBED`, 187,937 to `UNSUBSCRIBED`). **Klaviyo writes: 26** (D14). In **504** writes Shopify's consent date is newer than Klaviyo's (D11: overwritten). No write has a future date or is missing a date. A client-facing summary of these counts is the doc "Shopify email consent sync – planned changes".
 
 ## 5. Consent dates and authority (for discussion)
 
@@ -131,7 +132,7 @@ Matched profiles (Klaviyo email = Shopify email): 508,065. The target state come
 - **Shopify newer than Klaviyo:** the user's position is to overwrite. One caveat: the integration brings Shopify checkout opt-ins into Klaviyo (method `SHOPIFY`, "Customer Webhook"), so a genuine newer Shopify opt-in should already be in Klaviyo. Where it isn't, that's a sync gap rather than stale data. Proposal: overwrite as decided, but have the dry run list "Shopify newer" cases separately so the volume is known before the run (Q5).
 ### 5.1 How many conflicts (D6)
 
-Writes where Shopify's consent date is **newer** than Klaviyo's original date: **536** (0.3% of writes).
+Writes where Shopify's consent date is **newer** than Klaviyo's original date: **536** on Sep 28 data (0.3% of writes); **504** in the 2026-10-02 dry run. Per D11, all are overwritten.
 
 | Klaviyo → write | Shopify now | Count | What overwriting means |
 |---|---|---|---|
@@ -207,3 +208,105 @@ After the run and validation:
 - ~~Q12~~ → D10.
 - ~~Q13~~ → D12.
 - ~~Q14~~ → D13.
+- **Q15.** D14 needs a Klaviyo list to subscribe into (the subscribe API takes one, and Main would trigger the Welcome Series). Use a new list with no flows, for example "Shopify consent sync – Klaviyo updates", created by the user?
+
+## 9. Test-account pilot (draft for approval)
+
+**Purpose:** answer, on test accounts only, the questions that decide the build:
+
+- what Shopify accepts
+- what flows back into Klaviyo
+- what Attentive does
+
+Nothing here touches a real customer.
+
+### 9.1 How the writes are made
+
+- **One-off pilot script** in `exports/consent_sync/pilot/` (not part of migtool). It only sends `customerEmailMarketingConsentUpdate`, and only for customer IDs on a hard-coded **allowlist** of the test accounts. It refuses any other ID.
+- Every step is a dry run first: it prints the mutation and the customer's current state, then sends only after the user approves it.
+- The user reviews the script before its first run.
+- The Shopify admin UI isn't used for the writes: it can't set a back-dated consent date, and it isn't the API path the real run will use.
+
+### 9.2 Settings during the pilot
+
+Run it in the **same configuration as the real run**, so what we see is what the run will do:
+
+- "Sync Klaviyo profiles to Shopify" **off** (D13)
+- "Sync Shopify email subscribers to Klaviyo" pointed at the **dummy list** (D9). A test account appearing on the dummy list means it would have joined LOF USA Newsletter - Main.
+
+Restore both after the pilot, unless the run follows straight after.
+
+### 9.3 Test accounts
+
+Six `nick+consentpilot1..6@0xb8.net`-style accounts. Each must exist as a **Shopify US customer** and a **Klaviyo US profile**. At least two must also be in **Attentive**, one of them SMS-subscribed with a phone number. The user creates or chooses them. The starting states are set by the pilot script's "setup" step, which is also a consent write, on allowlisted accounts only.
+
+### 9.4 Cases
+
+Each case runs on its own account. Dates are fixed, back-dated values.
+
+| Case | Real-run group (count, Sep 28) | Klaviyo state (set up first) | Shopify before → write | `consentUpdatedAt` sent | Questions |
+|---|---|---|---|---|---|
+| P1 | subscribed, Shopify not subscribed (73,275) | SUBSCRIBED | NOT_SUBSCRIBED → **SUBSCRIBED** | 2024-05-01 | Back-dated date kept? Klaviyo consent date or method changed? Joins the dummy list? Welcome email? |
+| P2 | unsubscribed, Shopify subscribed (72,151) | UNSUBSCRIBED | SUBSCRIBED → **UNSUBSCRIBED** | 2025-03-01 | Klaviyo's unsubscribe date rewritten? Any event? |
+| P3 | unsubscribed, Shopify not subscribed (101,685; D10) | UNSUBSCRIBED | NOT_SUBSCRIBED → **UNSUBSCRIBED** | 2025-03-01 | Allowed? Webhook effects on Klaviyo? |
+| P4 | never, Shopify subscribed (26; D2) | NEVER_SUBSCRIBED | SUBSCRIBED → **NOT_SUBSCRIBED** | (none) | **Allowed at all?** If refused, the error text, and whether UNSUBSCRIBED is the fallback |
+| P5 | never, Shopify unsubscribed (2; D12) | NEVER_SUBSCRIBED | UNSUBSCRIBED → **NOT_SUBSCRIBED** | (none) | Allowed? |
+| P6 | subscribed, Shopify unsubscribed (318) | SUBSCRIBED | UNSUBSCRIBED → **SUBSCRIBED** | 2026-06-01 | Re-subscribe allowed with a date? Klaviyo effects |
+| P7 | re-run safety | (P1's account) | SUBSCRIBED → **SUBSCRIBED** again | same | No-op or error? Does a webhook still fire? (decides resume behaviour) |
+| P8 | date edge | (P2's account) | UNSUBSCRIBED → **UNSUBSCRIBED** | a future date, and a date older than the current one | Rejected, clamped or accepted? |
+| P9 | SMS untouched | an Attentive SMS subscriber | email change as in P2 | — | Shopify `smsMarketingConsent` unchanged? Attentive SMS and email status unchanged? |
+
+### 9.5 What's recorded after each write
+
+At **+1, +5 and +30 minutes**, in `exports/consent_sync/pilot/results.csv`:
+
+- **Shopify:** the customer's `emailMarketingConsent` (state, opt-in level, `consentUpdatedAt`), `smsMarketingConsent` and `updatedAt`. Read-only query.
+- **Klaviyo:** the profile's email consent, consent date, `method` and `method_detail`, suppressions, whether it's on the dummy list, Main or LOF Canada Newsletter, plus new events since the write (Subscribed/Unsubscribed to Email Marketing, Added to List, Received Email). Read-only API.
+- **Attentive (user, in the UI):** the contact's email and SMS subscription status, and anything new in their timeline.
+
+### 9.6 Pass criteria
+
+1. Shopify accepts P1–P3 and P6 with the dates as sent (or a known, consistent adjustment).
+2. Klaviyo's consent state, date and method don't change because of the Shopify write. If they do, the run would rewrite Klaviyo history, and we stop and rethink.
+3. No test account receives a Welcome or other flow email, and none joins a list other than the dummy.
+4. Shopify SMS consent and Attentive are unchanged (P9).
+5. P4/P5 settle D2/D12 (allowed, or fall back to UNSUBSCRIBED / leave).
+6. P7/P8 tell us whether a re-run is safe and how dates are validated.
+
+### 9.7 Afterwards
+
+Restore the test accounts to their original states if the user wants, then write up the results here. Those results feed the build spec (task #9).
+
+### 9.8 Results (run 2026-10-02 19:35–20:24 UTC)
+
+The six test accounts are recorded in `exports/consent_sync/pilot/results.csv`. Settings during the pilot: "Sync Klaviyo profiles to Shopify" off; "Sync Shopify email subscribers to Klaviyo" on, into NK_consentsync (VhVV8j).
+
+| Case | Write | Result |
+|---|---|---|
+| setup | 2× → `SUBSCRIBED` 2025-01-15; 2× → `UNSUBSCRIBED` 2025-02-15 | Accepted; dates kept as sent |
+| P1 (pilot4) | `NOT_SUBSCRIBED` → `SUBSCRIBED`, 2024-05-01 | Accepted; date kept |
+| P2 (pilot3) | `SUBSCRIBED` → `UNSUBSCRIBED`, 2025-03-01 | Accepted; date kept |
+| P3 (pilot1) | `NOT_SUBSCRIBED` → `UNSUBSCRIBED`, 2025-03-01 | Accepted; date kept |
+| P4 (pilot2) | `SUBSCRIBED` → `NOT_SUBSCRIBED` | **Refused**: "Cannot specify NOT_SUBSCRIBED as a marketing state input"; nothing changed |
+| P5 (pilot5) | `UNSUBSCRIBED` → `NOT_SUBSCRIBED` | **Refused** (same) |
+| P6 (pilot6) | `UNSUBSCRIBED` → `SUBSCRIBED`, 2026-06-01 | Accepted; date kept |
+| P7 (pilot4) | identical `SUBSCRIBED` write again | Accepted; consent unchanged, but the customer's `updatedAt` changed, so a customer-update notification fires |
+| P8a (pilot1) | `UNSUBSCRIBED` with a future date (2027-01-01) | **Refused**: "Consent updated at must not be in the future"; nothing changed |
+| P8b (pilot1) | `UNSUBSCRIBED` (state unchanged) with an older date (2024-01-01) | Accepted with no error, but **the date wasn't changed** and `updatedAt` didn't move |
+| P9 (pilot3) | email changes on an Attentive SMS subscriber | Shopify SMS unchanged; Attentive SMS still subscribed |
+
+Side effects, checked at +1, +5 and +30–47 minutes:
+
+- **Klaviyo: none.** No consent, date or method changes and no events from any Shopify write; nobody added to NK_consentsync or LOF USA Newsletter - Main; no emails. The pilot showed the Welcome Series risk (5.3) doesn't materialise for API writes. The dummy list stays as insurance (D9), together with a canary batch.
+- **Klaviyo → Shopify with the sync off: none.** Klaviyo unsubscribes made during setup didn't reach Shopify.
+- **Shopify SMS consent: unchanged** on every account.
+- **Attentive (user, UI): unchanged.** Attentive shows no email consent for pilot3 or pilot4 and pilot3's SMS subscription stayed. Separately, pilot3 being SMS-subscribed in Attentive didn't make Shopify's SMS state subscribed.
+- One real customer signed up during the pilot window and landed on NK_consentsync; they were moved to Main afterwards (task #12).
+
+Consequences for the build (phase 6):
+
+1. `NOT_SUBSCRIBED` is never sent: D2 becomes D14, and D12 is left as is.
+2. Read each customer's current state just before writing, and **skip customers already in the target state**. An identical write still counts as a customer update.
+3. **Never send a future date.** A date can only be set together with a state change, so validation compares dates only for customers whose state the run changed.
+4. Only `emailMarketingConsent` is written; SMS isn't touched.
+5. Klaviyo's back-dated subscribes took 10–20 minutes to apply on 2026-10-02. D14 runs first and is checked before the Shopify writes start.
