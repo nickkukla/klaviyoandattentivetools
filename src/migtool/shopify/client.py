@@ -6,7 +6,8 @@ mutations exist, each sent from its own method only:
 
 - `bulkOperationRunQuery` (starts a read-only bulk export), from `start_bulk_export`;
 - `customerEmailMarketingConsentUpdate` (email marketing consent and nothing
-  else), from `update_email_consent`, used only by `shopify consent-sync`.
+  else, batched as aliases), from `update_email_consents`, used only by
+  `shopify consent-sync`.
 
 Shopify rate-limits GraphQL by query cost and reports it in the
 response (`THROTTLED`), so throttled queries wait for the bucket to refill.
@@ -39,14 +40,14 @@ BULK_LIST = """query($n: Int!) { bulkOperations(first: $n, sortKey: CREATED_AT, 
 
 CONSENT_READ = """query($ids: [ID!]!) { nodes(ids: $ids) { ... on Customer {
   id email emailMarketingConsent { marketingState marketingOptInLevel consentUpdatedAt } } } }"""
-CONSENT_UPDATE = """mutation($input: CustomerEmailMarketingConsentUpdateInput!) {
-  customerEmailMarketingConsentUpdate(input: $input) {
-    customer { id emailMarketingConsent { marketingState marketingOptInLevel consentUpdatedAt } }
-    userErrors { field message code }
-  }
-}"""
 # Shopify refuses NOT_SUBSCRIBED as an input (consent-sync pilot, 2026-10-02).
 CONSENT_STATES = ("SUBSCRIBED", "UNSUBSCRIBED")
+# Consent updates per request, as GraphQL aliases. A consent mutation costs about
+# 10 points; Shopify Plus allows 20,000 points with 1,000 restored per second.
+CONSENT_UPDATE_BATCH = 50
+_CONSENT_FIELDS = """customerEmailMarketingConsentUpdate(input: $i%d) {
+    customer { id emailMarketingConsent { marketingState marketingOptInLevel consentUpdatedAt } }
+    userErrors { field message code } }"""
 
 
 def customer_gid(customer_id: str) -> str:
@@ -96,31 +97,43 @@ class ShopifyClient:
         nodes = self.query(CONSENT_READ, {"ids": gids})["nodes"]
         return {c: node for c, node in zip(customer_ids, nodes)}
 
-    def update_email_consent(self, customer_id: str, state: str, consent_updated_at: str | None) -> dict[str, Any]:
-        """Set one customer's email marketing consent. Sends nothing else.
+    def update_email_consents(
+        self, updates: list[tuple[str, str, str | None]],
+    ) -> dict[str, dict[str, Any] | None]:
+        """Set email marketing consent for up to CONSENT_UPDATE_BATCH customers in
+        one request: (customer ID, state, consentUpdatedAt) each, sent as
+        aliases of `customerEmailMarketingConsentUpdate`. Sends nothing else.
 
-        Returns Shopify's result: `customer` (the consent now stored) and
-        `userErrors`. A throttled request (not executed) waits and is sent again;
-        a lost response is never resent here (`ApiError`), so the caller reads
-        the customer back to learn the outcome."""
-        if state not in CONSENT_STATES:
-            raise ValueError(f"Email consent can only be set to {' or '.join(CONSENT_STATES)}, not {state!r}.")
-        consent: dict[str, Any] = {"marketingState": state}
-        if state == "SUBSCRIBED":
-            consent["marketingOptInLevel"] = "SINGLE_OPT_IN"
-        if consent_updated_at:
-            consent["consentUpdatedAt"] = consent_updated_at
-        variables = {"input": {"customerId": customer_gid(customer_id), "emailMarketingConsent": consent}}
+        Returns customer ID → Shopify's result for it (`customer`, `userErrors`),
+        or None when the response has no result for it. A throttled request (not
+        executed) waits and is sent again; a lost response is never resent here
+        (`ApiError`): the caller reads the customers back."""
+        if not updates or len(updates) > CONSENT_UPDATE_BATCH:
+            raise ValueError(f"Send 1 to {CONSENT_UPDATE_BATCH} consent updates per request, not {len(updates)}.")
+        variables: dict[str, Any] = {}
+        for n, (customer_id, state, consent_updated_at) in enumerate(updates):
+            if state not in CONSENT_STATES:
+                raise ValueError(f"Email consent can only be set to {' or '.join(CONSENT_STATES)}, not {state!r}.")
+            consent: dict[str, Any] = {"marketingState": state}
+            if state == "SUBSCRIBED":
+                consent["marketingOptInLevel"] = "SINGLE_OPT_IN"
+            if consent_updated_at:
+                consent["consentUpdatedAt"] = consent_updated_at
+            variables[f"i{n}"] = {"customerId": customer_gid(customer_id), "emailMarketingConsent": consent}
+        document = ("mutation(" + ", ".join(f"$i{n}: CustomerEmailMarketingConsentUpdateInput!"
+                                             for n in range(len(updates))) + ") {\n"
+                    + "\n".join(f"  c{n}: " + _CONSENT_FIELDS % n for n in range(len(updates))) + "\n}")
         for _ in range(self._max_throttled + 1):
-            body = self._http.post("/graphql.json", json={"query": CONSENT_UPDATE, "variables": variables},
+            body = self._http.post("/graphql.json", json={"query": document, "variables": variables},
                                    retry_writes=False).json()
             errors = body.get("errors") or []
             if errors and all((e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors):
                 self._sleep(_throttle_wait(body))
                 continue
-            if errors:
+            data = body.get("data")
+            if errors and not data:
                 raise ShopifyError("; ".join(e.get("message", str(e)) for e in errors))
-            return body["data"]["customerEmailMarketingConsentUpdate"]
+            return {cid: (data or {}).get(f"c{n}") for n, (cid, _, _) in enumerate(updates)}
         raise ShopifyError("Still throttled after retrying; try again later.")
 
     def recent_bulk_queries(self, limit: int = 10) -> list[dict[str, Any]]:

@@ -121,20 +121,39 @@ def test_plan_can_be_limited_to_emails_and_refuses_duplicate_shopify_emails(tmp_
 
 # --- Client ------------------------------------------------------------------------
 
-def test_update_refuses_not_subscribed_before_sending():
+def test_update_refuses_not_subscribed_and_oversized_batches_before_sending():
     with pytest.raises(ValueError, match="SUBSCRIBED or UNSUBSCRIBED"):
-        client().update_email_consent("1", "NOT_SUBSCRIBED", None)
+        client().update_email_consents([("1", "NOT_SUBSCRIBED", None)])
+    with pytest.raises(ValueError, match="1 to 50"):
+        client().update_email_consents([(str(i), "SUBSCRIBED", None) for i in range(51)])
 
 
 @respx.mock
-def test_update_sends_only_the_consent_mutation():
-    route = respx.post(GQL).mock(return_value=httpx.Response(200, json={"data": {"customerEmailMarketingConsentUpdate": {
-        "customer": {"id": "gid://shopify/Customer/1"}, "userErrors": []}}}))
-    client().update_email_consent("1", "SUBSCRIBED", "2024-05-01T00:00:00Z")
-    body = json.loads(route.calls.last.request.content)
-    assert "customerEmailMarketingConsentUpdate" in body["query"]
-    assert body["variables"] == {"input": {"customerId": "gid://shopify/Customer/1", "emailMarketingConsent": {
-        "marketingState": "SUBSCRIBED", "marketingOptInLevel": "SINGLE_OPT_IN", "consentUpdatedAt": "2024-05-01T00:00:00Z"}}}
+def test_update_sends_one_aliased_consent_mutation_per_batch():
+    route = respx.post(GQL).mock(return_value=httpx.Response(200, json={"data": {
+        "c0": {"customer": {"id": "gid://shopify/Customer/1"}, "userErrors": []},
+        "c1": {"customer": None, "userErrors": [{"message": "nope"}]}}}))
+    out = client().update_email_consents([("1", "SUBSCRIBED", "2024-05-01T00:00:00Z"), ("2", "UNSUBSCRIBED", None)])
+    [call] = route.calls
+    body = json.loads(call.request.content)
+    assert body["query"].count("customerEmailMarketingConsentUpdate") == 2 and "c1:" in body["query"]
+    assert body["variables"] == {
+        "i0": {"customerId": "gid://shopify/Customer/1", "emailMarketingConsent": {
+            "marketingState": "SUBSCRIBED", "marketingOptInLevel": "SINGLE_OPT_IN", "consentUpdatedAt": "2024-05-01T00:00:00Z"}},
+        "i1": {"customerId": "gid://shopify/Customer/2", "emailMarketingConsent": {"marketingState": "UNSUBSCRIBED"}}}
+    assert out["1"]["userErrors"] == [] and out["2"]["userErrors"] == [{"message": "nope"}]
+
+
+@respx.mock
+def test_a_throttled_batch_is_waited_for_and_sent_again():
+    sleeps = []
+    route = respx.post(GQL).mock(side_effect=[
+        httpx.Response(200, json={"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}],
+                                  "extensions": {"cost": {"requestedQueryCost": 10, "throttleStatus": {
+                                      "currentlyAvailable": 0, "restoreRate": 1000}}}}),
+        httpx.Response(200, json={"data": {"c0": {"customer": None, "userErrors": []}}})])
+    out = client(sleeps).update_email_consents([("1", "SUBSCRIBED", None)])
+    assert len(route.calls) == 2 and sleeps and out == {"1": {"customer": None, "userErrors": []}}
 
 
 def test_query_still_refuses_mutations():
@@ -169,23 +188,27 @@ class FakeStore:
                     "consentUpdatedAt": self.dates.get(cid)}})
             return httpx.Response(200, json={"data": {"nodes": nodes}})
         assert "customerEmailMarketingConsentUpdate" in q, q
-        cid = v["input"]["customerId"].rsplit("/", 1)[-1]
-        self.mutations.append((cid, v["input"]["emailMarketingConsent"]))
-        if cid in self.refuse:
-            return httpx.Response(200, json={"data": {"customerEmailMarketingConsentUpdate": {
-                "customer": None, "userErrors": [{"field": ["input"], "message": "nope", "code": "INVALID"}]}}})
-        sent = v["input"]["emailMarketingConsent"]
-        at = sent.get("consentUpdatedAt")
-        # Like Shopify: a change dated before the current consent date is ignored, without an error.
-        if not (at and self.dates.get(cid) and at < self.dates[cid]):
-            self.states[cid], self.dates[cid] = sent["marketingState"], at
-        if cid in self.lose:
-            return httpx.Response(503)
-        return httpx.Response(200, json={"data": {"customerEmailMarketingConsentUpdate": {
-            "customer": {"id": v["input"]["customerId"], "emailMarketingConsent": {
+        self.requests = getattr(self, "requests", 0) + 1
+        data, lost = {}, False
+        for n in range(len(v)):
+            inp = v[f"i{n}"]
+            cid = inp["customerId"].rsplit("/", 1)[-1]
+            self.mutations.append((cid, inp["emailMarketingConsent"]))
+            lost = lost or cid in self.lose
+            if cid in self.refuse:
+                data[f"c{n}"] = {"customer": None, "userErrors": [{"field": ["input"], "message": "nope", "code": "INVALID"}]}
+                continue
+            sent = inp["emailMarketingConsent"]
+            at = sent.get("consentUpdatedAt")
+            # Like Shopify: a change dated before the current consent date is ignored, without an error.
+            if not (at and self.dates.get(cid) and at < self.dates[cid]):
+                self.states[cid], self.dates[cid] = sent["marketingState"], at
+            data[f"c{n}"] = {"customer": {"id": inp["customerId"], "emailMarketingConsent": {
                 "marketingState": self.states[cid], "marketingOptInLevel": "SINGLE_OPT_IN",
-                "consentUpdatedAt": self.dates.get(cid)}},
-            "userErrors": []}}})
+                "consentUpdatedAt": self.dates.get(cid)}}, "userErrors": []}
+        if lost:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"data": data})
 
 
 def plan_file(tmp_path, rows):
@@ -216,7 +239,7 @@ def results(tmp_path):
 @respx.mock
 def test_sync_writes_skips_refuses_and_reads_back_lost_responses(tmp_path, monkeypatch):
     store = FakeStore({"1": "NOT_SUBSCRIBED", "2": "SUBSCRIBED", "3": "SUBSCRIBED", "4": "SUBSCRIBED"},
-                      refuse={"3"}, lose={"4"})
+                      refuse={"3"})
     sync_env(tmp_path, monkeypatch, store)
     p = plan_file(tmp_path, [("1", "SUBSCRIBED", "2024-05-01T00:00:00Z"), ("2", "SUBSCRIBED", "2024-05-01T00:00:00Z"),
                              ("3", "UNSUBSCRIBED", "2025-01-01T00:00:00Z"), ("4", "UNSUBSCRIBED", "2025-01-01T00:00:00Z"),
@@ -226,10 +249,24 @@ def test_sync_writes_skips_refuses_and_reads_back_lost_responses(tmp_path, monke
     r = results(tmp_path)
     assert {k: v["outcome"] for k, v in r.items()} == {"1": "written", "2": "skipped", "3": "refused",
                                                        "4": "written", "5": "not found"}
-    assert "read back: stored UNSUBSCRIBED" in r["4"]["detail"] and r["3"]["detail"] == "nope"
+    assert r["3"]["detail"] == "nope"
     assert [m[0] for m in store.mutations] == ["1", "3", "4"]  # 2 was already SUBSCRIBED: nothing sent
+    assert store.requests == 1  # the batch's three writes went in one request
     assert store.mutations[0][1] == {"marketingState": "SUBSCRIBED", "marketingOptInLevel": "SINGLE_OPT_IN",
                                      "consentUpdatedAt": "2024-05-01T00:00:00Z"}
+
+
+@respx.mock
+def test_a_lost_batch_response_is_read_back_not_resent(tmp_path, monkeypatch):
+    store = FakeStore({"1": "NOT_SUBSCRIBED", "2": "SUBSCRIBED"}, lose={"2"})
+    sync_env(tmp_path, monkeypatch, store)
+    p = plan_file(tmp_path, [("1", "SUBSCRIBED", "2024-05-01T00:00:00Z"), ("2", "UNSUBSCRIBED", "2025-01-01T00:00:00Z")])
+    result = sync("--plan", str(p))
+    assert result.exit_code == 0, result.output
+    r = results(tmp_path)
+    assert {k: v["outcome"] for k, v in r.items()} == {"1": "written", "2": "written"}
+    assert all("response lost (503); read back: stored" in v["detail"] for v in r.values())
+    assert store.requests == 1  # not resent
 
 
 @respx.mock
@@ -482,11 +519,13 @@ class IgnoringStore(FakeStore):
     def __call__(self, request):
         body = json.loads(request.content)
         if "customerEmailMarketingConsentUpdate" in body["query"]:
-            cid = body["variables"]["input"]["customerId"].rsplit("/", 1)[-1]
-            self.mutations.append((cid, body["variables"]["input"]["emailMarketingConsent"]))
-            return httpx.Response(200, json={"data": {"customerEmailMarketingConsentUpdate": {
-                "customer": {"id": f"gid://shopify/Customer/{cid}", "emailMarketingConsent": {
-                    "marketingState": self.states[cid], "consentUpdatedAt": None}}, "userErrors": []}}})
+            data = {}
+            for n, inp in enumerate(body["variables"][f"i{k}"] for k in range(len(body["variables"]))):
+                cid = inp["customerId"].rsplit("/", 1)[-1]
+                self.mutations.append((cid, inp["emailMarketingConsent"]))
+                data[f"c{n}"] = {"customer": {"id": inp["customerId"], "emailMarketingConsent": {
+                    "marketingState": self.states[cid], "consentUpdatedAt": None}}, "userErrors": []}
+            return httpx.Response(200, json={"data": data})
         return super().__call__(request)
 
 
@@ -496,3 +535,23 @@ def test_a_write_shopify_ignores_is_not_counted_as_written(tmp_path, monkeypatch
     result = sync("--plan", str(plan_file(tmp_path, [("1", "UNSUBSCRIBED", "2025-01-01T00:00:00Z")])))
     assert result.exit_code == 1 and "ignored 1" in result.output
     assert results(tmp_path)["1"]["outcome"] == "ignored"
+
+
+
+@respx.mock
+def test_a_customer_missing_from_the_batch_response_is_read_back(tmp_path, monkeypatch):
+    class PartialStore(FakeStore):
+        def __call__(self, request):
+            response = super().__call__(request)
+            if "customerEmailMarketingConsentUpdate" in json.loads(request.content)["query"]:
+                data = response.json()["data"]
+                data["c1"] = None  # e.g. a field error for one alias
+                return httpx.Response(200, json={"data": data, "errors": [{"message": "oops", "path": ["c1"]}]})
+            return response
+    store = PartialStore({"1": "NOT_SUBSCRIBED", "2": "NOT_SUBSCRIBED"})
+    sync_env(tmp_path, monkeypatch, store)
+    p = plan_file(tmp_path, [("1", "SUBSCRIBED", ""), ("2", "SUBSCRIBED", "")])
+    assert sync("--plan", str(p)).exit_code == 0
+    r = results(tmp_path)
+    assert r["1"]["outcome"] == "written" and r["2"]["outcome"] == "written"
+    assert "no result for it in the response; read back" in r["2"]["detail"]

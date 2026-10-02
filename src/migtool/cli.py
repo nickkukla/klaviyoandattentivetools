@@ -1403,6 +1403,7 @@ def shopify_consent_sync(
             for i in range(0, len(todo), CONSENT_BATCH):
                 batch = todo[i:i + CONSENT_BATCH]
                 current = client.email_consents([r["shopify_customer_id"] for r in batch])
+                pending = []  # (row, state before, date, rule) to write in one request
                 for r in batch:
                     node = current.get(r["shopify_customer_id"])
                     if node is None:
@@ -1425,24 +1426,39 @@ def shopify_consent_sync(
                     live_at = live.get("consentUpdatedAt")
                     if not date or parse_iso(date) > now or (live_at and parse_iso(live_at) >= parse_iso(date)):
                         date, rule = now.strftime("%Y-%m-%dT%H:%M:%SZ"), consent.DATE_SYNC_TIME
-                    try:
-                        result = client.update_email_consent(r["shopify_customer_id"], r["target_state"], date)
-                    except ApiError as exc:
-                        back = client.email_consents([r["shopify_customer_id"]]).get(r["shopify_customer_id"]) or {}
-                        stored = back.get("emailMarketingConsent") or {}
-                        if stored.get("marketingState") == r["target_state"]:
-                            out, detail = outcome_of(r, stored, date)
-                            record(r, before, out, f"response lost ({exc.status}); read back: {detail}", date=date, rule=rule)
-                        else:
-                            record(r, before, "unknown", f"response lost ({exc.status}); state now "
-                                   f"{stored.get('marketingState')}", date=date, rule=rule)
-                        continue
-                    if result.get("userErrors"):
+                    pending.append((r, before, date, rule))
+                if not pending:
+                    writer.flush()
+                    continue
+                lost: list[tuple[dict, str, str, str]] = []
+                lost_why = ""
+                try:
+                    answers = client.update_email_consents(
+                        [(r["shopify_customer_id"], r["target_state"], date) for r, _, date, _ in pending])
+                except ApiError as exc:
+                    answers, lost, lost_why = {}, pending, f"response lost ({exc.status})"
+                for r, before, date, rule in pending if not lost else []:
+                    result = answers.get(r["shopify_customer_id"])
+                    if result is None:
+                        lost.append((r, before, date, rule))
+                        lost_why = lost_why or "no result for it in the response"
+                    elif result.get("userErrors"):
                         record(r, before, "refused", "; ".join(e.get("message", "") for e in result["userErrors"]),
                                date=date, rule=rule)
                     else:
                         out, detail = outcome_of(r, (result.get("customer") or {}).get("emailMarketingConsent") or {}, date)
                         record(r, before, out, detail, date=date, rule=rule)
+                if lost:
+                    # Never resent blindly: read the customers back and record what Shopify holds.
+                    back = client.email_consents([r["shopify_customer_id"] for r, _, _, _ in lost])
+                    for r, before, date, rule in lost:
+                        stored = (back.get(r["shopify_customer_id"]) or {}).get("emailMarketingConsent") or {}
+                        if stored.get("marketingState") == r["target_state"]:
+                            out, detail = outcome_of(r, stored, date)
+                            record(r, before, out, f"{lost_why}; read back: {detail}", date=date, rule=rule)
+                        else:
+                            record(r, before, "unknown", f"{lost_why}; state now {stored.get('marketingState')}",
+                                   date=date, rule=rule)
                 writer.flush()
                 n = i + len(batch)
                 if n % 1000 < CONSENT_BATCH or n == len(todo):
