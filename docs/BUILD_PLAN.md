@@ -111,6 +111,64 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 
 **Gate:** all acceptance criteria in `REQUIREMENTS.md` checked off.
 
+## Phase 6: Klaviyo US → Shopify US email consent sync
+
+Specified by `docs/CONSENT_SYNC.md`: decisions D1–D14 and the pilot results in section 9.8. Email marketing consent only. Klaviyo is the source of truth, except for the 26 D14 customers.
+
+### Commands
+
+- **`migtool shopify consent-plan --klaviyo <profiles export> --shopify <customers export>`**. Local and read-only; no API calls.
+  - Joins the two exports by lowercased email and applies the mapping in `CONSENT_SYNC.md` 4.1.
+  - Writes `<run>.plan.csv`, one row per customer to write: Shopify customer ID, email, Klaviyo profile ID, Klaviyo state, Shopify state now, target state (`SUBSCRIBED` or `UNSUBSCRIBED`), target date, and whether Shopify's date is newer (D11).
+  - Writes `<run>.klaviyo_d14.csv`, the D14 customers in the dedupe layout (`Email Marketing Consent` = Subscribe, `Email Marketing Consent Timestamp` = Shopify's `consentUpdatedAt`).
+  - Writes `<run>.excluded.csv`: D12 and `INVALID`/`REDACTED`, with reasons.
+  - Prints counts by transition. `NOT_SUBSCRIBED` is never a target.
+  - Target date = D5: `ca_consent_timestamp` (or `ca_suppression_timestamp` for suppressed profiles) on migrated CA profiles, Klaviyo's consent or suppression date otherwise. A date in the future is set to the plan time (P8a), and a missing date is reported.
+- **D14 Klaviyo update:** the existing `klaviyo dedupe import` with a new role **`consent`**: update existing profiles only, consent only, no migration tags, no join list. It subscribes with `--subscribe-list Xz4KGg` (LOF USA Newsletter - Main, D15; the Welcome Series may follow) and a custom source of "Shopify email consent (consent sync)". The custom source becomes an option of the writer; today it's the constant `migtool CA migration`. Checked with `klaviyo dedupe check --role consent`.
+- **`migtool shopify consent-sync --to shopify_us --plan <plan.csv> [--limit N] [--resume] [--yes]`**. The only Shopify write.
+  - Before anything: `check_shop` (the token belongs to Shopify US), a check that the token has `write_customers`, and a typed confirmation naming the store and the number of writes. `--yes` skips only the typed confirmation.
+  - For each batch of up to 50 customers: read their current `emailMarketingConsent` with one `nodes(ids:)` query; **skip customers already in the target state** (P7). Otherwise send `customerEmailMarketingConsentUpdate` with `marketingState`, `marketingOptInLevel: SINGLE_OPT_IN` and `consentUpdatedAt` = the target date.
+  - Results per customer go to `<run>.results.csv`: written, skipped (already in the target state), refused (with the `userErrors`), or unknown (lost response, read back and recorded).
+  - Mutations are **never retried** blindly. A lost response is resolved by reading the customer back.
+  - Cost-based throttling as for queries (`THROTTLED` waits for the bucket). The achieved rate is printed, so the canary measures it. If it's too slow for ~261k writes, the fallback is `bulkOperationRunMutation` (a JSONL upload), as a separate decision.
+  - `--limit N` (canary); `--resume` continues from a checkpoint in `state/` (customers already processed are skipped, and the skip-if-already rule makes re-running safe anyway).
+  - Implemented as one new `ShopifyClient` method, `update_email_consent(...)`. The client's mutation guard stays: `query()` still refuses mutations, and only `start_bulk_export` and `update_email_consent` send them.
+- **`migtool shopify consent-validate --klaviyo <export> --shopify <export> [--plan <plan.csv> --results <results.csv>] [--klaviyo-before <backup>]`**. Local and read-only.
+  - State: every matched customer's Shopify state equals the mapped target; D12 counts as a match; `INVALID`/`REDACTED` are listed separately; D14 customers are subscribed on both sides.
+  - Dates: compared only where the run changed the state (P8b), so Shopify's date must equal the plan's. For D14, Klaviyo's date must equal Shopify's.
+  - Klaviyo before/after (with `--klaviyo-before`): no consent state, date or method changed between the pre-run backup and the post-run export, except D14 customers and normal customer activity. Changes are listed for review, as in the Sep 28 three-way comparison.
+  - Writes `<run>.mismatches.csv` and counts, and exits 1 on any mismatch.
+
+### Tests
+
+- Mapping: one test per row of `CONSENT_SYNC.md` 4.1, including suppressed vs `UNSUBSCRIBE`-only, D12, D14 and `INVALID`/`REDACTED`; `NOT_SUBSCRIBED` never planned; target dates (migrated vs US, suppressed, future dates clamped, missing dates).
+- Sync: skip-if-already-in-target; `userErrors` recorded as refused, and the run continues; lost response read back, not retried; `--limit`; `--resume`; refused without `write_customers` or with the wrong store; the client still refuses any other mutation.
+- Validate: matching and mismatched states, D12, D14 dates, date checks only for changed customers, Klaviyo before/after detection.
+- D14 role: consent only, no tags, existing profiles only, custom source sent.
+
+### Trial
+
+- The six pilot test accounts (`nick+consentpilot1–6@0xb8.net`), reset by the user to new starting states, run through `consent-plan` → `consent-sync` → `consent-validate` with a plan restricted to them. A D14-style case on one account goes through the `consent` role.
+
+### Gate
+
+- All tests pass. The trial validates clean, with no Klaviyo changes (other than D14), no list additions or emails, and Attentive unchanged (user check).
+- The user approves the refreshed plan counts before the run.
+
+### Run order
+
+See `CONSENT_SYNC.md` 5.4 and tasks #10/#11:
+
+1. Full Klaviyo US backup and a fresh Shopify export, with both integration settings normal.
+2. `consent-plan` on those exports; the user approves the counts.
+3. D14: `dedupe import --role consent`, then wait for the back-dated subscribes to apply (10–20 minutes) and run `dedupe check`.
+4. The user points the subscriber sync at NK_consentsync and turns "Sync Klaviyo profiles to Shopify" off.
+5. **Canary:** `consent-sync --limit` with about 100 subscribe and 100 unsubscribe writes. Wait 15 minutes, then check NK_consentsync, those customers' Klaviyo consent, and any emails. Continue only if all are clean.
+6. `consent-sync --resume` for the rest.
+7. The user restores both settings; any real signups on NK_consentsync move to Main.
+8. Post-run exports, `consent-validate` (including Klaviyo before/after), then a run record in `exports/consent_sync/`.
+9. The user removes the write scopes from the Shopify token.
+
 ## Migration run order (after sign-off)
 
 1. Klaviyo: create the LOF Canada Newsletter list in `klaviyo_us`. Export profiles from `klaviyo_ca` and `klaviyo_us`; dedupe outside the tool (including phone uniqueness and removing overlapping Shopify properties); import unique CA profiles into `klaviyo_us` with `--list-id` set to the LOF Canada Newsletter list.
@@ -128,4 +186,6 @@ Record real responses (secrets and personal data scrubbed) as test fixtures whil
 | Back in Stock events may lack a SKU | Such rows go to the excluded file with a reason; volume reported in phase 1 |
 | Klaviyo import overwrites matching profiles | Dedupe happens beforehand (outside the tool); README warning; trial first |
 | Catch-up run misses a change `--since` can't see | Phase 1 confirms which changes move the `updated` time; set `--since` a little before the main run started, since every write is safe to repeat |
+| Consent sync writes Klaviyo history back through Shopify | Pilot found no feedback; dummy list and canary batch on run day; Klaviyo before/after comparison in validation |
+| Shopify write throughput too low for ~261k writes | Canary measures the rate; bulk mutation as a fallback |
 | Rate limits make runs long | Pacing; `--resume` on exports; imports are safe to re-run; expected run times documented in the README |
