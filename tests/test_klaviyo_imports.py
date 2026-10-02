@@ -415,8 +415,9 @@ class FakeWriter:
     def import_result(self, job):
         return set(job.emails), [], set()
 
-    def subscribe(self, rows, *, list_id, on_sent, on_refused=None):
+    def subscribe(self, rows, *, list_id, on_sent, on_refused=None, source=None):
         self.calls.append(("subscribe", list(rows), list_id))
+        self.sources = [*getattr(self, "sources", []), source]
         on_sent(len(rows))
         return []
 

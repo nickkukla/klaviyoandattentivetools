@@ -36,7 +36,7 @@ from migtool.state import StateStore
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
 klaviyo_app = typer.Typer(no_args_is_help=True, help="Klaviyo exports and imports.")
 app.add_typer(klaviyo_app, name="klaviyo")
-shopify_app = typer.Typer(no_args_is_help=True, help="Shopify, read-only: customers and their marketing consent.")
+shopify_app = typer.Typer(no_args_is_help=True, help="Shopify: customers and their marketing consent. Read-only except `consent-sync` (email consent).")
 app.add_typer(shopify_app, name="shopify")
 profiles_app = typer.Typer(no_args_is_help=True, help="Profiles.")
 lists_app = typer.Typer(no_args_is_help=True, help="Lists and their members.")
@@ -872,7 +872,7 @@ def dedupe_import(
             inst, account=f"{account['name']} ({account['id']})", record_count=len(p.rows),
             yes=yes, allow_write_to_source=allow_write_to_source,
         )
-        main_step = {"hold": "update", "kept": "update", "suppress": "suppress"}.get(role, "import")
+        main_step = {"hold": "update", "kept": "update", "consent": "update", "suppress": "suppress"}.get(role, "import")
         log = RunLog(run, written_label="submitted" if main_step == "suppress" else "written")
         log.read(len(raw))
         log.skipped(len(p.skipped))
@@ -1098,7 +1098,8 @@ def shopify_whoami(instance: str = typer.Option(..., "--instance", help="Shopify
     typer.echo(f"scopes: {', '.join(info['scopes']) or 'none'}")
     writes = [s for s in info["scopes"] if s.startswith("write_")]
     if writes:
-        typer.echo(f"Note: the token also has write scopes ({', '.join(writes)}); this tool only reads.")
+        typer.echo(f"Note: the token also has write scopes ({', '.join(writes)}); this tool only reads, "
+                   "except `shopify consent-sync` (email marketing consent).")
 
 
 @shopify_app.command("customers-export")
@@ -1213,6 +1214,241 @@ def shopify_customers(
     for k, v in sorted(counts.items()):
         typer.echo(f"  {k}: {v:,}")
     typer.echo(f"Wrote {path}")
+
+# --- Consent sync (docs/CONSENT_SYNC.md, BUILD_PLAN phase 6) ------------------------
+
+CONSENT_BATCH = 50  # customers read (and written) per round
+CONSENT_KEY = "shopify-consent-sync"
+RESULT_COLUMNS = ["time", "shopify_customer_id", "email", "target_state", "target_date", "state_before",
+                  "outcome", "detail"]
+DONE_OUTCOMES = {"written", "skipped", "refused", "not found"}  # `unknown` is retried by --resume
+
+
+def _write_rows(path: Path, columns: list[str], rows: list[dict]) -> int:
+    w = CsvWriter(path, columns)
+    for r in rows:
+        w.write(r)
+    w.close()
+    return w.count
+
+
+@shopify_app.command("consent-plan")
+def shopify_consent_plan(
+    instance: str = typer.Option("shopify_us", "--instance", help="Shopify instance the plan is for (output folder)."),
+    klaviyo: Path = typer.Option(..., "--klaviyo", exists=True, dir_okay=False, help="Klaviyo `profiles export` CSV."),
+    shopify: Path = typer.Option(..., "--shopify", exists=True, dir_okay=False, help="Shopify `customers-export` CSV."),
+    emails: Path | None = typer.Option(None, "--emails", exists=True, dir_okay=False,
+                                       help="CSV with an email column: plan only these (trials)."),
+) -> None:
+    """Plan the Klaviyo → Shopify email consent sync from two exports. Local and read-only.
+
+    Writes <run>.plan.csv (the Shopify writes), <run>.klaviyo_d14.csv (D14:
+    Klaviyo subscribes, for `klaviyo dedupe import --role consent`) and
+    <run>.excluded.csv (D12 and unwritable customers). See docs/CONSENT_SYNC.md."""
+    from migtool.shopify import consent
+
+    get_instance(instance, "shopify")
+    only = None
+    if emails:
+        try:
+            _, rows = imports.read_rows(emails)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        only = {r["email"].strip().lower() for r in rows if r.get("email")}
+    try:
+        p = consent.plan(klaviyo, shopify, now=utc_now(), only=only)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    run = new_run(instance, "consent-plan")
+    files = {}
+    for suffix, columns, rows in ((".plan.csv", consent.PLAN_COLUMNS, p.writes),
+                                  (".klaviyo_d14.csv", consent.D14_COLUMNS, p.d14),
+                                  (".excluded.csv", consent.EXCLUDED_COLUMNS, p.excluded)):
+        path = run.path(suffix)
+        files[path.name] = _write_rows(path, columns, rows)
+    by_target = {t: sum(1 for w in p.writes if w["target_state"] == t) for t in ("SUBSCRIBED", "UNSUBSCRIBED")}
+    counts = {"klaviyo_profiles": p.profiles, "matched": p.matched, "shopify_writes": len(p.writes), **by_target,
+              "klaviyo_d14": len(p.d14), "excluded": len(p.excluded), "shopify_newer": p.shopify_newer,
+              "no_date": p.no_date, "future_dates_clamped": p.clamped,
+              "by_transition": {" | ".join(k): v for k, v in sorted(p.counts.items())}}
+    write_manifest(run, files=files, counts=counts,
+                   extra={"klaviyo_export": str(klaviyo), "shopify_export": str(shopify),
+                          "emails": str(emails) if emails else None})
+    typer.echo(f"Klaviyo profiles {p.profiles:,}; matched to a Shopify customer by email {p.matched:,}")
+    for (k, sh, act), n in sorted(p.counts.items()):
+        typer.echo(f"  {k:12} | {sh:14} | {act:8} | {n:,}")
+    typer.echo(f"Shopify writes: {len(p.writes):,} ({by_target['SUBSCRIBED']:,} SUBSCRIBED, "
+               f"{by_target['UNSUBSCRIBED']:,} UNSUBSCRIBED); Shopify date newer than Klaviyo's: {p.shopify_newer:,}")
+    typer.echo(f"Klaviyo writes (D14): {len(p.d14):,}; excluded: {len(p.excluded):,}")
+    if p.no_date or p.clamped:
+        typer.echo(f"Writes without a date: {p.no_date:,}; future dates set to now: {p.clamped:,}")
+    for name in files:
+        typer.echo(f"  {run.dir / name}")
+
+
+@shopify_app.command("consent-sync")
+def shopify_consent_sync(
+    to: str = typer.Option(..., "--to", help="Shopify instance to write."),
+    plan_file: Path = typer.Option(..., "--plan", exists=True, dir_okay=False, help="<run>.plan.csv from consent-plan."),
+    target: str | None = typer.Option(None, "--target", help="Only rows with this target state (canary)."),
+    limit: int | None = LIMIT,
+    resume: bool = typer.Option(False, "--resume", help="Continue the saved run of this plan."),
+    yes: bool = YES,
+) -> None:
+    """Write Shopify email marketing consent from a consent plan. The only Shopify write.
+
+    Each customer's current consent is read first; customers already in the
+    target state are skipped. Only `customerEmailMarketingConsentUpdate` is
+    sent. Per-customer results go to <run>.results.csv. A lost response isn't
+    resent: the customer is read back instead."""
+    from migtool.shopify import consent
+    from migtool.shopify.client import CONSENT_STATES
+
+    if target is not None and target not in CONSENT_STATES:
+        raise typer.BadParameter(f"must be one of {', '.join(CONSENT_STATES)}", param_hint="--target")
+    rows = list(consent.read_csv(plan_file))
+    if rows and set(consent.PLAN_COLUMNS) - set(rows[0]):
+        raise ConfigError(f"{plan_file} isn't a consent plan (missing {sorted(set(consent.PLAN_COLUMNS) - set(rows[0]))}).")
+    bad = [r for r in rows if r["target_state"] not in CONSENT_STATES]
+    if bad:
+        raise ConfigError(f"{len(bad):,} plan rows have a target state Shopify can't take (e.g. {bad[0]['target_state']}).")
+    plan_key = str(plan_file.resolve())
+    store = StateStore()
+    saved = store.load_checkpoint(to, CONSENT_KEY)
+    if saved and not resume:
+        raise ConfigError(f"A consent sync of {saved['plan']} is saved. Use --resume to continue it, or delete "
+                          f"state/{to}/{CONSENT_KEY}.checkpoint.json to start a new one.")
+    if resume and not saved:
+        raise ConfigError("There's no saved consent sync to resume.")
+    if saved and saved["plan"] != plan_key:
+        raise ConfigError(f"The saved consent sync is for {saved['plan']}, not {plan_key}.")
+    done: set[str] = set()
+    for path in (saved or {}).get("results", []):
+        done |= {r["shopify_customer_id"] for r in consent.read_csv(Path(path)) if r["outcome"] in DONE_OUTCOMES}
+    todo = [r for r in rows if r["shopify_customer_id"] not in done and (target is None or r["target_state"] == target)]
+    if limit is not None:
+        todo = todo[:limit]
+    inst = get_instance(to, "shopify")
+    client, info = _shopify(to)
+    with client:
+        if "write_customers" not in info["scopes"]:
+            raise ConfigError(f"The {to} token doesn't have write_customers; nothing was written.")
+        typer.echo(f"Plan:            {plan_file} ({len(rows):,} rows, {len(done):,} already done)")
+        typer.echo(f"This run:        {len(todo):,} customers "
+                   f"({sum(r['target_state'] == 'SUBSCRIBED' for r in todo):,} → SUBSCRIBED, "
+                   f"{sum(r['target_state'] == 'UNSUBSCRIBED' for r in todo):,} → UNSUBSCRIBED)")
+        typer.echo("Writes:          email marketing consent only (customerEmailMarketingConsentUpdate)")
+        confirm_write(inst, account=f"{info['name']} ({info['domain']})", record_count=len(todo), yes=yes)
+        run = new_run(to, "consent-sync")
+        results = run.path(".results.csv")
+        writer = CsvWriter(results, RESULT_COLUMNS)
+        store.save_checkpoint(to, CONSENT_KEY, {"plan": plan_key, "store": info["domain"],
+                                                "results": [*(saved or {}).get("results", []), str(results)]})
+        counts = {k: 0 for k in ("written", "skipped", "refused", "not found", "unknown")}
+        started = utc_now()
+        aborted = None
+
+        def record(r: dict, before: str, outcome: str, detail: str = "") -> None:
+            counts[outcome] += 1
+            writer.write({"time": iso(utc_now()), "shopify_customer_id": r["shopify_customer_id"], "email": r["email"],
+                          "target_state": r["target_state"], "target_date": r["target_date"],
+                          "state_before": before, "outcome": outcome, "detail": detail})
+
+        try:
+            for i in range(0, len(todo), CONSENT_BATCH):
+                batch = todo[i:i + CONSENT_BATCH]
+                current = client.email_consents([r["shopify_customer_id"] for r in batch])
+                for r in batch:
+                    node = current.get(r["shopify_customer_id"])
+                    if node is None:
+                        record(r, "", "not found")
+                        continue
+                    before = (node.get("emailMarketingConsent") or {}).get("marketingState") or ""
+                    if before == r["target_state"]:
+                        record(r, before, "skipped", "already in the target state")
+                        continue
+                    date = r["target_date"] or None
+                    if date and parse_iso(date) > utc_now():
+                        date = iso(utc_now())  # Shopify refuses future dates
+                    try:
+                        result = client.update_email_consent(r["shopify_customer_id"], r["target_state"], date)
+                    except ApiError as exc:
+                        back = client.email_consents([r["shopify_customer_id"]]).get(r["shopify_customer_id"]) or {}
+                        now_state = (back.get("emailMarketingConsent") or {}).get("marketingState")
+                        if now_state == r["target_state"]:
+                            record(r, before, "written", f"response lost ({exc.status}); confirmed by read-back")
+                        else:
+                            record(r, before, "unknown", f"response lost ({exc.status}); state now {now_state}")
+                        continue
+                    if result.get("userErrors"):
+                        record(r, before, "refused", "; ".join(e.get("message", "") for e in result["userErrors"]))
+                    else:
+                        stored = ((result.get("customer") or {}).get("emailMarketingConsent") or {})
+                        record(r, before, "written", f"stored {stored.get('marketingState')} {stored.get('consentUpdatedAt')}")
+                writer.flush()
+                n = i + len(batch)
+                if n % 1000 < CONSENT_BATCH or n == len(todo):
+                    secs = max((utc_now() - started).total_seconds(), 1)
+                    typer.echo(f"  {n:,}/{len(todo):,}: written {counts['written']:,}, skipped {counts['skipped']:,}, "
+                               f"refused {counts['refused']:,} ({n / secs:.1f}/s)")
+        except (Exception, KeyboardInterrupt) as exc:
+            aborted = "interrupted" if isinstance(exc, KeyboardInterrupt) else f"{type(exc).__name__}: {exc}"
+            typer.echo(f"Stopped: {aborted}. Re-run with --resume to continue.")
+        finally:
+            writer.close()
+    secs = max((utc_now() - started).total_seconds(), 1)
+    write_manifest(run, files={results.name: writer.count}, counts={**counts, "seconds": round(secs)},
+                   status="aborted" if aborted else "complete",
+                   extra={"plan": plan_key, "store": info["domain"], "target": target, "limit": limit})
+    typer.echo(f"written {counts['written']:,}, skipped {counts['skipped']:,}, refused {counts['refused']:,}, "
+               f"not found {counts['not found']:,}, unknown {counts['unknown']:,} in {round(secs):,}s")
+    typer.echo(f"Results: {results}")
+    if aborted or counts["refused"] or counts["not found"] or counts["unknown"]:
+        raise typer.Exit(1)
+
+
+@shopify_app.command("consent-validate")
+def shopify_consent_validate(
+    instance: str = typer.Option("shopify_us", "--instance", help="Shopify instance (output folder)."),
+    klaviyo: Path = typer.Option(..., "--klaviyo", exists=True, dir_okay=False, help="Klaviyo export after the run."),
+    shopify: Path = typer.Option(..., "--shopify", exists=True, dir_okay=False, help="Shopify export after the run."),
+    results: list[Path] = typer.Option([], "--results", exists=True, dir_okay=False,
+                                       help="consent-sync results file (repeatable)."),
+    d14: Path | None = typer.Option(None, "--d14", exists=True, dir_okay=False, help="<run>.klaviyo_d14.csv."),
+    klaviyo_before: Path | None = typer.Option(None, "--klaviyo-before", exists=True, dir_okay=False,
+                                               help="Klaviyo backup taken before the run."),
+) -> None:
+    """Check (local, read-only) that Shopify email consent mirrors Klaviyo after the sync.
+
+    Exits 1 on any mismatch. Klaviyo consent changes since the backup are
+    listed for review (expected for D14 customers and normal activity)."""
+    from migtool.shopify import consent
+
+    get_instance(instance, "shopify")
+    d14_emails = {r["email"] for r in consent.read_csv(d14)} if d14 else set()
+    v = consent.validate(klaviyo, shopify, written=consent.written_targets(results), d14_emails=d14_emails,
+                         klaviyo_before=klaviyo_before)
+    run = new_run(instance, "consent-validate")
+    files = {}
+    if v.mismatches:
+        path = run.path(".mismatches.csv")
+        files[path.name] = _write_rows(path, consent.MISMATCH_COLUMNS, v.mismatches)
+    if v.klaviyo_changes:
+        path = run.path(".klaviyo_changes.csv")
+        files[path.name] = _write_rows(path, consent.KLAVIYO_CHANGE_COLUMNS, v.klaviyo_changes)
+    write_manifest(run, files=files, counts=dict(v.counts),
+                   extra={"klaviyo": str(klaviyo), "shopify": str(shopify), "results": [str(r) for r in results],
+                          "d14": str(d14) if d14 else None, "klaviyo_before": str(klaviyo_before) if klaviyo_before else None})
+    c = v.counts
+    typer.echo(f"checked {c['checked']:,}: ok {c['ok']:,}, mismatched {c['mismatched']:,} "
+               f"(D12 {c['d12']:,}, excluded {c['excluded']:,})")
+    if klaviyo_before:
+        typer.echo(f"Klaviyo consent changes since the backup: {c['klaviyo_changed']:,} (D14: {c['klaviyo_changed_d14']:,})")
+    for name in files:
+        typer.echo(f"  {run.dir / name}")
+    if v.mismatches:
+        raise typer.Exit(1)
+
 
 def main() -> None:
     """Console entry point: turns expected errors into a message and an exit code."""

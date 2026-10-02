@@ -16,6 +16,7 @@ from typing import Any
 
 from migtool.klaviyo.writes import (
     CONSENT_COLUMNS,
+    CUSTOM_SOURCE,
     identity,
     MIGRATED_FROM,
     Job,
@@ -182,7 +183,7 @@ class Importer:
         self._count(stage, len(ok))
         return ok
 
-    def subscribe(self, rows: list[dict[str, str]], *, list_id: str) -> None:
+    def subscribe(self, rows: list[dict[str, str]], *, list_id: str, source: str = CUSTOM_SOURCE) -> None:
         """Historical-import subscribe with each row's original consent timestamp."""
         ready = []
         for row in rows:
@@ -206,7 +207,8 @@ class Importer:
             else:
                 log_refused(who, reason)
 
-        self.w.subscribe(ready, list_id=list_id, on_sent=lambda n: self._count("subscribe", n), on_refused=refused)
+        self.w.subscribe(ready, list_id=list_id, on_sent=lambda n: self._count("subscribe", n), on_refused=refused,
+                         source=source)
         sent = self.steps.get("subscribe", 0) - before
         self.echo(f"subscribe: {sent:,} profiles (historical import, original timestamps)")
         if already:

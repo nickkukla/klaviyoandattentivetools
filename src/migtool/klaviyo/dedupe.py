@@ -50,6 +50,7 @@ class Role:
     consent: bool  # applies Email Marketing Consent
     tags: bool  # adds migrated_from / migration_run_id
     only_hold: bool = False  # sends migration_hold and nothing else
+    source: str | None = None  # Klaviyo custom source for subscribes (default: the migration's)
 
 
 ROLES: dict[str, Role] = {r.name: r for r in (
@@ -58,6 +59,9 @@ ROLES: dict[str, Role] = {r.name: r for r in (
     Role("suppress", "02", creates=True, join_list=True, consent=False, tags=True),
     Role("new", "03a-03d", creates=True, join_list=True, consent=True, tags=True),
     Role("kept", "04a, 04b", creates=False, join_list=True, consent=True, tags=True),
+    # Consent sync D14: subscribe existing profiles with Shopify's date; nothing else.
+    Role("consent", "consent sync D14", creates=False, join_list=False, consent=True, tags=False,
+         source="Shopify email consent (consent sync)"),
 )}
 
 
@@ -270,7 +274,7 @@ def run(imp: Importer, p: Plan, *, join_list: str | None, subscribe_list: str | 
                  for r, i in wanted if i == "SUBSCRIBED" and identity(r) in confirmed]
     unsubscribe = [r["email"] for r, i in wanted if i == "UNSUBSCRIBED" and identity(r) in confirmed]
     if subscribe:
-        imp.subscribe(subscribe, list_id=subscribe_list)
+        imp.subscribe(subscribe, list_id=subscribe_list, **({"source": role.source} if role.source else {}))
     imp.unsubscribe(unsubscribe)
 
 
@@ -399,11 +403,12 @@ def problems(
                              "won't receive email")
             if subscribe is not None and pid not in subscribe:
                 found.append("not on the subscribe list")
-            # A profile the migration creates (role new) must carry the file's
-            # original date. An existing subscriber (role kept) keeps whatever
+            # A profile the migration creates (role new), or one the consent
+            # sync subscribes with Shopify's date (role consent), must carry the
+            # file's date. An existing subscriber (role kept) keeps whatever
             # date it already had, earlier or later, so there's nothing to check.
             want, got = consent_timestamp(row), m.get("consent_timestamp")
-            if role.name == "new" and want:
+            if role.name in ("new", "consent") and want:
                 if not got or parse_iso(got).replace(microsecond=0) != parse_iso(want).replace(microsecond=0):
                     found.append(f"consent_timestamp is {got}, expected {want}")
         elif instruction == "UNSUBSCRIBED" and m.get("consent") != "UNSUBSCRIBED":

@@ -326,21 +326,22 @@ class Writer:
 
     def subscribe(
         self, rows: Sequence[tuple[str, str]], *, list_id: str, on_sent: Callable[[int], None],
-        on_refused: Refused = _ignore,
+        on_refused: Refused = _ignore, source: str = CUSTOM_SOURCE,
     ) -> list[tuple[str, str]]:
         """Historical-import subscribe: (email, consented_at) pairs, no job to
-        track. `on_sent(n)` is called as each request is accepted. Returns refused rows."""
+        track. `source` is the consent's custom source in Klaviyo. `on_sent(n)`
+        is called as each request is accepted. Returns refused rows."""
         rejected: list[tuple[str, str]] = []
         for chunk in batches(list(rows), SUBSCRIBE_BATCH):
-            rejected += self.isolate(list(chunk), lambda c: self._subscribe(c, list_id), lambda r: r[0],
+            rejected += self.isolate(list(chunk), lambda c: self._subscribe(c, list_id, source), lambda r: r[0],
                                      lambda c, _: on_sent(len(c)), on_refused)
         return rejected
 
-    def _subscribe(self, rows: Sequence[tuple[str, str]], list_id: str) -> None:
+    def _subscribe(self, rows: Sequence[tuple[str, str]], list_id: str, source: str = CUSTOM_SOURCE) -> None:
         self.client.post("/profile-subscription-bulk-create-jobs/", {"data": {
             "type": "profile-subscription-bulk-create-job",
             "attributes": {
-                "custom_source": CUSTOM_SOURCE,
+                "custom_source": source,
                 "historical_import": True,
                 "profiles": {"data": [
                     {"type": "profile", "attributes": {"email": email, "subscriptions": {
