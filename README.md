@@ -230,12 +230,13 @@ Imports one of the dedupe files (Klaviyo UI-import layout) under the rules of it
 | `suppress` | 02 | Rows that were US profiles before the migration (per `--us-snapshot`) join `--join-list` and get `ca_suppression_*`. The rest are CA-only: created or updated and tagged. Then all are submitted for suppression. |
 | `new` | 03a–03d | Creates or updates, joins `--join-list`, adds tags. Consent from `Email Marketing Consent`: `Subscribe` → historical subscribe to `--subscribe-list`; `Unsubscribed` → unsubscribe. |
 | `kept` | 04a, 04b | Updates existing profiles only, joins `--join-list`, adds tags. Consent as for `new`, using `ca_consent_timestamp`. |
+| `consent` | consent sync D14 | Updates existing profiles only. Subscribes them to `--subscribe-list` with the file's date (Shopify's consent date) and the custom source "Shopify email consent (consent sync)". No join list, no tags, no other fields. |
 
 | Flag | |
 |---|---|
 | `--to` (required) | Instance to write to |
 | `--file` (required) | The dedupe CSV |
-| `--role` (required) | `hold`, `hold-new`, `suppress`, `new` or `kept` |
+| `--role` (required) | `hold`, `hold-new`, `suppress`, `new`, `kept` or `consent` |
 | `--join-list` | List the profiles join (required for `suppress`, `new`, `kept`; refused for the others) |
 | `--subscribe-list` | List `Subscribe` rows subscribe to (roles `new`, `kept`; required when the file has `Subscribe` rows) |
 | `--types-from` | A `profiles export` CSV whose header gives each custom property's type (required for `new`) |
@@ -489,9 +490,9 @@ uv run migtool klaviyo events resend --to klaviyo_us --file held_orders.csv --me
 uv run migtool klaviyo events resend --to klaviyo_us --file held_orders.csv --metric "Order Confirmation – Resend"
 ```
 
-## Shopify (read-only)
+## Shopify
 
-The Shopify commands only read. The client refuses to send a GraphQL mutation, even if the token would allow one. Every command first checks that the token belongs to the store in `SHOPIFY_<US|CA>_SHOP`, so a CA token under the US name is stopped.
+The Shopify commands only read, except `shopify consent-sync`, which writes email marketing consent and nothing else. The client refuses to send a GraphQL mutation from any query, even if the token would allow one. Exactly two mutations exist, each sent from one place: the bulk-export start (`customers-export`) and `customerEmailMarketingConsentUpdate` (`consent-sync`). Every command first checks that the token belongs to the store in `SHOPIFY_<US|CA>_SHOP`, so a CA token under the US name is stopped.
 
 ### `migtool shopify whoami`
 
@@ -528,6 +529,77 @@ Looks customers up by email and writes `exports/<instance>/customers/<run>.csv`:
 ```
 uv run migtool shopify customers --instance shopify_us --file pilot.csv --compare klaviyo_us
 uv run migtool shopify customers --instance shopify_us --email a@example.com --email b@example.com
+```
+
+### Consent sync: Klaviyo US → Shopify US email consent
+
+The plan, decisions (D1–D15), pilot results and run order are in `docs/CONSENT_SYNC.md`; the build spec is phase 6 of `docs/BUILD_PLAN.md`. In short: Shopify's email marketing consent is set to Klaviyo's for every customer whose email matches a Klaviyo profile. Klaviyo subscribed → `SUBSCRIBED`; unsubscribed or suppressed → `UNSUBSCRIBED`; with the original consent date. Shopify can't be set to `NOT_SUBSCRIBED`, so Klaviyo never subscribed + Shopify unsubscribed is left (D12). Klaviyo never subscribed + Shopify subscribed keeps Shopify and subscribes Klaviyo with Shopify's date (D14). SMS isn't touched.
+
+#### `migtool shopify consent-plan`
+
+Local and read-only: joins a Klaviyo `profiles export` and a Shopify `customers-export` by email and writes, under `exports/<instance>/consent-plan/`:
+
+- `<run>.plan.csv`: the Shopify writes (target state and date, and whether Shopify's date is newer)
+- `<run>.klaviyo_d14.csv`: the D14 Klaviyo subscribes, in the dedupe layout
+- `<run>.excluded.csv`: D12 and unwritable (`INVALID`/`REDACTED`) customers
+
+It prints counts by transition. Future dates are set to the plan time, since Shopify refuses them. `--emails <csv>` limits the plan to those emails, for trials.
+
+```
+uv run migtool shopify consent-plan --klaviyo exports/klaviyo_us/profiles/<ts>.csv --shopify exports/shopify_us/customers-export/<ts>.csv
+```
+
+#### D14: `klaviyo dedupe import --role consent`
+
+```
+uv run migtool klaviyo dedupe import --to klaviyo_us --role consent --file <run>.klaviyo_d14.csv --subscribe-list Xz4KGg
+uv run migtool klaviyo dedupe check --instance klaviyo_us --role consent --file <run>.klaviyo_d14.csv --subscribe-list Xz4KGg
+```
+
+Klaviyo can take 10–20 minutes to apply back-dated subscribes, so run the check after that.
+
+#### `migtool shopify consent-sync`
+
+The only Shopify write.
+
+- **Checks first:** the token belongs to the store and has `write_customers`, then a typed confirmation of the store and the number of customers.
+- **For each batch of 50:**
+  - reads the customers' current email consent
+  - **skips customers already in the target state:** Shopify treats even an identical write as a customer update and notifies apps
+  - sends `customerEmailMarketingConsentUpdate` for the rest
+- **Results** per customer go to `<run>.results.csv`: written, skipped, refused (with Shopify's message), not found, or unknown.
+- **A lost response is never resent.** The customer is read back instead.
+- **Exit code:** 1 if anything was refused, not found, unknown or stopped.
+
+| Flag | |
+|---|---|
+| `--to` (required) | Shopify instance |
+| `--plan` (required) | `<run>.plan.csv` |
+| `--target` | Only `SUBSCRIBED` or only `UNSUBSCRIBED` rows (for the canary) |
+| `--limit` | At most N customers in this run |
+| `--resume` | Continue the saved run of this plan, skipping customers already done (unknown ones are retried) |
+| `--yes` | Skip the typed confirmation |
+
+The run is saved in `state/<instance>/shopify-consent-sync.checkpoint.json`. A new run of a plan needs `--resume`, or that file deleted.
+
+```
+uv run migtool shopify consent-sync --to shopify_us --plan <run>.plan.csv --target SUBSCRIBED --limit 100     # canary
+uv run migtool shopify consent-sync --to shopify_us --plan <run>.plan.csv --target UNSUBSCRIBED --limit 100 --resume
+uv run migtool shopify consent-sync --to shopify_us --plan <run>.plan.csv --resume                            # the rest
+```
+
+#### `migtool shopify consent-validate`
+
+Local and read-only. It works on exports taken after the run and checks that every matched customer's Shopify state matches Klaviyo under the rules (D12 counts as a match; `INVALID`/`REDACTED` are reported separately). It also checks:
+
+- with `--results`: for customers the run wrote, Shopify's date equals the date written
+- with `--d14`: for D14 customers, Klaviyo's date equals Shopify's
+- with `--klaviyo-before <backup>`: every Klaviyo consent state, date or method change since the backup is listed in `<run>.klaviyo_changes.csv` for review
+
+Mismatches go to `<run>.mismatches.csv` and exit 1.
+
+```
+uv run migtool shopify consent-validate --klaviyo <after>.csv --shopify <after>.csv --results <run>.results.csv --d14 <run>.klaviyo_d14.csv --klaviyo-before <backup>.csv
 ```
 
 ## STOQ: preparing and uploading the Back in Stock file

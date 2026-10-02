@@ -118,8 +118,9 @@ class FakeImporter:
     def skip_unconfirmed(self, rows, ok, step):
         return [r for r in rows if dedupe.identity(r) in ok]
 
-    def subscribe(self, rows, *, list_id):
+    def subscribe(self, rows, *, list_id, source=None):
         self.calls.append(("subscribe", [(r["email"], r["consent_timestamp"]) for r in rows], list_id))
+        self.source = source
 
     def unsubscribe(self, emails):
         self.calls.append(("unsubscribe", list(emails)))

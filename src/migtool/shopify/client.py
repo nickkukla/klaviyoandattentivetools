@@ -1,9 +1,12 @@
-"""A read-only Shopify Admin GraphQL client.
+"""A Shopify Admin GraphQL client that reads, with two narrow exceptions.
 
-Every request is a GraphQL query; a document containing a mutation is refused
-before anything is sent, so the tool can't change a store even with a token
-that allows it. The one exception is starting a bulk export
-(`bulkOperationRunQuery`), which only reads, sent from `start_bulk_export` alone.
+`query()` refuses any document containing a mutation before anything is sent,
+so reads can't change a store even with a token that allows it. Exactly two
+mutations exist, each sent from its own method only:
+
+- `bulkOperationRunQuery` (starts a read-only bulk export), from `start_bulk_export`;
+- `customerEmailMarketingConsentUpdate` (email marketing consent and nothing
+  else), from `update_email_consent`, used only by `shopify consent-sync`.
 
 Shopify rate-limits GraphQL by query cost and reports it in the
 response (`THROTTLED`), so throttled queries wait for the bucket to refill.
@@ -34,6 +37,23 @@ BULK_LIST = """query($n: Int!) { bulkOperations(first: $n, sortKey: CREATED_AT, 
   nodes { id status type errorCode objectCount url query createdAt } } }"""
 
 
+CONSENT_READ = """query($ids: [ID!]!) { nodes(ids: $ids) { ... on Customer {
+  id email emailMarketingConsent { marketingState marketingOptInLevel consentUpdatedAt } } } }"""
+CONSENT_UPDATE = """mutation($input: CustomerEmailMarketingConsentUpdateInput!) {
+  customerEmailMarketingConsentUpdate(input: $input) {
+    customer { id emailMarketingConsent { marketingState marketingOptInLevel consentUpdatedAt } }
+    userErrors { field message code }
+  }
+}"""
+# Shopify refuses NOT_SUBSCRIBED as an input (consent-sync pilot, 2026-10-02).
+CONSENT_STATES = ("SUBSCRIBED", "UNSUBSCRIBED")
+
+
+def customer_gid(customer_id: str) -> str:
+    """A numeric customer ID (as the customers export writes it) as a GraphQL ID."""
+    return customer_id if customer_id.startswith("gid://") else f"gid://shopify/Customer/{customer_id}"
+
+
 class ShopifyError(Exception):
     """GraphQL errors in an otherwise successful response."""
 
@@ -46,7 +66,8 @@ class ShopifyClient:
         self.shop = shop
         self._sleep = sleep
         self._max_throttled = max_throttled
-        # Queries only, so a retried request can't be applied twice: nothing to warn about.
+        # Queries are safe to retry. The two mutations are sent with retries off
+        # (a lost response is looked up instead), so nothing to warn about.
         self._http = HttpClient(
             f"https://{shop}/admin/api/{API_VERSION}",
             headers={"X-Shopify-Access-Token": token.reveal(), "Content-Type": "application/json"},
@@ -65,6 +86,41 @@ class ShopifyClient:
             if errors:
                 raise ShopifyError("; ".join(e.get("message", str(e)) for e in errors))
             return body["data"]
+        raise ShopifyError("Still throttled after retrying; try again later.")
+
+    def email_consents(self, customer_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+        """Current email marketing consent for up to 250 customers (one query):
+        customer ID as given → `emailMarketingConsent` (with `email`), or None
+        when there's no such customer."""
+        gids = [customer_gid(c) for c in customer_ids]
+        nodes = self.query(CONSENT_READ, {"ids": gids})["nodes"]
+        return {c: node for c, node in zip(customer_ids, nodes)}
+
+    def update_email_consent(self, customer_id: str, state: str, consent_updated_at: str | None) -> dict[str, Any]:
+        """Set one customer's email marketing consent. Sends nothing else.
+
+        Returns Shopify's result: `customer` (the consent now stored) and
+        `userErrors`. A throttled request (not executed) waits and is sent again;
+        a lost response is never resent here (`ApiError`), so the caller reads
+        the customer back to learn the outcome."""
+        if state not in CONSENT_STATES:
+            raise ValueError(f"Email consent can only be set to {' or '.join(CONSENT_STATES)}, not {state!r}.")
+        consent: dict[str, Any] = {"marketingState": state}
+        if state == "SUBSCRIBED":
+            consent["marketingOptInLevel"] = "SINGLE_OPT_IN"
+        if consent_updated_at:
+            consent["consentUpdatedAt"] = consent_updated_at
+        variables = {"input": {"customerId": customer_gid(customer_id), "emailMarketingConsent": consent}}
+        for _ in range(self._max_throttled + 1):
+            body = self._http.post("/graphql.json", json={"query": CONSENT_UPDATE, "variables": variables},
+                                   retry_writes=False).json()
+            errors = body.get("errors") or []
+            if errors and all((e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors):
+                self._sleep(_throttle_wait(body))
+                continue
+            if errors:
+                raise ShopifyError("; ".join(e.get("message", str(e)) for e in errors))
+            return body["data"]["customerEmailMarketingConsentUpdate"]
         raise ShopifyError("Still throttled after retrying; try again later.")
 
     def recent_bulk_queries(self, limit: int = 10) -> list[dict[str, Any]]:
