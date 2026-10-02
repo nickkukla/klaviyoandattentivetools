@@ -37,6 +37,12 @@ KLAVIYO_CHANGE_COLUMNS = ["email", "klaviyo_profile_id", "field", "before", "aft
 
 TARGET = {"subscribed": "SUBSCRIBED", "unsubscribed": "UNSUBSCRIBED", "suppressed": "UNSUBSCRIBED"}
 UNWRITABLE = {"INVALID", "REDACTED"}
+KLAVIYO_CONSENTS = {"SUBSCRIBED", "UNSUBSCRIBED", "NEVER_SUBSCRIBED"}
+SHOPIFY_STATES = {"SUBSCRIBED", "NOT_SUBSCRIBED", "UNSUBSCRIBED", "PENDING", "INVALID", "REDACTED"}
+# Columns each export must have; a file without them is refused rather than
+# read as "never subscribed" (missing data is not a consent decision).
+KLAVIYO_COLUMNS = {"id", "email", "consent", "consent_timestamp", "suppressions"}
+SHOPIFY_COLUMNS = {"customer_id", "email", "email_marketing", "email_consent_updated"}
 
 
 def iso_z(value: str) -> str:
@@ -50,20 +56,29 @@ def same_second(a: str | None, b: str | None) -> bool:
     return parse_iso(a).replace(microsecond=0) == parse_iso(b).replace(microsecond=0)
 
 
-def read_csv(path: Path) -> Iterator[dict[str, str]]:
+def read_csv(path: Path, required: set[str] | None = None) -> Iterator[dict[str, str]]:
+    """Rows of a CSV. With `required`, a file missing any of those columns is
+    refused (ValueError) before a row is read."""
     csv.field_size_limit(1 << 30)
     with open(path, newline="", encoding="utf-8-sig") as fh:
-        yield from csv.DictReader(fh)
+        reader = csv.DictReader(fh)
+        missing = sorted((required or set()) - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(f"{path} is missing column(s) {', '.join(missing)}; is it the right export?")
+        yield from reader
 
 
 def shopify_by_email(path: Path) -> dict[str, dict[str, str]]:
     """Shopify customers export rows by lowercased email (customers without an
     email can't be matched). Raises if an email is on more than one customer."""
     out: dict[str, dict[str, str]] = {}
-    for row in read_csv(path):
+    for row in read_csv(path, SHOPIFY_COLUMNS):
         email = (row.get("email") or "").strip().lower()
         if not email:
             continue
+        if row.get("email_marketing") not in SHOPIFY_STATES:
+            raise ValueError(f"Shopify customer {row.get('customer_id')} has email state "
+                             f"{row.get('email_marketing')!r}, which isn't one of {', '.join(sorted(SHOPIFY_STATES))}.")
         if email in out:
             raise ValueError(f"{email} is on more than one Shopify customer; resolve that before planning.")
         out[email] = row
@@ -91,8 +106,17 @@ def _property(row: dict[str, str], name: str) -> str:
 def klaviyo_consent(row: dict[str, str]) -> KlaviyoConsent:
     """One `profiles export` row's email consent, as the sync sees it. A
     suppression other than UNSUBSCRIBE makes it `suppressed`; an UNSUBSCRIBE
-    suppression on a profile that isn't subscribed makes it `unsubscribed`."""
-    suppressions = json.loads(row.get("suppressions") or "[]")
+    suppression on a profile that isn't subscribed makes it `unsubscribed`.
+    Raises ValueError for a consent or suppressions value it can't read."""
+    if row.get("consent") not in KLAVIYO_CONSENTS:
+        raise ValueError(f"Klaviyo profile {row.get('id')} has consent {row.get('consent')!r}, "
+                         f"which isn't one of {', '.join(sorted(KLAVIYO_CONSENTS))}.")
+    try:
+        suppressions = json.loads(row.get("suppressions") or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Klaviyo profile {row.get('id')}: suppressions aren't valid JSON ({exc}).") from exc
+    if not isinstance(suppressions, list) or not all(isinstance(x, dict) for x in suppressions):
+        raise ValueError(f"Klaviyo profile {row.get('id')}: suppressions aren't a list of suppressions.")
     strong = [s for s in suppressions if s.get("reason") != "UNSUBSCRIBE"]
     migrated = _property(row, "migrated_from") == "ca"
     if strong:
@@ -100,10 +124,13 @@ def klaviyo_consent(row: dict[str, str]) -> KlaviyoConsent:
         date = (migrated and _property(row, "ca_suppression_timestamp")) or strong[0].get("timestamp") \
             or row.get("suppression_timestamp") or ""
     else:
-        state = {"SUBSCRIBED": "subscribed", "UNSUBSCRIBED": "unsubscribed"}.get(row.get("consent") or "", "never")
-        if state == "never" and any(s.get("reason") == "UNSUBSCRIBE" for s in suppressions):
+        state = {"SUBSCRIBED": "subscribed", "UNSUBSCRIBED": "unsubscribed"}.get(row["consent"], "never")
+        unsubscribe = [s for s in suppressions if s.get("reason") == "UNSUBSCRIBE"]
+        if state == "never" and unsubscribe:
             state = "unsubscribed"
         date = (migrated and _property(row, "ca_consent_timestamp")) or row.get("consent_timestamp") or ""
+        if not date and state == "unsubscribed" and unsubscribe:
+            date = unsubscribe[0].get("timestamp") or ""  # the unsubscribe's own date when consent has none
     return KlaviyoConsent(row.get("id") or "", (row.get("email") or "").strip().lower(), state, date,
                           row.get("consent_timestamp") or "", row.get("method") or "")
 
@@ -134,7 +161,7 @@ def plan(klaviyo_path: Path, shopify_path: Path, *, now: datetime, only: set[str
     """Work out every write. `only` limits the plan to these emails (trials)."""
     shop = shopify_by_email(shopify_path)
     result = Plan()
-    for row in read_csv(klaviyo_path):
+    for row in read_csv(klaviyo_path, KLAVIYO_COLUMNS):
         result.profiles += 1
         k = klaviyo_consent(row)
         if not k.email or (only is not None and k.email not in only):
@@ -183,38 +210,48 @@ class Validation:
     klaviyo_changes: list[dict[str, str]] = field(default_factory=list)
 
 
-def written_targets(results_paths: list[Path]) -> dict[str, tuple[str, str]]:
-    """Shopify customer ID → (state, date) for every customer a sync run wrote."""
-    out: dict[str, tuple[str, str]] = {}
+def written_targets(results_paths: list[Path]) -> dict[str, tuple[str, str, str]]:
+    """Shopify customer ID → (state, date, email) for every customer a sync run
+    wrote (the latest result per customer wins)."""
+    out: dict[str, tuple[str, str, str]] = {}
     for path in results_paths:
-        for row in read_csv(path):
-            if row.get("outcome") == "written":
-                out[row["shopify_customer_id"]] = (row["target_state"], row["target_date"])
+        for row in read_csv(path, {"shopify_customer_id", "email", "target_state", "target_date", "outcome"}):
+            if row["outcome"] == "written":
+                out[row["shopify_customer_id"]] = (row["target_state"], row["target_date"], row["email"])
+            else:
+                out.pop(row["shopify_customer_id"], None)
     return out
 
 
 def validate(
-    klaviyo_path: Path, shopify_path: Path, *, written: dict[str, tuple[str, str]] | None = None,
+    klaviyo_path: Path, shopify_path: Path, *, written: dict[str, tuple[str, str, str]] | None = None,
     d14_emails: set[str] | None = None, klaviyo_before: Path | None = None,
 ) -> Validation:
-    """Check post-run exports against the rules. A customer is fine when its
-    action is `match` or `d12`; `write` or `d14` means it still differs. For
-    customers the run wrote, Shopify's date must equal the date written (dates
-    are only set with a state change, pilot P8b). For D14 customers, Klaviyo's
-    date must equal Shopify's. With `klaviyo_before`, every change to Klaviyo
-    consent state, date or method is listed for review (D14 ones are expected)."""
+    """Check post-run exports against the rules.
+
+    - Every matched customer: its action must be `match` or `d12`; `write` or
+      `d14` means it still differs.
+    - Every customer the run wrote must still be in the Shopify export, under
+      the same email, in the state written and with the date written (dates
+      are only set with a state change, pilot P8b).
+    - Every D14 email must have a Klaviyo profile and a Shopify customer, both
+      subscribed, with Klaviyo's date equal to Shopify's.
+    - With `klaviyo_before`, every change to a Klaviyo profile's consent
+      state, date or method (or a profile gone) is listed for review."""
     shop = shopify_by_email(shopify_path)
+    shop_by_id = {row["customer_id"]: row for row in shop.values()}
     written = written or {}
     d14_emails = d14_emails or set()
     v = Validation()
     after: dict[str, KlaviyoConsent] = {}
-    for row in read_csv(klaviyo_path):
+    seen_d14: set[str] = set()
+    for row in read_csv(klaviyo_path, KLAVIYO_COLUMNS):
         k = klaviyo_consent(row)
         after[k.profile_id] = k
         s = shop.get(k.email) if k.email else None
         if not s:
             continue
-        sh_state = s.get("email_marketing") or "NOT_SUBSCRIBED"
+        sh_state = s["email_marketing"]
         act = action(k.state, sh_state)
         v.counts["checked"] += 1
         base = {"email": k.email, "shopify_customer_id": s["customer_id"], "klaviyo_profile_id": k.profile_id}
@@ -225,24 +262,46 @@ def validate(
             v.counts["excluded"] += 1
         elif act == "d12":
             v.counts["d12"] += 1
-        target = written.get(s["customer_id"])
-        if target and not problems:
-            if sh_state != target[0]:
-                problems.append(f"Shopify {sh_state}, the run wrote {target[0]}")
-            elif target[1] and not same_second(s.get("email_consent_updated"), target[1]):
-                problems.append(f"Shopify date {s.get('email_consent_updated')}, the run wrote {target[1]}")
-        if k.email in d14_emails and not problems and not same_second(k.consent_timestamp, s.get("email_consent_updated")):
-            problems.append(f"D14: Klaviyo date {k.consent_timestamp}, Shopify date {s.get('email_consent_updated')}")
+        if k.email in d14_emails:
+            seen_d14.add(k.email)
+            if (k.state, sh_state) != ("subscribed", "SUBSCRIBED"):
+                problems.append(f"D14: expected subscribed on both sides, Klaviyo {k.state}, Shopify {sh_state}")
+            elif not s.get("email_consent_updated") or not same_second(k.consent_timestamp, s["email_consent_updated"]):
+                problems.append(f"D14: Klaviyo date {k.consent_timestamp}, Shopify date {s.get('email_consent_updated')}")
         if problems:
             v.counts["mismatched"] += 1
             v.mismatches.append({**base, "problem": "; ".join(problems)})
         else:
             v.counts["ok"] += 1
+    # Customers the run wrote: present, same identity, as written.
+    for cid, (state, date, email) in written.items():
+        s = shop_by_id.get(cid)
+        base = {"email": email, "shopify_customer_id": cid, "klaviyo_profile_id": ""}
+        problem = None
+        if s is None:
+            problem = "written by the run, but not in the post-run Shopify export"
+        elif (s.get("email") or "").strip().lower() != email:
+            problem = f"written by the run for {email}, but the Shopify customer's email is now {s.get('email')}"
+        elif s["email_marketing"] != state:
+            problem = f"Shopify {s['email_marketing']}, the run wrote {state}"
+        elif date and not same_second(s.get("email_consent_updated"), date):
+            problem = f"Shopify date {s.get('email_consent_updated')}, the run wrote {date}"
+        v.counts["written_checked"] += 1
+        if problem:
+            v.counts["written_mismatched"] += 1
+            v.mismatches.append({**base, "problem": problem})
+    for email in sorted(d14_emails - seen_d14):
+        v.counts["mismatched"] += 1
+        v.mismatches.append({"email": email, "shopify_customer_id": "", "klaviyo_profile_id": "",
+                             "problem": "D14: no matching Klaviyo profile and Shopify customer in the post-run exports"})
     if klaviyo_before:
-        for row in read_csv(klaviyo_before):
+        for row in read_csv(klaviyo_before, KLAVIYO_COLUMNS):
             b = klaviyo_consent(row)
             a = after.get(b.profile_id)
             if not a:
+                v.counts["klaviyo_missing"] += 1
+                v.klaviyo_changes.append({"email": b.email, "klaviyo_profile_id": b.profile_id, "field": "profile",
+                                          "before": "present", "after": "missing (deleted or merged)"})
                 continue
             for name, before, now in (("state", b.state, a.state), ("consent_timestamp", b.consent_timestamp,
                                       a.consent_timestamp), ("method", b.method, a.method)):

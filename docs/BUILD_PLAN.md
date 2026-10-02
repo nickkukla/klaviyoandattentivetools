@@ -152,7 +152,7 @@ Specified by `docs/CONSENT_SYNC.md`: decisions D1–D14 and the pilot results in
 
 ### Gate
 
-- All tests pass. The trial validates clean, with no Klaviyo changes (other than D14), no list additions or emails, and Attentive unchanged (user check).
+- All tests pass. The trial validates clean. Apart from the D14 case, there are no Klaviyo changes, no list additions and no emails, and Attentive is unchanged (user check). The D14 case is allowed to subscribe its profile to LOF USA Newsletter - Main and may trigger the Welcome Series (D15).
 - The user approves the refreshed plan counts before the run.
 
 ### Run order
