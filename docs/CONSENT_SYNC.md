@@ -312,3 +312,16 @@ Consequences for the build (phase 6):
 3. **Never send a future date.** A date can only be set together with a state change, so validation compares dates only for customers whose state the run changed.
 4. Only `emailMarketingConsent` is written; SMS isn't touched.
 5. Klaviyo's back-dated subscribes took 10–20 minutes to apply on 2026-10-02. D14 runs first and is checked before the Shopify writes start.
+
+### 9.9 Phase 6 trial (2026-10-02 21:20–21:44 UTC)
+
+The built commands ran end to end on the six test accounts. Settings were normal ("Sync Klaviyo profiles to Shopify" on, subscriber sync into Main). Snapshots of the six accounts in the export layouts stood in for full exports (helper `exports/consent_sync/trial/mini_export.py`); logs and snapshots are in `exports/consent_sync/trial/`.
+
+- **Setup:** two Shopify writes with the pilot script created mismatches. The first try for pilot6 (dated 2025-08-01, older than its 2026-06-01 consent date) was **silently ignored by Shopify**, which led to D16 and the ignored-write detection (PR #35). Re-done with 2026-09-01, it applied.
+- **`consent-plan`:** 2 Shopify writes (pilot3 → UNSUBSCRIBED with the original date; pilot6 → SUBSCRIBED at the sync time, D16), 1 D14 (pilot2), 1 D12 (pilot5), 2 matches.
+- **D14:** `dedupe import --role consent` subscribed pilot2 to Main with Shopify's date (2025-01-15), email-only, no tags.
+- **`consent-sync`:** `--target SUBSCRIBED --limit 1` wrote pilot6 (sync time, stored as sent); `--resume` wrote pilot3 (original date, stored as sent); a second `--resume` sent nothing. Nothing was refused, ignored or in conflict.
+- **`consent-validate`** (+15 minutes, with `--results`, `--d14` and `--klaviyo-before`): 6 of 6 ok, 0 mismatches (1 D12); both written customers verified (state and date); the only Klaviyo changes were pilot2's D14 subscribe (never → subscribed, 2025-01-15, API). `dedupe check --role consent`: 1 of 1 ok.
+- **Attentive (user):** pilot3's SMS still subscribed after the Shopify email unsubscribe.
+
+**Gate met.** The run is planned for **Monday 2026-10-05**, following phase 6's run order in `BUILD_PLAN.md` and the checklist in 5.4.
